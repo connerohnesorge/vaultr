@@ -79,7 +79,14 @@ fn civil(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
     let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
     let y = if m <= 2 { y + 1 } else { y };
-    (y, m, d, (rem / 3600) as u32, (rem % 3600 / 60) as u32, (rem % 60) as u32)
+    (
+        y,
+        m,
+        d,
+        (rem / 3600) as u32,
+        (rem % 3600 / 60) as u32,
+        (rem % 60) as u32,
+    )
 }
 
 /// Parse an ISO timestamp back to SystemTime (meta original_start). Best-effort.
@@ -100,7 +107,9 @@ fn parse_iso(s: &str) -> Option<SystemTime> {
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146097 + doe - 719468;
     let secs = days * 86400 + h * 3600 + mi * 60 + sec;
-    u64::try_from(secs).ok().map(|s| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(s))
+    u64::try_from(secs)
+        .ok()
+        .map(|s| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(s))
 }
 
 /// vault/YYYY/MM/DD/<session_id>, dated from meta original_start when parseable.
@@ -116,14 +125,25 @@ pub fn session_dir(vault: &Path, session_id: &str) -> std::io::Result<PathBuf> {
     let mut when = SystemTime::now();
     if let Ok(text) = fs::read_to_string(vault.join(".meta").join(format!("{session_id}.json"))) {
         if let Ok(meta) = serde_json::from_str::<Value>(&text) {
-            if let Some(t) = meta.get("original_start").and_then(Value::as_str).and_then(parse_iso) {
+            if let Some(t) = meta
+                .get("original_start")
+                .and_then(Value::as_str)
+                .and_then(parse_iso)
+            {
                 when = t;
             }
         }
     }
-    let secs = when.duration_since(SystemTime::UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+    let secs = when
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
     let (y, m, d, ..) = civil(secs);
-    let dir = vault.join(format!("{y:04}")).join(format!("{m:02}")).join(format!("{d:02}")).join(session_id);
+    let dir = vault
+        .join(format!("{y:04}"))
+        .join(format!("{m:02}"))
+        .join(format!("{d:02}"))
+        .join(session_id);
     fs::create_dir_all(&dir)?;
     map.insert(key, dir.clone());
     Ok(dir)
@@ -147,10 +167,18 @@ fn allowed_headers(headers: &hyper::HeaderMap) -> Map<String, Value> {
     out
 }
 
-pub fn update_meta(vault: &Path, adapter: &Adapter, ids: &Identity, model: Option<&str>) -> std::io::Result<()> {
+pub fn update_meta(
+    vault: &Path,
+    adapter: &Adapter,
+    ids: &Identity,
+    model: Option<&str>,
+) -> std::io::Result<()> {
     let meta_dir = vault.join(".meta");
     fs::create_dir_all(&meta_dir)?;
-    let path = meta_dir.join(format!("{}.json", ids.session_id.as_deref().unwrap_or("unknown")));
+    let path = meta_dir.join(format!(
+        "{}.json",
+        ids.session_id.as_deref().unwrap_or("unknown")
+    ));
     let meta: Value = fs::read_to_string(&path)
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
@@ -185,9 +213,16 @@ pub fn prepare_capture(
     req: CapturedRequest,
     body: Value,
 ) -> Result<PendingCapture, String> {
-    let sid = req.ids.session_id.clone().ok_or_else(|| format!("{} request has no session identity", adapter.harness))?;
+    let sid = req
+        .ids
+        .session_id
+        .clone()
+        .ok_or_else(|| format!("{} request has no session identity", adapter.harness))?;
     let empty = vec![];
-    let history = body.get(adapter.history_key).and_then(Value::as_array).unwrap_or(&empty);
+    let history = body
+        .get(adapter.history_key)
+        .and_then(Value::as_array)
+        .unwrap_or(&empty);
     let dir = session_dir(vault, &sid).map_err(|e| e.to_string())?;
 
     let prior: Value = fs::read_to_string(dir.join("state.json"))
@@ -195,7 +230,10 @@ pub fn prepare_capture(
         .and_then(|t| serde_json::from_str::<Value>(&t).ok())
         .and_then(|v| v.get("request_body").cloned())
         .unwrap_or(Value::Null);
-    let prior_history = prior.get(adapter.history_key).and_then(Value::as_array).unwrap_or(&empty);
+    let prior_history = prior
+        .get(adapter.history_key)
+        .and_then(Value::as_array)
+        .unwrap_or(&empty);
     let prefix = common_prefix(prior_history, history);
 
     let mut set = Map::new();
@@ -251,10 +289,18 @@ pub fn prepare_capture(
         "thread_id": req.ids.thread_id,
         "request_body": body,
     });
-    fs::write(dir.join("state.json"), serde_json::to_string(&state).map_err(|e| e.to_string())? + "\n")
-        .map_err(|e| e.to_string())?;
+    fs::write(
+        dir.join("state.json"),
+        serde_json::to_string(&state).map_err(|e| e.to_string())? + "\n",
+    )
+    .map_err(|e| e.to_string())?;
 
-    Ok(PendingCapture { dir, request_part, model, req })
+    Ok(PendingCapture {
+        dir,
+        request_part,
+        model,
+        req,
+    })
 }
 
 /// Stream-end half: attach the response, append the envelope, update meta.
@@ -280,10 +326,15 @@ pub fn finish_capture(
         .append(true)
         .open(pending.dir.join("turns.jsonl"))
         .map_err(|e| e.to_string())?;
-    writeln!(f, "{}", serde_json::to_string(&pending.request_part).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+    writeln!(
+        f,
+        "{}",
+        serde_json::to_string(&pending.request_part).map_err(|e| e.to_string())?
+    )
+    .map_err(|e| e.to_string())?;
     crate::herdr::maybe_snapshot(vault);
-    update_meta(vault, adapter, &pending.req.ids, pending.model.as_deref()).map_err(|e| e.to_string())?;
+    update_meta(vault, adapter, &pending.req.ids, pending.model.as_deref())
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 

@@ -22,7 +22,9 @@ pub type BoxBody = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
 static DOM_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 
 fn full(data: impl Into<Bytes>) -> BoxBody {
-    Full::new(data.into()).map_err(|e: Infallible| match e {}).boxed()
+    Full::new(data.into())
+        .map_err(|e: Infallible| match e {})
+        .boxed()
 }
 
 fn json_error(status: StatusCode, message: &str) -> Response<BoxBody> {
@@ -84,7 +86,11 @@ async fn handle(req: Request<hyper::body::Incoming>, ctx: Arc<ProxyCtx>) -> Resp
     let adapter = &ctx.adapter;
     let upstream_base = adapter.upstream.trim_end_matches('/');
     let path = req.uri().path().to_string();
-    let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
+    let query = req
+        .uri()
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
 
     if path == "/health" {
         let body = serde_json::json!({ "ok": true, "harness": adapter.harness, "upstream": upstream_base });
@@ -100,7 +106,10 @@ async fn handle(req: Request<hyper::body::Incoming>, ctx: Arc<ProxyCtx>) -> Resp
         .map(|v| v.eq_ignore_ascii_case("websocket"))
         .unwrap_or(false)
     {
-        return Response::builder().status(426).body(full("HTTP fallback required\n")).unwrap();
+        return Response::builder()
+            .status(426)
+            .body(full("HTTP fallback required\n"))
+            .unwrap();
     }
 
     let method = req.method().as_str().to_string();
@@ -120,10 +129,16 @@ async fn handle(req: Request<hyper::body::Incoming>, ctx: Arc<ProxyCtx>) -> Resp
     // decoder allocate a 128MB window PER STREAM (the historic multi-GB RSS), and we
     // strip the encoding before the client anyway — compression buys nothing here.
     let mut headers = reqwest::header::HeaderMap::new();
-    headers.insert("accept-encoding", reqwest::header::HeaderValue::from_static("identity"));
+    headers.insert(
+        "accept-encoding",
+        reqwest::header::HeaderValue::from_static("identity"),
+    );
     for (k, v) in &req_headers {
         let name = k.as_str().to_ascii_lowercase();
-        if matches!(name.as_str(), "host" | "content-length" | "connection" | "accept-encoding") {
+        if matches!(
+            name.as_str(),
+            "host" | "content-length" | "connection" | "accept-encoding"
+        ) {
             continue;
         }
         if let (Ok(n), Ok(val)) = (
@@ -154,7 +169,10 @@ async fn handle(req: Request<hyper::body::Incoming>, ctx: Arc<ProxyCtx>) -> Resp
     let mut response_headers = hyper::HeaderMap::new();
     for (k, v) in upstream.headers() {
         let name = k.as_str().to_ascii_lowercase();
-        if matches!(name.as_str(), "content-length" | "content-encoding" | "transfer-encoding" | "connection") {
+        if matches!(
+            name.as_str(),
+            "content-length" | "content-encoding" | "transfer-encoding" | "connection"
+        ) {
             continue;
         }
         if let (Ok(n), Ok(val)) = (
@@ -209,10 +227,13 @@ async fn handle(req: Request<hyper::body::Incoming>, ctx: Arc<ProxyCtx>) -> Resp
 
     let Some(pending) = pending else {
         // passthrough: stream upstream body without capture
-        let stream = upstream
-            .bytes_stream()
-            .map(|r| r.map(Frame::data).map_err(|e| std::io::Error::other(e.to_string())));
-        return resp_builder.body(BodyExt::boxed(StreamBody::new(stream))).unwrap();
+        let stream = upstream.bytes_stream().map(|r| {
+            r.map(Frame::data)
+                .map_err(|e| std::io::Error::other(e.to_string()))
+        });
+        return resp_builder
+            .body(BodyExt::boxed(StreamBody::new(stream)))
+            .unwrap();
     };
 
     // tee: forward chunks live, save accumulated SSE at close/error
@@ -250,7 +271,8 @@ async fn handle(req: Request<hyper::body::Incoming>, ctx: Arc<ProxyCtx>) -> Resp
             complete: complete && sse.contains(terminal),
             sse,
         };
-        ctx2.otel.record(&ctx2.adapter, pending.model.as_deref(), &pending.req, &resp);
+        ctx2.otel
+            .record(&ctx2.adapter, pending.model.as_deref(), &pending.req, &resp);
         if let Err(e) = capture::finish_capture(&ctx2.vault, &ctx2.adapter, pending, &resp) {
             eprintln!("capture failed: {e}");
         }
@@ -258,7 +280,9 @@ async fn handle(req: Request<hyper::body::Incoming>, ctx: Arc<ProxyCtx>) -> Resp
     });
 
     let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-    resp_builder.body(BodyExt::boxed(StreamBody::new(stream))).unwrap()
+    resp_builder
+        .body(BodyExt::boxed(StreamBody::new(stream)))
+        .unwrap()
 }
 
 pub fn decode_bytes(raw: &[u8], encoding: Option<&str>) -> std::io::Result<Vec<u8>> {

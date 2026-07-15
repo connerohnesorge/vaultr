@@ -112,7 +112,9 @@ pub fn parse_job(name: &str, text: &str) -> Option<Job> {
         body: body.trim().to_string(),
     };
     for line in fm.lines() {
-        let Some((k, v)) = line.split_once(':') else { continue };
+        let Some((k, v)) = line.split_once(':') else {
+            continue;
+        };
         let (k, v) = (k.trim(), v.trim());
         match k {
             "every" => job.every = parse_duration(v)?,
@@ -137,8 +139,15 @@ pub fn load_jobs() -> Vec<Job> {
             if p.extension().and_then(|s| s.to_str()) != Some("md") {
                 continue;
             }
-            let name = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default().to_string();
-            match std::fs::read_to_string(&p).ok().and_then(|t| parse_job(&name, &t)) {
+            let name = p
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string();
+            match std::fs::read_to_string(&p)
+                .ok()
+                .and_then(|t| parse_job(&name, &t))
+            {
                 Some(j) => out.push(j),
                 None => eprintln!("[jobs] {name}.md: parse failed, skipping"),
             }
@@ -153,13 +162,20 @@ pub fn load_jobs() -> Vec<Job> {
 }
 
 fn epoch_now() -> u64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn last_record_ts(name: &str) -> Option<u64> {
-    let text = std::fs::read_to_string(state_dir().join("jobs").join(format!("{name}.jsonl"))).ok()?;
+    let text =
+        std::fs::read_to_string(state_dir().join("jobs").join(format!("{name}.jsonl"))).ok()?;
     let line = text.lines().rev().find(|l| !l.trim().is_empty())?;
-    serde_json::from_str::<serde_json::Value>(line).ok()?.get("ts")?.as_u64()
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()?
+        .get("ts")?
+        .as_u64()
 }
 
 fn record(name: &str, outcome: &str, started: SystemTime, detail: &str) {
@@ -240,10 +256,18 @@ fn launch_line(job: &Job) -> String {
         "claude --dangerously-skip-permissions".to_string()
     };
     if let Some(m) = &job.model {
-        s.push_str(&if codex { format!(" -m '{m}'") } else { format!(" --model='{m}'") });
+        s.push_str(&if codex {
+            format!(" -m '{m}'")
+        } else {
+            format!(" --model='{m}'")
+        });
     }
     if let Some(c) = &job.config {
-        s.push_str(&if codex { format!(" --profile '{c}'") } else { format!(" --settings '{c}'") });
+        s.push_str(&if codex {
+            format!(" --profile '{c}'")
+        } else {
+            format!(" --settings '{c}'")
+        });
     }
     if let Some(a) = &job.args {
         s.push(' ');
@@ -281,9 +305,16 @@ async fn close_workspace(id: &str) {
 /// >0 means the create "failure" actually leaked a live workspace.
 async fn close_by_label(label: &str) -> u32 {
     let list = run30(&["herdr", "workspace", "list"]).await;
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&list.out) else { return 0 };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&list.out) else {
+        return 0;
+    };
     let mut closed = 0;
-    for ws in v.pointer("/result/workspaces").and_then(|w| w.as_array()).into_iter().flatten() {
+    for ws in v
+        .pointer("/result/workspaces")
+        .and_then(|w| w.as_array())
+        .into_iter()
+        .flatten()
+    {
         if ws.get("label").and_then(|l| l.as_str()) == Some(label) {
             if let Some(id) = ws.get("workspace_id").and_then(|i| i.as_str()) {
                 close_workspace(id).await;
@@ -301,15 +332,35 @@ async fn run_agent(job: &Job, rendered: &str) -> Option<(bool, String)> {
         return None;
     }
     let label = format!("job-{}", job.name);
-    let ws = run30(&["herdr", "workspace", "create", "--cwd", &job.cwd, "--label", &label, "--no-focus"]).await;
+    let ws = run30(&[
+        "herdr",
+        "workspace",
+        "create",
+        "--cwd",
+        &job.cwd,
+        "--label",
+        &label,
+        "--no-focus",
+    ])
+    .await;
     let (mut ws_id, mut pane) = (None::<String>, None::<String>);
     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&ws.out) {
-        ws_id = v.pointer("/result/workspace/workspace_id").and_then(|s| s.as_str()).map(String::from);
-        pane = v.pointer("/result/root_pane/pane_id").and_then(|s| s.as_str()).map(String::from);
+        ws_id = v
+            .pointer("/result/workspace/workspace_id")
+            .and_then(|s| s.as_str())
+            .map(String::from);
+        pane = v
+            .pointer("/result/root_pane/pane_id")
+            .and_then(|s| s.as_str())
+            .map(String::from);
     }
     let result = async {
         let (Some(pane), Some(_)) = (&pane, &ws_id) else {
-            eprintln!("[job:{}] workspace create failed: {}", job.name, ws.out.chars().take(200).collect::<String>());
+            eprintln!(
+                "[job:{}] workspace create failed: {}",
+                job.name,
+                ws.out.chars().take(200).collect::<String>()
+            );
             let orphans = close_by_label(&label).await;
             let detail = if orphans > 0 {
                 format!("workspace create unparseable, {orphans} orphan(s) closed by label")
@@ -318,11 +369,32 @@ async fn run_agent(job: &Job, rendered: &str) -> Option<(bool, String)> {
             };
             return Some((false, detail));
         };
-        if !run30(&["herdr", "pane", "run", pane, &launch_line(job)]).await.ok {
+        if !run30(&["herdr", "pane", "run", pane, &launch_line(job)])
+            .await
+            .ok
+        {
             return Some((false, "pane run failed".to_string()));
         }
-        if !run(&["herdr", "wait", "agent-status", pane, "--status", "idle", "--timeout", "60000"], Duration::from_secs(70)).await.ok {
-            eprintln!("[job:{}] agent did not become ready in pane {pane}", job.name);
+        if !run(
+            &[
+                "herdr",
+                "wait",
+                "agent-status",
+                pane,
+                "--status",
+                "idle",
+                "--timeout",
+                "60000",
+            ],
+            Duration::from_secs(70),
+        )
+        .await
+        .ok
+        {
+            eprintln!(
+                "[job:{}] agent did not become ready in pane {pane}",
+                job.name
+            );
             return Some((false, "agent never became ready".to_string()));
         }
         // agent-status flips idle on process detection, ~1-2s BEFORE the TUI reads input —
@@ -334,7 +406,17 @@ async fn run_agent(job: &Job, rendered: &str) -> Option<(bool, String)> {
         for _ in 0..3 {
             run30(&["herdr", "pane", "run", pane, rendered]).await;
             tokio::time::sleep(Duration::from_secs(2)).await;
-            let read = run30(&["herdr", "pane", "read", pane, "--source", "recent-unwrapped", "--lines", "80"]).await;
+            let read = run30(&[
+                "herdr",
+                "pane",
+                "read",
+                pane,
+                "--source",
+                "recent-unwrapped",
+                "--lines",
+                "80",
+            ])
+            .await;
             if !read.ok {
                 break; // can't verify — don't blind-retype; fail and retry next tick
             }
@@ -350,13 +432,37 @@ async fn run_agent(job: &Job, rendered: &str) -> Option<(bool, String)> {
         run30(&["herdr", "pane", "send-keys", pane, "Enter"]).await;
         let timeout_ms = job.timeout.as_millis().to_string();
         let done = run(
-            &["herdr", "wait", "agent-status", pane, "--status", "done", "--timeout", &timeout_ms],
+            &[
+                "herdr",
+                "wait",
+                "agent-status",
+                pane,
+                "--status",
+                "done",
+                "--timeout",
+                &timeout_ms,
+            ],
             job.timeout + Duration::from_secs(60),
         )
         .await;
-        let tail = run30(&["herdr", "pane", "read", pane, "--source", "recent", "--lines", "15"]).await;
-        println!("[job:{}] agent {}; tail:\n{}", job.name, if done.ok { "done" } else { "TIMED OUT" }, tail.out.trim());
-        Some((done.ok, if done.ok { "agent done".to_string() } else { "agent timeout".to_string() }))
+        let tail = run30(&[
+            "herdr", "pane", "read", pane, "--source", "recent", "--lines", "15",
+        ])
+        .await;
+        println!(
+            "[job:{}] agent {}; tail:\n{}",
+            job.name,
+            if done.ok { "done" } else { "TIMED OUT" },
+            tail.out.trim()
+        );
+        Some((
+            done.ok,
+            if done.ok {
+                "agent done".to_string()
+            } else {
+                "agent timeout".to_string()
+            },
+        ))
     }
     .await;
     if let Some(ref id) = ws_id {
@@ -375,7 +481,12 @@ async fn run_job(job: &Job) {
             }
             Ok(r) => r,
             Err(cmd) => {
-                record(&job.name, "skipped", started, &format!("precondition: {cmd}"));
+                record(
+                    &job.name,
+                    "skipped",
+                    started,
+                    &format!("precondition: {cmd}"),
+                );
                 return;
             }
         };
@@ -387,7 +498,11 @@ async fn run_job(job: &Job) {
     } else {
         // script job: only !`cmd` lines execute; anything else is prose
         for line in job.body.lines() {
-            let Some(cmd) = line.trim().strip_prefix("!`").and_then(|r| r.strip_suffix('`')) else {
+            let Some(cmd) = line
+                .trim()
+                .strip_prefix("!`")
+                .and_then(|r| r.strip_suffix('`'))
+            else {
                 continue;
             };
             let (ok, out) = shell(cmd, &job.cwd, job.timeout).await;
@@ -395,7 +510,12 @@ async fn run_job(job: &Job) {
                 println!("[job:{}] {out}", job.name);
             }
             if !ok {
-                record(&job.name, "failed", started, &format!("command failed: {cmd}"));
+                record(
+                    &job.name,
+                    "failed",
+                    started,
+                    &format!("command failed: {cmd}"),
+                );
                 return;
             }
         }
@@ -416,7 +536,10 @@ pub async fn scheduler(cfg: Cfg) {
     println!(
         "[jobs] scheduler: {} job(s) [{}], cap {cap}",
         jobs.len(),
-        jobs.iter().map(|j| j.name.as_str()).collect::<Vec<_>>().join(", ")
+        jobs.iter()
+            .map(|j| j.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     );
     let sem = Arc::new(tokio::sync::Semaphore::new(cap));
     let running: Arc<Mutex<HashSet<String>>> = Default::default();
@@ -426,8 +549,9 @@ pub async fn scheduler(cfg: Cfg) {
             if !job.enabled || running.lock().unwrap().contains(&job.name) {
                 continue;
             }
-            let due = last_record_ts(&job.name)
-                .map_or(true, |ts| epoch_now().saturating_sub(ts) >= job.every.as_secs());
+            let due = last_record_ts(&job.name).map_or(true, |ts| {
+                epoch_now().saturating_sub(ts) >= job.every.as_secs()
+            });
             if !due {
                 continue;
             }

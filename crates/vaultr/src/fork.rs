@@ -105,6 +105,7 @@ pub fn fork(root: &Path, id: &str, target: Target, opts: &ForkOptions) -> Result
                 git_branch,
                 &items,
                 base_instructions.as_deref(),
+                session.meta.model.as_deref(),
             )?;
             let launch = vec!["codex".into(), "resume".into(), id.clone()];
             (id, path, launch)

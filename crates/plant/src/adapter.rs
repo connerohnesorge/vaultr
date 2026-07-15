@@ -34,7 +34,10 @@ pub struct Adapter {
 }
 
 fn env_port(var: &str, default: u16) -> u16 {
-    std::env::var(var).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    std::env::var(var)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
 }
 
 fn env_or(var: &str, default: &str) -> String {
@@ -56,7 +59,10 @@ pub fn adapters() -> Vec<Adapter> {
             harness: "codex",
             kind: Harness::Codex,
             port: env_port("VAULTR_CODEX_PORT", 18924),
-            upstream: env_or("VAULTR_CODEX_UPSTREAM", "https://chatgpt.com/backend-api/codex"),
+            upstream: env_or(
+                "VAULTR_CODEX_UPSTREAM",
+                "https://chatgpt.com/backend-api/codex",
+            ),
             history_key: "input",
             big_fields: &["tools", "instructions"],
             terminal_event: "response.completed",
@@ -79,13 +85,22 @@ impl Adapter {
                     .pointer("/metadata/user_id")
                     .and_then(Value::as_str)
                     .and_then(|s| serde_json::from_str::<Value>(s).ok())
-                    .and_then(|v| v.get("session_id").and_then(Value::as_str).map(String::from))
+                    .and_then(|v| {
+                        v.get("session_id")
+                            .and_then(Value::as_str)
+                            .map(String::from)
+                    })
                     .filter(|s| is_uuid(s));
-                Identity { session_id: sid, ..Default::default() }
+                Identity {
+                    session_id: sid,
+                    ..Default::default()
+                }
             }
             Harness::Codex => {
                 let client = object(
-                    body.get("client_metadata").or_else(|| body.get("metadata")).cloned(),
+                    body.get("client_metadata")
+                        .or_else(|| body.get("metadata"))
+                        .cloned(),
                 );
                 let turn = object(
                     header_str(headers, "x-codex-turn-metadata")
@@ -126,7 +141,11 @@ impl Adapter {
                     .unwrap_or(Value::Null);
                 TokenUsage {
                     input: count(start.get("input_tokens")),
-                    output: count(delta.get("output_tokens").or_else(|| start.get("output_tokens"))),
+                    output: count(
+                        delta
+                            .get("output_tokens")
+                            .or_else(|| start.get("output_tokens")),
+                    ),
                     cache_read: count(start.get("cache_read_input_tokens")),
                     cache_creation: count(start.get("cache_creation_input_tokens")),
                 }
@@ -158,13 +177,18 @@ fn header_str<'a>(headers: &'a hyper::HeaderMap, name: &str) -> Option<&'a str> 
 fn object(value: Option<Value>) -> Value {
     match value {
         Some(v @ Value::Object(_)) => v,
-        Some(Value::String(s)) => serde_json::from_str(&s).unwrap_or(Value::Object(Default::default())),
+        Some(Value::String(s)) => {
+            serde_json::from_str(&s).unwrap_or(Value::Object(Default::default()))
+        }
         _ => Value::Object(Default::default()),
     }
 }
 
 fn id_field(obj: &Value, key: &str) -> Option<String> {
-    obj.get(key).and_then(Value::as_str).filter(|s| is_uuid(s)).map(String::from)
+    obj.get(key)
+        .and_then(Value::as_str)
+        .filter(|s| is_uuid(s))
+        .map(String::from)
 }
 
 pub fn is_uuid(s: &str) -> bool {
@@ -202,8 +226,17 @@ pub fn is_uuid(s: &str) -> bool {
 
 fn count(value: Option<&Value>) -> u64 {
     match value {
-        Some(Value::Number(n)) => n.as_f64().filter(|f| f.is_finite() && *f >= 0.0).map(|f| f as u64).unwrap_or(0),
-        Some(Value::String(s)) => s.parse::<f64>().ok().filter(|f| f.is_finite() && *f >= 0.0).map(|f| f as u64).unwrap_or(0),
+        Some(Value::Number(n)) => n
+            .as_f64()
+            .filter(|f| f.is_finite() && *f >= 0.0)
+            .map(|f| f as u64)
+            .unwrap_or(0),
+        Some(Value::String(s)) => s
+            .parse::<f64>()
+            .ok()
+            .filter(|f| f.is_finite() && *f >= 0.0)
+            .map(|f| f as u64)
+            .unwrap_or(0),
         _ => 0,
     }
 }

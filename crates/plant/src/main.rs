@@ -24,7 +24,10 @@ fn crash_log() -> PathBuf {
 
 fn vault_path() -> PathBuf {
     PathBuf::from(std::env::var("VAULT_SESSIONS").unwrap_or_else(|_| {
-        format!("{}/.dotfiles/vault/sessions", std::env::var("HOME").expect("HOME"))
+        format!(
+            "{}/.dotfiles/vault/sessions",
+            std::env::var("HOME").expect("HOME")
+        )
     }))
 }
 
@@ -40,12 +43,18 @@ async fn subcommand(argv: &[String]) -> Option<i32> {
     let idle = flag("--idle")
         .and_then(|v| jobs::parse_duration(&v))
         .unwrap_or(Duration::from_secs(3600));
-    match (argv.get(1).map(String::as_str), argv.get(2).map(String::as_str)) {
+    match (
+        argv.get(1).map(String::as_str),
+        argv.get(2).map(String::as_str),
+    ) {
         (Some("sessions"), Some("eligible")) => {
             let max = flag("--max").and_then(|v| v.parse().ok()).unwrap_or(10);
             let list = sweep::eligible_sessions(&vault_path(), idle, max);
             let (total, ledgered) = sweep::eligibility_stats(&vault_path());
-            eprintln!("[eligible] {} of {total} sessions ({ledgered} ledgered)", list.len());
+            eprintln!(
+                "[eligible] {} of {total} sessions ({ledgered} ledgered)",
+                list.len()
+            );
             if list.is_empty() {
                 return Some(1);
             }
@@ -53,7 +62,11 @@ async fn subcommand(argv: &[String]) -> Option<i32> {
             Some(0)
         }
         (Some("compress"), Some("once")) => {
-            Some(if sweep::compress_sweep(&vault_path(), idle).await { 0 } else { 1 })
+            Some(if sweep::compress_sweep(&vault_path(), idle).await {
+                0
+            } else {
+                1
+            })
         }
         _ => None,
     }
@@ -80,7 +93,11 @@ fn record_exit(started: SystemTime, why: &str) {
         rss_mb(),
     );
     use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(crash_log()) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(crash_log())
+    {
         let _ = f.write_all(line.as_bytes());
     }
 }
@@ -115,7 +132,11 @@ async fn main() {
             std::process::id()
         );
         use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(crash_log()) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(crash_log())
+        {
             let _ = f.write_all(msg.as_bytes());
         }
         eprintln!("[plant] {info}");

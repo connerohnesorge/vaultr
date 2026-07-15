@@ -7,8 +7,9 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub const HISTOGRAM_BOUNDS: [u64; 11] =
-    [100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000, 120_000, 300_000];
+pub const HISTOGRAM_BOUNDS: [u64; 11] = [
+    100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000, 120_000, 300_000,
+];
 
 struct HistogramPoint {
     attributes: Value,
@@ -32,7 +33,9 @@ pub struct Otel {
 }
 
 fn now_ns() -> String {
-    let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let d = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     format!("{}", d.as_millis() as u128 * 1_000_000)
 }
 
@@ -54,7 +57,11 @@ fn attributes(values: &[(&str, Value)]) -> Value {
 }
 
 fn attrs_from_map(map: &Map<String, Value>) -> Value {
-    attributes(&map.iter().map(|(k, v)| (k.as_str(), v.clone())).collect::<Vec<_>>())
+    attributes(
+        &map.iter()
+            .map(|(k, v)| (k.as_str(), v.clone()))
+            .collect::<Vec<_>>(),
+    )
 }
 
 fn resource(loki_labels: bool) -> Value {
@@ -98,13 +105,23 @@ impl Otel {
         }
     }
 
-    pub fn record(&self, adapter: &Adapter, model: Option<&str>, req: &CapturedRequest, resp: &CapturedResponse) {
+    pub fn record(
+        &self,
+        adapter: &Adapter,
+        model: Option<&str>,
+        req: &CapturedRequest,
+        resp: &CapturedResponse,
+    ) {
         if !self.enabled {
             return;
         }
         let model = model.unwrap_or("unknown").to_string();
         let usage = adapter.usage(&parse_sse(&resp.sse));
-        let duration_ms = req.started_at.elapsed().map(|d| d.as_millis() as u64).unwrap_or(0);
+        let duration_ms = req
+            .started_at
+            .elapsed()
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
 
         let mut st = self.state.lock().unwrap();
         for (typ, value) in [
@@ -123,7 +140,10 @@ impl Otel {
             "status": resp.status.to_string(), "model": model, "harness": adapter.harness,
             "complete": resp.complete,
         });
-        st.requests.entry(req_attrs.to_string()).or_insert((req_attrs, 0)).1 += 1;
+        st.requests
+            .entry(req_attrs.to_string())
+            .or_insert((req_attrs, 0))
+            .1 += 1;
 
         let common = json!({ "model": model, "harness": adapter.harness });
         let key = common.to_string();
@@ -135,13 +155,19 @@ impl Otel {
         });
         hist.count += 1;
         hist.sum += duration_ms;
-        let bucket = HISTOGRAM_BOUNDS.iter().position(|&b| duration_ms <= b).unwrap_or(HISTOGRAM_BOUNDS.len());
+        let bucket = HISTOGRAM_BOUNDS
+            .iter()
+            .position(|&b| duration_ms <= b)
+            .unwrap_or(HISTOGRAM_BOUNDS.len());
         hist.buckets[bucket] += 1;
 
         let ok = resp.status < 400 && resp.complete;
         let t = now_ns();
         let log_attrs = attributes(&[
-            ("session_id", json!(req.ids.session_id.as_deref().unwrap_or("unknown"))),
+            (
+                "session_id",
+                json!(req.ids.session_id.as_deref().unwrap_or("unknown")),
+            ),
             ("model", json!(model)),
             ("harness", json!(adapter.harness)),
             ("status", json!(resp.status)),
@@ -224,7 +250,9 @@ impl Otel {
                     .output()
                     .await;
                 match out {
-                    Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+                    Ok(o) if o.status.success() => {
+                        String::from_utf8_lossy(&o.stdout).trim().to_string()
+                    }
                     _ => {
                         eprintln!("[otel] cnb auth token failed; skipping flush");
                         return;

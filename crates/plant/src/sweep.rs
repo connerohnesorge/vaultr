@@ -38,8 +38,14 @@ pub async fn run(cmd: &[&str], timeout: Duration) -> RunResult {
         .env("PATH", augmented_path())
         .output();
     match tokio::time::timeout(timeout, fut).await {
-        Ok(Ok(o)) => RunResult { ok: o.status.success(), out: String::from_utf8_lossy(&o.stdout).into_owned() },
-        _ => RunResult { ok: false, out: String::new() },
+        Ok(Ok(o)) => RunResult {
+            ok: o.status.success(),
+            out: String::from_utf8_lossy(&o.stdout).into_owned(),
+        },
+        _ => RunResult {
+            ok: false,
+            out: String::new(),
+        },
     }
 }
 
@@ -55,7 +61,9 @@ fn which(bin: &str) -> bool {
 
 fn ledger_sessions(vault: &Path) -> HashSet<String> {
     let mut processed = HashSet::new();
-    if let Ok(text) = std::fs::read_to_string(vault.join("..").join("learnings").join(".ledger.jsonl")) {
+    if let Ok(text) =
+        std::fs::read_to_string(vault.join("..").join("learnings").join(".ledger.jsonl"))
+    {
         for line in text.lines() {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
                 if let Some(sid) = v.get("session_id").and_then(|s| s.as_str()) {
@@ -72,7 +80,12 @@ fn turns_files(vault: &Path) -> Vec<(String, PathBuf)> {
     let mut out = vec![];
     let dirs = |p: &Path| -> Vec<PathBuf> {
         std::fs::read_dir(p)
-            .map(|rd| rd.flatten().map(|e| e.path()).filter(|p| p.is_dir()).collect())
+            .map(|rd| {
+                rd.flatten()
+                    .map(|e| e.path())
+                    .filter(|p| p.is_dir())
+                    .collect()
+            })
             .unwrap_or_default()
     };
     for y in dirs(vault) {
@@ -137,16 +150,16 @@ pub fn eligibility_stats(vault: &Path) -> (usize, usize) {
 /// so this defends message *bodies*. Compiled once per scrub, not per line.
 fn secret_regexes() -> Vec<regex::Regex> {
     [
-        r"sk-ant-[A-Za-z0-9_-]{20,}",                                     // Anthropic
+        r"sk-ant-[A-Za-z0-9_-]{20,}", // Anthropic
         // ponytail: no bare `sk-[alnum]{20,}` — it over-matches base64 (the exact entropy
         // false-positive we dropped gitleaks for). Add sk-proj-/sk-[alnum]{48} if OpenAI
         // keys ever show up in bodies (we capture Anthropic traffic, so they don't yet).
-        r"(?:AKIA|ASIA)[0-9A-Z]{16}",                                     // AWS access key
-        r"gh[posru]_[A-Za-z0-9]{36,}",                                    // GitHub token
-        r"xox[baprs]-[A-Za-z0-9-]{10,}",                                  // Slack token
-        r"https://hooks\.slack\.com/services/[A-Za-z0-9/]+",             // Slack webhook
-        r"AIza[0-9A-Za-z_-]{35}",                                         // Google API key
-        r"ya29\.[0-9A-Za-z_-]{20,}",                                      // Google OAuth
+        r"(?:AKIA|ASIA)[0-9A-Z]{16}",    // AWS access key
+        r"gh[posru]_[A-Za-z0-9]{36,}",   // GitHub token
+        r"xox[baprs]-[A-Za-z0-9-]{10,}", // Slack token
+        r"https://hooks\.slack\.com/services/[A-Za-z0-9/]+", // Slack webhook
+        r"AIza[0-9A-Za-z_-]{35}",        // Google API key
+        r"ya29\.[0-9A-Za-z_-]{20,}",     // Google OAuth
         r"(?s)-----BEGIN[A-Z ]*PRIVATE KEY-----.*?-----END[A-Z ]*PRIVATE KEY-----", // PEM
     ]
     .iter()
@@ -156,7 +169,11 @@ fn secret_regexes() -> Vec<regex::Regex> {
 
 /// Redact one line against literal denylist needles + secret regexes. Pure — the streaming
 /// loop and the self-test both call it. Returns the rewritten line and the redaction count.
-fn redact_line(mut line: String, needles: &HashSet<String>, patterns: &[regex::Regex]) -> (String, usize) {
+fn redact_line(
+    mut line: String,
+    needles: &HashSet<String>,
+    patterns: &[regex::Regex],
+) -> (String, usize) {
     let mut hits = 0;
     for needle in needles {
         let c = line.matches(needle.as_str()).count();
@@ -258,15 +275,33 @@ pub async fn compress_sweep(vault: &Path, idle: Duration) -> bool {
         let herdr = path.with_file_name("herdr.jsonl");
         if herdr.is_file() {
             let herdr_s = herdr.display().to_string();
-            if !run(&["zstd", "-19", "-T0", "-q", "--rm", &herdr_s], Duration::from_secs(600)).await.ok {
+            if !run(
+                &["zstd", "-19", "-T0", "-q", "--rm", &herdr_s],
+                Duration::from_secs(600),
+            )
+            .await
+            .ok
+            {
                 continue;
             }
         }
-        if run(&["zstd", "-19", "-T0", "-q", "--rm", &path_s], Duration::from_secs(600)).await.ok {
+        if run(
+            &["zstd", "-19", "-T0", "-q", "--rm", &path_s],
+            Duration::from_secs(600),
+        )
+        .await
+        .ok
+        {
             sealed += 1;
-            let after = std::fs::metadata(format!("{path_s}.zst")).map(|m| m.len()).unwrap_or(0);
+            let after = std::fs::metadata(format!("{path_s}.zst"))
+                .map(|m| m.len())
+                .unwrap_or(0);
             let rel = path_s.split("/sessions/").nth(1).unwrap_or(&path_s);
-            println!("[compress] {rel}: {:.1}MB -> {:.1}MB", before as f64 / 1e6, after as f64 / 1e6);
+            println!(
+                "[compress] {rel}: {:.1}MB -> {:.1}MB",
+                before as f64 / 1e6,
+                after as f64 / 1e6
+            );
         }
     }
     if sealed > 0 {
@@ -276,7 +311,14 @@ pub async fn compress_sweep(vault: &Path, idle: Duration) -> bool {
         let msg = format!("chore: seal {sealed} session(s) (scrubbed + zstd)");
         run30(&["git", "-C", &repo, "commit", "-m", &msg]).await;
         let push = run(&["git", "-C", &repo, "push"], Duration::from_secs(300)).await;
-        println!("[compress] sealed {sealed}, push {}", if push.ok { "ok" } else { "FAILED (next sweep retries)" });
+        println!(
+            "[compress] sealed {sealed}, push {}",
+            if push.ok {
+                "ok"
+            } else {
+                "FAILED (next sweep retries)"
+            }
+        );
     } else {
         println!("[compress] nothing to seal");
     }

@@ -68,6 +68,22 @@ pub fn reconstruct_reader<R: Read>(reader: R) -> Result<Recon> {
         // next request's history delta; only the final envelope's completed
         // response needs appending. Track it per-envelope, keeping only the last.
         trailing = extract_response_output(&env, &harness);
+        // Codex stamps each replayed item with the turn it belongs to; the
+        // request-side items of this turn carry it already (baked into the
+        // wire), but the response-side items we append here don't — add it so
+        // a fork's resume replays them byte-identically to a native resume.
+        if harness == "codex" {
+            if let Some(turn_id) = env.get("turn_id").and_then(Value::as_str) {
+                for item in &mut trailing {
+                    if let Some(o) = item.as_object_mut() {
+                        o.insert(
+                            "internal_chat_message_metadata_passthrough".into(),
+                            serde_json::json!({"turn_id": turn_id}),
+                        );
+                    }
+                }
+            }
+        }
 
         let Some(h) = env.pointer("/request/body_delta/history") else {
             continue;

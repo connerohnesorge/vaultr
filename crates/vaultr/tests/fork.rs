@@ -128,6 +128,27 @@ fn claude_empty_history_writes_nothing() {
     );
 }
 
+// Mirror the writer's stored-form normalization: cache_control stripped, and a
+// user message whose content is a single bare text block collapses to a string.
+fn stored_form(m: &Value) -> Value {
+    let v = claude_writer::strip_cache_control(m.clone());
+    let is_user = v["role"] == "user";
+    let content = &v["content"];
+    if is_user {
+        if let Some(a) = content.as_array() {
+            if a.len() == 1
+                && a[0]["type"] == "text"
+                && a[0].as_object().map(|o| o.len()) == Some(2)
+            {
+                let mut v2 = v.clone();
+                v2["content"] = a[0]["text"].clone();
+                return v2;
+            }
+        }
+    }
+    v
+}
+
 #[test]
 fn claude_passthrough_strips_cache_control_only() {
     let dir = tmp();
@@ -138,21 +159,14 @@ fn claude_passthrough_strips_cache_control_only() {
         .iter()
         .filter(|r| r["type"] == "user" || r["type"] == "assistant")
         .collect();
-    let expected: Vec<Value> = msgs
-        .iter()
-        .map(|m| claude_writer::strip_cache_control(m.clone()))
-        .collect();
+    let expected: Vec<Value> = msgs.iter().map(stored_form).collect();
     for (rec, exp) in conv.iter().zip(&expected) {
         assert_eq!(rec["message"]["content"], exp["content"]);
         assert_eq!(rec["message"]["role"], exp["role"]);
     }
-    // system-reminder text preserved byte-for-byte in the record.
-    let first = conv[0]["message"]["content"][0]["text"].as_str().unwrap();
+    // system-reminder text preserved byte-for-byte in the stored (collapsed) record.
+    let first = conv[0]["message"]["content"].as_str().unwrap();
     assert!(first.contains("<system-reminder>secret scaffolding</system-reminder>"));
-    // cache_control gone.
-    assert!(conv[0]["message"]["content"][0]
-        .get("cache_control")
-        .is_none());
 }
 
 // ---------- Codex writer ----------
@@ -186,6 +200,7 @@ fn codex_filename_local_time_and_uuidv7() {
         Some("main"),
         &codex_items(),
         Some("base"),
+        None,
         &id,
         start,
     )
@@ -219,7 +234,7 @@ fn codex_filename_local_time_and_uuidv7() {
 fn codex_passthrough_fidelity_and_preview_events() {
     let home = tmp();
     let items = codex_items();
-    let (id, path) = codex_writer::write(home.path(), "/tmp", None, &items, None).unwrap();
+    let (id, path) = codex_writer::write(home.path(), "/tmp", None, &items, None, None).unwrap();
     assert_eq!(uuid::Uuid::parse_str(&id).unwrap().get_version_num(), 7);
     let recs = read_jsonl(&path);
     assert_eq!(recs[0]["type"], "session_meta");
@@ -230,7 +245,15 @@ fn codex_passthrough_fidelity_and_preview_events() {
         .collect();
     assert_eq!(written.len(), items.len());
     for (w, orig) in written.iter().zip(&items) {
-        assert_eq!(*w, orig, "response_item must round-trip verbatim");
+        if orig["type"] == "reasoning" {
+            // reasoning is normalized to the replayed wire shape
+            assert_eq!(w["id"], orig["id"]);
+            assert_eq!(w["summary"], orig["summary"]);
+            assert_eq!(w["content"], Value::Null);
+            assert_eq!(w["encrypted_content"], orig["encrypted_content"]);
+        } else {
+            assert_eq!(*w, orig, "response_item must round-trip verbatim");
+        }
     }
     // exactly one user_message preview (the typed one, not AGENTS.md scaffolding)
     let previews: Vec<&Value> = recs
@@ -254,9 +277,9 @@ fn codex_collision_refused() {
     let start = Local.with_ymd_and_hms(2026, 1, 1, 1, 1, 1).unwrap();
     let id = uuid::Uuid::now_v7().to_string();
     let items = codex_items();
-    codex_writer::write_with_id(home.path(), "/", None, &items, None, &id, start).unwrap();
-    let err =
-        codex_writer::write_with_id(home.path(), "/", None, &items, None, &id, start).unwrap_err();
+    codex_writer::write_with_id(home.path(), "/", None, &items, None, None, &id, start).unwrap();
+    let err = codex_writer::write_with_id(home.path(), "/", None, &items, None, None, &id, start)
+        .unwrap_err();
     assert!(err.to_string().contains("refusing to overwrite"));
 }
 
@@ -402,7 +425,7 @@ fn fork_same_harness_claude_roundtrip() {
         .collect();
     let expected: Vec<Value> = msgs
         .iter()
-        .map(|m| claude_writer::strip_cache_control(m["content"].clone()))
+        .map(|m| stored_form(m)["content"].clone())
         .collect();
     assert_eq!(contents.len(), expected.len());
     for (got, exp) in contents.iter().zip(&expected) {
@@ -531,7 +554,9 @@ fn smoke(harness: &str, target: Target) {
         Target::Claude => {
             let conv: Vec<&Value> = recs
                 .iter()
-                .filter(|r| r["type"] == "user" || r["type"] == "assistant")
+                .filter(|r| {
+                    r["type"] == "user" || r["type"] == "assistant" || r["type"] == "attachment"
+                })
                 .collect();
             assert!(!conv.is_empty());
             assert!(conv[0]["parentUuid"].is_null());
