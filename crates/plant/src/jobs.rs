@@ -362,6 +362,11 @@ async fn close_by_label(label: &str) -> u32 {
         .flatten()
     {
         if ws.get("label").and_then(|l| l.as_str()) == Some(label) {
+            // a kept pane from a falsely-"failed" run can still hold a working agent —
+            // never close those out from under it
+            if ws.get("agent_status").and_then(|s| s.as_str()) == Some("working") {
+                continue;
+            }
             if let Some(id) = ws.get("workspace_id").and_then(|i| i.as_str()) {
                 close_workspace(id).await;
                 closed += 1;
@@ -474,7 +479,9 @@ async fn run_agent(job: &Job, rendered: &str) -> Option<(bool, String)> {
             if !read.ok {
                 break; // can't verify — don't blind-retype; fail and retry next tick
             }
-            if read.out.contains(&needle) {
+            // claude's TUI collapses large pastes to "[Pasted text #N]" — that placeholder
+            // IS the prompt having landed; retyping on it queues duplicate prompts
+            if read.out.contains(&needle) || read.out.contains("[Pasted text") {
                 landed = true;
                 break;
             }
