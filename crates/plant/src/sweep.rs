@@ -59,15 +59,18 @@ fn which(bin: &str) -> bool {
         .any(|dir| Path::new(dir).join(bin).is_file())
 }
 
-fn ledger_sessions(vault: &Path) -> HashSet<String> {
+fn ledger_sessions(vault: &Path, learner: &str) -> HashSet<String> {
     let mut processed = HashSet::new();
     if let Ok(text) =
         std::fs::read_to_string(vault.join("..").join("learnings").join(".ledger.jsonl"))
     {
         for line in text.lines() {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
-                if let Some(sid) = v.get("session_id").and_then(|s| s.as_str()) {
-                    processed.insert(sid.to_string());
+                let recorded = v.get("learner").and_then(|s| s.as_str());
+                if recorded == Some(learner) || (recorded.is_none() && learner == "claude") {
+                    if let Some(sid) = v.get("session_id").and_then(|s| s.as_str()) {
+                        processed.insert(sid.to_string());
+                    }
                 }
             }
         }
@@ -75,8 +78,12 @@ fn ledger_sessions(vault: &Path) -> HashSet<String> {
     processed
 }
 
-/// glob */*/*/*/turns.jsonl under vault -> (session_id, path)
-fn turns_files(vault: &Path) -> Vec<(String, PathBuf)> {
+fn capture_files(vault: &Path) -> Vec<(String, PathBuf)> {
+    turns_files(vault, true)
+}
+
+/// glob */*/*/*/turns.jsonl[.zst] under vault -> (session_id, path)
+fn turns_files(vault: &Path, include_compressed: bool) -> Vec<(String, PathBuf)> {
     let mut out = vec![];
     let dirs = |p: &Path| -> Vec<PathBuf> {
         std::fs::read_dir(p)
@@ -92,7 +99,14 @@ fn turns_files(vault: &Path) -> Vec<(String, PathBuf)> {
         for m in dirs(&y) {
             for d in dirs(&m) {
                 for sess in dirs(&d) {
-                    let f = sess.join("turns.jsonl");
+                    let raw = sess.join("turns.jsonl");
+                    let f = if raw.is_file() {
+                        raw
+                    } else if include_compressed {
+                        sess.join("turns.jsonl.zst")
+                    } else {
+                        continue;
+                    };
                     if f.is_file() {
                         if let Some(sid) = sess.file_name().and_then(|s| s.to_str()) {
                             out.push((sid.to_string(), f));
@@ -114,16 +128,19 @@ fn idle_for(path: &Path, idle: Duration) -> bool {
         .unwrap_or(false)
 }
 
-pub fn eligible_sessions(vault: &Path, idle: Duration, max: usize) -> Vec<String> {
-    let processed = ledger_sessions(vault);
+pub fn eligible_sessions(vault: &Path, idle: Duration, max: usize, learner: &str) -> Vec<String> {
+    let processed = ledger_sessions(vault, learner);
     let mut out = vec![];
-    for (sid, path) in turns_files(vault) {
+    for (sid, path) in capture_files(vault) {
         if processed.contains(&sid) || !idle_for(&path, idle) {
             continue;
         }
+        let compressed = path.extension().and_then(|e| e.to_str()) == Some("zst");
         let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         // substance gate: >20KB, or >5 turns (only read small files to count)
-        let substantive = size > 20_480
+        // Compressed sessions already cleared the legacy Claude pass before sealing.
+        let substantive = compressed
+            || size > 20_480
             || std::fs::read_to_string(&path)
                 .map(|t| t.trim_end().lines().count() > 5)
                 .unwrap_or(false);
@@ -139,8 +156,11 @@ pub fn eligible_sessions(vault: &Path, idle: Duration, max: usize) -> Vec<String
 
 /// Diagnostics for the `sessions eligible` subcommand's stderr — stdout must stay
 /// clean (it is substituted into an agent prompt by the learn job).
-pub fn eligibility_stats(vault: &Path) -> (usize, usize) {
-    (turns_files(vault).len(), ledger_sessions(vault).len())
+pub fn eligibility_stats(vault: &Path, learner: &str) -> (usize, usize) {
+    (
+        capture_files(vault).len(),
+        ledger_sessions(vault, learner).len(),
+    )
 }
 
 /// Unambiguous secret formats — low false-positive prefixes only. Deliberately NOT a
@@ -261,10 +281,11 @@ pub async fn compress_sweep(vault: &Path, idle: Duration) -> bool {
         eprintln!("[compress] zstd not on PATH");
         return false;
     }
-    let processed = ledger_sessions(vault);
+    let claude = ledger_sessions(vault, "claude");
+    let codex = ledger_sessions(vault, "codex");
     let mut sealed = 0u32;
-    for (sid, path) in turns_files(vault) {
-        if !processed.contains(&sid) || !idle_for(&path, idle) {
+    for (sid, path) in turns_files(vault, false) {
+        if !claude.contains(&sid) || !codex.contains(&sid) || !idle_for(&path, idle) {
             continue;
         }
         if !scrub(&path).await {
@@ -323,4 +344,41 @@ pub async fn compress_sweep(vault: &Path, idle: Duration) -> bool {
         println!("[compress] nothing to seal");
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn eligibility_is_independent_per_learner() {
+        let root = std::env::temp_dir().join(format!("plant-sweep-test-{}", std::process::id()));
+        let sessions = root.join("sessions");
+        let claude_id = "claude-processed";
+        let codex_id = "codex-processed";
+        let claude_dir = sessions.join("2026/07/15").join(claude_id);
+        let codex_dir = sessions.join("2026/07/15").join(codex_id);
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        std::fs::write(claude_dir.join("turns.jsonl"), "{}\n".repeat(6)).unwrap();
+        std::fs::write(codex_dir.join("turns.jsonl.zst"), "sealed").unwrap();
+        std::fs::create_dir_all(root.join("learnings")).unwrap();
+        std::fs::write(
+            root.join("learnings/.ledger.jsonl"),
+            format!(
+                "{{\"session_id\":\"{claude_id}\"}}\n{{\"session_id\":\"{codex_id}\",\"learner\":\"codex\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        let claude = eligible_sessions(&sessions, Duration::ZERO, 10, "claude");
+        let codex = eligible_sessions(&sessions, Duration::ZERO, 10, "codex");
+        assert!(claude.iter().any(|p| p.ends_with(codex_id)));
+        assert!(!claude.iter().any(|p| p.ends_with(claude_id)));
+        assert!(codex.iter().any(|p| p.ends_with(claude_id)));
+        assert!(!codex.iter().any(|p| p.ends_with(codex_id)));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
 }

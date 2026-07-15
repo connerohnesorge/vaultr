@@ -13,6 +13,7 @@ use crate::sweep::{run, run30};
 
 const DEFAULTS: &[(&str, &str)] = &[
     ("learn", include_str!("../jobs/learn.md")),
+    ("learn-codex", include_str!("../jobs/learn-codex.md")),
     ("compress", include_str!("../jobs/compress.md")),
     ("reconcile", include_str!("../jobs/reconcile.md")),
 ];
@@ -531,7 +532,7 @@ pub async fn scheduler(cfg: Cfg) {
     let cap: usize = cfg
         .get("PLANT_JOBS_MAX_CONCURRENT")
         .and_then(|v| v.parse().ok())
-        .unwrap_or(2);
+        .unwrap_or(1);
     let jobs = load_jobs();
     println!(
         "[jobs] scheduler: {} job(s) [{}], cap {cap}",
@@ -564,5 +565,19 @@ pub async fn scheduler(cfg: Cfg) {
             });
         }
         tokio::time::sleep(Duration::from_secs(60)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn codex_learn_job_uses_requested_model_and_effort() {
+        let job = parse_job("learn-codex", include_str!("../jobs/learn-codex.md")).unwrap();
+        assert_eq!(job.cli.as_deref(), Some("codex"));
+        assert_eq!(job.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(job.args.as_deref(), Some("-c model_reasoning_effort=xhigh"));
+        assert!(job.body.contains("--learner codex"));
     }
 }

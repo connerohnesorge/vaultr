@@ -31,7 +31,8 @@ fn vault_path() -> PathBuf {
     }))
 }
 
-/// `plant sessions eligible [--idle 60m] [--max 10]` and `plant compress once [--idle 60m]`
+/// `plant sessions eligible [--learner claude|codex] [--idle 60m] [--max 10]`
+/// and `plant compress once [--idle 60m]`
 /// — the sweep primitives jobs/*.md bodies compose. Exit 1 from `sessions eligible` with
 /// nothing eligible => the learn job records `skipped` instead of launching an agent.
 async fn subcommand(argv: &[String]) -> Option<i32> {
@@ -49,10 +50,11 @@ async fn subcommand(argv: &[String]) -> Option<i32> {
     ) {
         (Some("sessions"), Some("eligible")) => {
             let max = flag("--max").and_then(|v| v.parse().ok()).unwrap_or(10);
-            let list = sweep::eligible_sessions(&vault_path(), idle, max);
-            let (total, ledgered) = sweep::eligibility_stats(&vault_path());
+            let learner = flag("--learner").unwrap_or_else(|| "claude".to_string());
+            let list = sweep::eligible_sessions(&vault_path(), idle, max, &learner);
+            let (total, ledgered) = sweep::eligibility_stats(&vault_path(), &learner);
             eprintln!(
-                "[eligible] {} of {total} sessions ({ledgered} ledgered)",
+                "[eligible:{learner}] {} of {total} sessions ({ledgered} ledgered)",
                 list.len()
             );
             if list.is_empty() {
