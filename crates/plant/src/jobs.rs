@@ -1,6 +1,9 @@
 //! Declarative jobs: <vault>/jobs/*.md — frontmatter (schedule + launch config)
 //! + body. `cli:` present => agent job (render !`cmd` placeholders, type into a fresh
 //! Herdr pane); absent => script job (execute the body's !`cmd` lines in order).
+//! `close-pane: always|on-success|never` (default always) controls whether the job's
+//! Herdr workspace is closed when the run ends; kept workspaces are reclaimed by the
+//! next run of the same job.
 //! Outcomes append to ~/.local/state/plant/jobs/<name>.jsonl; the tail line is the
 //! scheduling state (due when now - last.ts >= every). Never `claude -p`.
 
@@ -59,6 +62,13 @@ impl Cfg {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ClosePane {
+    Always,
+    OnSuccess,
+    Never,
+}
+
 #[derive(Clone)]
 pub struct Job {
     pub name: String,
@@ -70,6 +80,7 @@ pub struct Job {
     pub config: Option<String>,
     pub args: Option<String>,
     pub cwd: String,
+    pub close_pane: ClosePane,
     pub body: String,
 }
 
@@ -115,6 +126,7 @@ pub fn parse_job(name: &str, text: &str) -> Option<Job> {
         config: None,
         args: None,
         cwd: expand_home("~/.dotfiles"),
+        close_pane: ClosePane::Always,
         body: body.trim().to_string(),
     };
     for line in fm.lines() {
@@ -131,6 +143,14 @@ pub fn parse_job(name: &str, text: &str) -> Option<Job> {
             "config" => job.config = Some(expand_home(v)),
             "args" => job.args = Some(v.to_string()),
             "cwd" => job.cwd = expand_home(v),
+            "close-pane" => {
+                job.close_pane = match v {
+                    "always" => ClosePane::Always,
+                    "on-success" => ClosePane::OnSuccess,
+                    "never" => ClosePane::Never,
+                    _ => return None,
+                }
+            }
             _ => {}
         }
     }
@@ -255,11 +275,13 @@ async fn render(body: &str, cwd: &str, timeout: Duration) -> Result<String, Stri
 
 fn launch_line(job: &Job) -> String {
     let codex = job.cli.as_deref() == Some("codex");
+    // `command` bypasses the user's interactive-shell aliases (a `codex='codex --yolo'`
+    // alias duplicated our flag, clap refused, and the prompt got typed into bare zsh)
     let mut s = if codex {
         // sandboxed codex blocks on its first approval prompt — background panes can't answer
-        "codex --dangerously-bypass-approvals-and-sandbox".to_string()
+        "command codex --dangerously-bypass-approvals-and-sandbox".to_string()
     } else {
-        "claude --dangerously-skip-permissions".to_string()
+        "command claude --dangerously-skip-permissions".to_string()
     };
     if let Some(m) = &job.model {
         s.push_str(&if codex {
@@ -280,6 +302,24 @@ fn launch_line(job: &Job) -> String {
         s.push_str(a);
     }
     s
+}
+
+/// herdr's agent-status reports "idle" for a bare shell too — a failed CLI launch drops
+/// the pane back to zsh and typing a prompt there executes it as shell commands. Only
+/// trust a pane that herdr has actually recognized as running an agent.
+async fn pane_has_agent(pane: &str) -> bool {
+    let list = run30(&["herdr", "pane", "list"]).await;
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&list.out) else {
+        return false;
+    };
+    v.pointer("/result/panes")
+        .and_then(|p| p.as_array())
+        .into_iter()
+        .flatten()
+        .any(|p| {
+            p.get("pane_id").and_then(|i| i.as_str()) == Some(pane)
+                && p.get("agent").and_then(|a| a.as_str()).is_some()
+        })
 }
 
 async fn focused_workspace() -> Option<String> {
@@ -338,6 +378,11 @@ async fn run_agent(job: &Job, rendered: &str) -> Option<(bool, String)> {
         return None;
     }
     let label = format!("job-{}", job.name);
+    // reclaim workspaces from prior runs: SIGTERM'd mid-run leaks, or close-pane kept ones
+    let stale = close_by_label(&label).await;
+    if stale > 0 {
+        println!("[job:{}] reclaimed {stale} stale workspace(s)", job.name);
+    }
     let ws = run30(&[
         "herdr",
         "workspace",
@@ -407,6 +452,9 @@ async fn run_agent(job: &Job, rendered: &str) -> Option<(bool, String)> {
         // a paste sent in that window is swallowed whole. Wait out startup, then verify
         // the text actually landed in the pane before submitting; retype if it didn't.
         tokio::time::sleep(Duration::from_secs(3)).await;
+        if !pane_has_agent(pane).await {
+            return Some((false, "CLI never launched (pane has no agent)".to_string()));
+        }
         let needle: String = rendered.chars().take(30).collect();
         let mut landed = false;
         for _ in 0..3 {
@@ -471,8 +519,17 @@ async fn run_agent(job: &Job, rendered: &str) -> Option<(bool, String)> {
         ))
     }
     .await;
-    if let Some(ref id) = ws_id {
-        close_workspace(id).await;
+    let close = match job.close_pane {
+        ClosePane::Always => true,
+        ClosePane::Never => false,
+        ClosePane::OnSuccess => matches!(result, Some((true, _))),
+    };
+    if close {
+        if let Some(ref id) = ws_id {
+            close_workspace(id).await;
+        }
+    } else if ws_id.is_some() {
+        println!("[job:{}] pane kept open (close-pane: {:?})", job.name, job.close_pane);
     }
     result
 }
@@ -584,5 +641,24 @@ mod tests {
         assert_eq!(job.model.as_deref(), Some("gpt-5.6-sol"));
         assert_eq!(job.args.as_deref(), Some("-c model_reasoning_effort=xhigh"));
         assert!(job.body.contains("--learner codex"));
+    }
+
+    #[test]
+    fn close_pane_parses_and_rejects_unknown() {
+        let mk = |v: &str| parse_job("j", &format!("---\ncli: claude\nclose-pane: {v}\n---\nhi\n"));
+        assert_eq!(mk("always").unwrap().close_pane, ClosePane::Always);
+        assert_eq!(mk("on-success").unwrap().close_pane, ClosePane::OnSuccess);
+        assert_eq!(mk("never").unwrap().close_pane, ClosePane::Never);
+        assert!(mk("sometimes").is_none());
+        let default = parse_job("j", "---\ncli: claude\n---\nhi\n").unwrap();
+        assert_eq!(default.close_pane, ClosePane::Always);
+    }
+
+    #[test]
+    fn launch_line_bypasses_shell_aliases() {
+        let job = parse_job("j", "---\ncli: codex\n---\nhi\n").unwrap();
+        assert!(launch_line(&job).starts_with("command codex "));
+        let job = parse_job("j", "---\ncli: claude\n---\nhi\n").unwrap();
+        assert!(launch_line(&job).starts_with("command claude "));
     }
 }
