@@ -1,0 +1,16 @@
+[package]
+name = "vaultr"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+zstd = "0.13"
+uuid = { version = "1", features = ["v4", "v7"] }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+tempfile = "3"
