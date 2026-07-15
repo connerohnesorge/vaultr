@@ -175,8 +175,7 @@ fn prompt(kind: Kind) -> Option<String> {
         }
         Kind::LearnCodex => eligible("codex").map(|dirs| {
             format!(
-                "Read ~/.dotfiles/skills/Vault/Workflows/Learn.md and execute that workflow \
-                 exactly, with `--learner codex` and these session directories as input: {dirs}"
+                "$Vault Learn with `--learner codex` and these session directories as input: {dirs}"
             )
         }),
         Kind::Reconcile => Some("/Vault reconcile".to_string()),
