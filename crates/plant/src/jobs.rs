@@ -1,9 +1,8 @@
-//! Declarative jobs: <vault>/jobs/*.md — frontmatter (schedule + launch config)
-//! + body. `cli:` present => agent job (render !`cmd` placeholders, type into a fresh
-//! Herdr pane); absent => script job (execute the body's !`cmd` lines in order).
-//! `close-pane: always|on-success|never` (default always) controls whether the job's
-//! Herdr workspace is closed when the run ends; kept workspaces are reclaimed by the
-//! next run of the same job.
+//! Built-in jobs, defined as Rust code in load_jobs()/run_job() below. Compress calls
+//! the sweep directly in-process; learn/learn-codex/reconcile compute a prompt in Rust
+//! and type it into a fresh Herdr pane.
+//! `close_pane` (Always|OnSuccess) controls whether the job's Herdr workspace is
+//! closed when the run ends; kept workspaces are reclaimed by the next run of the same job.
 //! Outcomes append to ~/.local/state/plant/jobs/<name>.jsonl; the tail line is the
 //! scheduling state (due when now - last.ts >= every). Never `claude -p`.
 
@@ -14,24 +13,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::sweep::{run, run30};
 
-const DEFAULTS: &[(&str, &str)] = &[
-    ("learn", include_str!("../jobs/learn.md")),
-    ("learn-codex", include_str!("../jobs/learn-codex.md")),
-    ("compress", include_str!("../jobs/compress.md")),
-    ("reconcile", include_str!("../jobs/reconcile.md")),
-];
-
 pub fn state_dir() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/state/plant")
-}
-
-/// Jobs live in the user's vault: sibling of the sessions dir (VAULT_SESSIONS or
-/// ~/.dotfiles/vault/sessions) => <vault>/jobs.
-fn jobs_dir() -> PathBuf {
-    let sessions = std::env::var("VAULT_SESSIONS").map(PathBuf::from).unwrap_or_else(|_| {
-        PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".dotfiles/vault/sessions")
-    });
-    sessions.parent().map(Path::to_path_buf).unwrap_or(sessions).join("jobs")
 }
 
 /// Recognized config keys from real env then vault/.env — a private map, never
@@ -66,22 +49,27 @@ impl Cfg {
 pub enum ClosePane {
     Always,
     OnSuccess,
-    Never,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Kind {
+    Compress,
+    Learn,
+    LearnCodex,
+    Reconcile,
 }
 
 #[derive(Clone)]
 pub struct Job {
     pub name: String,
+    pub kind: Kind,
     pub every: Duration,
-    pub enabled: bool,
     pub timeout: Duration,
     pub cli: Option<String>,
     pub model: Option<String>,
-    pub config: Option<String>,
     pub args: Option<String>,
     pub cwd: String,
     pub close_pane: ClosePane,
-    pub body: String,
 }
 
 /// "90s" / "15m" / "2h" / "30d" — single number + unit.
@@ -113,78 +101,86 @@ fn expand_home(v: &str) -> String {
     }
 }
 
-pub fn parse_job(name: &str, text: &str) -> Option<Job> {
-    let rest = text.strip_prefix("---")?;
-    let (fm, body) = rest.split_once("\n---")?;
-    let mut job = Job {
-        name: name.to_string(),
-        every: Duration::from_secs(15 * 60),
-        enabled: true,
-        timeout: Duration::from_secs(45 * 60),
-        cli: None,
-        model: None,
-        config: None,
-        args: None,
-        cwd: expand_home("~/.dotfiles"),
-        close_pane: ClosePane::Always,
-        body: body.trim().to_string(),
-    };
-    for line in fm.lines() {
-        let Some((k, v)) = line.split_once(':') else {
-            continue;
-        };
-        let (k, v) = (k.trim(), v.trim());
-        match k {
-            "every" => job.every = parse_duration(v)?,
-            "enabled" => job.enabled = v != "false",
-            "timeout" => job.timeout = parse_duration(v)?,
-            "cli" => job.cli = Some(v.to_string()),
-            "model" => job.model = Some(v.to_string()),
-            "config" => job.config = Some(expand_home(v)),
-            "args" => job.args = Some(v.to_string()),
-            "cwd" => job.cwd = expand_home(v),
-            "close-pane" => {
-                job.close_pane = match v {
-                    "always" => ClosePane::Always,
-                    "on-success" => ClosePane::OnSuccess,
-                    "never" => ClosePane::Never,
-                    _ => return None,
-                }
-            }
-            _ => {}
+impl Job {
+    fn new(name: &str, kind: Kind, every: Duration) -> Job {
+        Job {
+            name: name.to_string(),
+            kind,
+            every,
+            timeout: Duration::from_secs(45 * 60),
+            cli: None,
+            model: None,
+            args: None,
+            cwd: expand_home("~/.dotfiles"),
+            close_pane: ClosePane::Always,
         }
     }
-    Some(job)
 }
 
+const MIN: u64 = 60;
+
 pub fn load_jobs() -> Vec<Job> {
-    let mut out = vec![];
-    if let Ok(rd) = std::fs::read_dir(jobs_dir()) {
-        for e in rd.flatten() {
-            let p = e.path();
-            if p.extension().and_then(|s| s.to_str()) != Some("md") {
-                continue;
-            }
-            let name = p
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default()
-                .to_string();
-            match std::fs::read_to_string(&p)
-                .ok()
-                .and_then(|t| parse_job(&name, &t))
-            {
-                Some(j) => out.push(j),
-                None => eprintln!("[jobs] {name}.md: parse failed, skipping"),
-            }
+    vec![
+        Job {
+            timeout: Duration::from_secs(2 * 3600),
+            ..Job::new("compress", Kind::Compress, Duration::from_secs(30 * MIN))
+        },
+        Job {
+            cli: Some("claude".into()),
+            model: Some("opus[1m]".into()),
+            close_pane: ClosePane::OnSuccess,
+            ..Job::new("learn", Kind::Learn, Duration::from_secs(15 * MIN))
+        },
+        Job {
+            cli: Some("codex".into()),
+            model: Some("gpt-5.6-sol".into()),
+            args: Some("-c model_reasoning_effort=xhigh".into()),
+            close_pane: ClosePane::OnSuccess,
+            ..Job::new(
+                "learn-codex",
+                Kind::LearnCodex,
+                Duration::from_secs(15 * MIN),
+            )
+        },
+        Job {
+            cli: Some("claude".into()),
+            model: Some("opus[1m]".into()),
+            ..Job::new(
+                "reconcile",
+                Kind::Reconcile,
+                Duration::from_secs(30 * 86400),
+            )
+        },
+    ]
+}
+
+/// Eligible session dirs for a learner, or None when there's nothing to learn from.
+fn eligible(learner: &str) -> Option<String> {
+    let vault = crate::vault_path();
+    let list = crate::sweep::eligible_sessions(&vault, Duration::from_secs(3600), 10, learner);
+    let (total, ledgered) = crate::sweep::eligibility_stats(&vault, learner);
+    println!(
+        "[eligible:{learner}] {} of {total} sessions ({ledgered} ledgered)",
+        list.len()
+    );
+    (!list.is_empty()).then(|| list.join(" "))
+}
+
+/// The prompt an agent job types into its Herdr pane; None => nothing to do, skip.
+fn prompt(kind: Kind) -> Option<String> {
+    match kind {
+        Kind::Compress => None,
+        Kind::Learn => {
+            eligible("claude").map(|dirs| format!("/Vault learn --learner claude {dirs}"))
         }
+        Kind::LearnCodex => eligible("codex").map(|dirs| {
+            format!(
+                "Read ~/.dotfiles/skills/Vault/Workflows/Learn.md and execute that workflow \
+                 exactly, with `--learner codex` and these session directories as input: {dirs}"
+            )
+        }),
+        Kind::Reconcile => Some("/Vault reconcile".to_string()),
     }
-    if out.is_empty() {
-        // jobs/ missing or empty: compiled-in defaults keep capture hygiene alive
-        out.extend(DEFAULTS.iter().filter_map(|(n, t)| parse_job(n, t)));
-    }
-    out.sort_by(|a, b| a.name.cmp(&b.name));
-    out
 }
 
 fn epoch_now() -> u64 {
@@ -225,54 +221,6 @@ fn record(name: &str, outcome: &str, started: SystemTime, detail: &str) {
     println!("[job:{name}] {outcome} ({detail})");
 }
 
-/// sh -c with the job's cwd; augmented PATH so job bodies can say `plant sessions
-/// eligible` (plant's own dir) and reach user-installed tools under launchd's bare env.
-async fn shell(cmd: &str, cwd: &str, timeout: Duration) -> (bool, String) {
-    let fut = tokio::process::Command::new("sh")
-        .arg("-c")
-        .arg(cmd)
-        .current_dir(cwd)
-        .env("PATH", crate::sweep::augmented_path())
-        .output();
-    match tokio::time::timeout(timeout, fut).await {
-        Ok(Ok(o)) => (
-            o.status.success(),
-            String::from_utf8_lossy(&o.stdout).trim().to_string(),
-        ),
-        _ => (false, String::new()),
-    }
-}
-
-/// Substitute !`cmd` placeholders (line start or after whitespace, same rule as
-/// Claude Code skills). Err(cmd) on the first non-zero exit => skip the run.
-async fn render(body: &str, cwd: &str, timeout: Duration) -> Result<String, String> {
-    let re = regex::Regex::new(r"!`([^`]+)`").expect("static regex");
-    let mut out = String::new();
-    for line in body.lines() {
-        let spans: Vec<(usize, usize)> = re
-            .find_iter(line)
-            .map(|m| (m.start(), m.end()))
-            .filter(|&(s, _)| s == 0 || line[..s].ends_with(char::is_whitespace))
-            .collect();
-        let mut rendered = String::new();
-        let mut last = 0;
-        for (s, e) in spans {
-            rendered.push_str(&line[last..s]);
-            let cmd = &line[s + 2..e - 1];
-            let (ok, output) = shell(cmd, cwd, timeout).await;
-            if !ok {
-                return Err(cmd.to_string());
-            }
-            rendered.push_str(&output);
-            last = e;
-        }
-        rendered.push_str(&line[last..]);
-        out.push_str(&rendered);
-        out.push('\n');
-    }
-    Ok(out.trim().to_string())
-}
-
 fn launch_line(job: &Job) -> String {
     let codex = job.cli.as_deref() == Some("codex");
     // `command` bypasses the user's interactive-shell aliases (a `codex='codex --yolo'`
@@ -288,13 +236,6 @@ fn launch_line(job: &Job) -> String {
             format!(" -m '{m}'")
         } else {
             format!(" --model='{m}'")
-        });
-    }
-    if let Some(c) = &job.config {
-        s.push_str(&if codex {
-            format!(" --profile '{c}'")
-        } else {
-            format!(" --settings '{c}'")
         });
     }
     if let Some(a) = &job.args {
@@ -526,70 +467,42 @@ async fn run_agent(job: &Job, rendered: &str) -> Option<(bool, String)> {
         ))
     }
     .await;
-    let close = match job.close_pane {
-        ClosePane::Always => true,
-        ClosePane::Never => false,
-        ClosePane::OnSuccess => matches!(result, Some((true, _))),
-    };
+    // PLANT_KEEP_PANES=1: manual-verification override, leave the workspace open
+    let close = std::env::var("PLANT_KEEP_PANES").as_deref() != Ok("1")
+        && match job.close_pane {
+            ClosePane::Always => true,
+            ClosePane::OnSuccess => matches!(result, Some((true, _))),
+        };
     if close {
         if let Some(ref id) = ws_id {
             close_workspace(id).await;
         }
     } else if ws_id.is_some() {
-        println!("[job:{}] pane kept open (close-pane: {:?})", job.name, job.close_pane);
+        println!(
+            "[job:{}] pane kept open (close-pane: {:?})",
+            job.name, job.close_pane
+        );
     }
     result
 }
 
-async fn run_job(job: &Job) {
+pub async fn run_job(job: &Job) {
     let started = SystemTime::now();
-    if job.cli.is_some() {
-        let rendered = match render(&job.body, &job.cwd, job.timeout).await {
-            Ok(r) if r.is_empty() => {
-                record(&job.name, "skipped", started, "empty rendered body");
-                return;
-            }
-            Ok(r) => r,
-            Err(cmd) => {
-                record(
-                    &job.name,
-                    "skipped",
-                    started,
-                    &format!("precondition: {cmd}"),
-                );
-                return;
-            }
-        };
-        match run_agent(job, &rendered).await {
-            None => println!("[job:{}] herdr down, retry next tick", job.name),
-            Some((true, detail)) => record(&job.name, "success", started, &detail),
-            Some((false, detail)) => record(&job.name, "failed", started, &detail),
-        }
-    } else {
-        // script job: only !`cmd` lines execute; anything else is prose
-        for line in job.body.lines() {
-            let Some(cmd) = line
-                .trim()
-                .strip_prefix("!`")
-                .and_then(|r| r.strip_suffix('`'))
-            else {
-                continue;
-            };
-            let (ok, out) = shell(cmd, &job.cwd, job.timeout).await;
-            if !out.is_empty() {
-                println!("[job:{}] {out}", job.name);
-            }
-            if !ok {
-                record(
-                    &job.name,
-                    "failed",
-                    started,
-                    &format!("command failed: {cmd}"),
-                );
-                return;
-            }
-        }
-        record(&job.name, "success", started, "script ok");
+    if job.kind == Kind::Compress {
+        let ok =
+            crate::sweep::compress_sweep(&crate::vault_path(), Duration::from_secs(3600)).await;
+        let outcome = if ok { "success" } else { "failed" };
+        record(&job.name, outcome, started, "compress sweep");
+        return;
+    }
+    let Some(prompt) = prompt(job.kind) else {
+        record(&job.name, "skipped", started, "nothing eligible");
+        return;
+    };
+    match run_agent(job, &prompt).await {
+        None => println!("[job:{}] herdr down, retry next tick", job.name),
+        Some((true, detail)) => record(&job.name, "success", started, &detail),
+        Some((false, detail)) => record(&job.name, "failed", started, &detail),
     }
 }
 
@@ -616,12 +529,11 @@ pub async fn scheduler(cfg: Cfg) {
     tokio::time::sleep(Duration::from_secs(15)).await; // startup settle
     loop {
         for job in load_jobs() {
-            if !job.enabled || running.lock().unwrap().contains(&job.name) {
+            if running.lock().unwrap().contains(&job.name) {
                 continue;
             }
-            let due = last_record_ts(&job.name).map_or(true, |ts| {
-                epoch_now().saturating_sub(ts) >= job.every.as_secs()
-            });
+            let due = last_record_ts(&job.name)
+                .is_none_or(|ts| epoch_now().saturating_sub(ts) >= job.every.as_secs());
             if !due {
                 continue;
             }
@@ -641,31 +553,38 @@ pub async fn scheduler(cfg: Cfg) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn codex_learn_job_uses_requested_model_and_effort() {
-        let job = parse_job("learn-codex", include_str!("../jobs/learn-codex.md")).unwrap();
-        assert_eq!(job.cli.as_deref(), Some("codex"));
-        assert_eq!(job.model.as_deref(), Some("gpt-5.6-sol"));
-        assert_eq!(job.args.as_deref(), Some("-c model_reasoning_effort=xhigh"));
-        assert!(job.body.contains("--learner codex"));
+    fn by_name(name: &str) -> Job {
+        load_jobs().into_iter().find(|j| j.name == name).unwrap()
     }
 
     #[test]
-    fn close_pane_parses_and_rejects_unknown() {
-        let mk = |v: &str| parse_job("j", &format!("---\ncli: claude\nclose-pane: {v}\n---\nhi\n"));
-        assert_eq!(mk("always").unwrap().close_pane, ClosePane::Always);
-        assert_eq!(mk("on-success").unwrap().close_pane, ClosePane::OnSuccess);
-        assert_eq!(mk("never").unwrap().close_pane, ClosePane::Never);
-        assert!(mk("sometimes").is_none());
-        let default = parse_job("j", "---\ncli: claude\n---\nhi\n").unwrap();
-        assert_eq!(default.close_pane, ClosePane::Always);
+    fn codex_learn_job_uses_requested_model_and_effort() {
+        let job = by_name("learn-codex");
+        assert_eq!(job.cli.as_deref(), Some("codex"));
+        assert_eq!(job.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(job.args.as_deref(), Some("-c model_reasoning_effort=xhigh"));
+        assert_eq!(job.close_pane, ClosePane::OnSuccess);
+    }
+
+    #[test]
+    fn built_in_jobs_have_expected_shape() {
+        let jobs = load_jobs();
+        assert_eq!(jobs.len(), 4);
+        assert_eq!(by_name("compress").kind, Kind::Compress);
+        assert_eq!(by_name("learn").close_pane, ClosePane::OnSuccess);
+        assert_eq!(by_name("reconcile").close_pane, ClosePane::Always);
+        assert_eq!(by_name("reconcile").every, Duration::from_secs(30 * 86400));
     }
 
     #[test]
     fn launch_line_bypasses_shell_aliases() {
-        let job = parse_job("j", "---\ncli: codex\n---\nhi\n").unwrap();
-        assert!(launch_line(&job).starts_with("command codex "));
-        let job = parse_job("j", "---\ncli: claude\n---\nhi\n").unwrap();
-        assert!(launch_line(&job).starts_with("command claude "));
+        assert!(launch_line(&by_name("learn-codex")).starts_with("command codex "));
+        assert!(launch_line(&by_name("learn")).starts_with("command claude "));
+    }
+
+    #[test]
+    fn reconcile_prompt_is_static_and_compress_has_none() {
+        assert_eq!(prompt(Kind::Reconcile).as_deref(), Some("/Vault reconcile"));
+        assert_eq!(prompt(Kind::Compress), None);
     }
 }

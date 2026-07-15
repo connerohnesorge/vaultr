@@ -31,10 +31,9 @@ fn vault_path() -> PathBuf {
     }))
 }
 
-/// `plant sessions eligible [--learner claude|codex] [--idle 60m] [--max 10]`
-/// and `plant compress once [--idle 60m]`
-/// — the sweep primitives jobs/*.md bodies compose. Exit 1 from `sessions eligible` with
-/// nothing eligible => the learn job records `skipped` instead of launching an agent.
+/// `plant sessions eligible [--learner claude|codex] [--idle 60m] [--max 10]`,
+/// `plant compress once [--idle 60m]`, and `plant jobs run <name>` (manual trigger of a
+/// built-in job; PLANT_KEEP_PANES=1 keeps the Herdr workspace open after the run).
 async fn subcommand(argv: &[String]) -> Option<i32> {
     let flag = |name: &str| {
         argv.iter()
@@ -69,6 +68,19 @@ async fn subcommand(argv: &[String]) -> Option<i32> {
             } else {
                 1
             })
+        }
+        (Some("jobs"), Some("run")) => {
+            let name = argv.get(3).cloned().unwrap_or_default();
+            match jobs::load_jobs().into_iter().find(|j| j.name == name) {
+                Some(job) => {
+                    jobs::run_job(&job).await;
+                    Some(0)
+                }
+                None => {
+                    eprintln!("unknown job '{name}'");
+                    Some(1)
+                }
+            }
         }
         _ => None,
     }

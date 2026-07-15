@@ -1,6 +1,6 @@
 //! Session-sweep primitives: eligibility discovery, scrub, compress. Orchestration
 //! (scheduling, agent panes) lives in jobs.rs; these are exposed as `plant sessions
-//! eligible` / `plant compress once` subcommands and composed in jobs/*.md bodies.
+//! eligible` / `plant compress once` subcommands and called directly by the built-in Rust jobs.
 //! Every failure path non-fatal: capture uptime is sacred. All heavy work shells out.
 
 use std::collections::HashSet;
