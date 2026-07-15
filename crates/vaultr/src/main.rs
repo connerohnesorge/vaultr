@@ -93,8 +93,8 @@ fn list(root: &std::path::Path, all: bool) -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<38} {:<12} {:<24} {:<26} {}",
-        "ID", "HARNESS", "MODEL", "LAST ACTIVITY", "CWD"
+        "{:<38} {:<12} {:<24} {:<26} CWD",
+        "ID", "HARNESS", "MODEL", "LAST ACTIVITY"
     );
     for s in &sessions {
         println!(
