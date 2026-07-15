@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use vaultr::{normalize, recon, render, vault};
+use vaultr::{fork, normalize, recon, render, vault};
 
 #[derive(Parser)]
 #[command(
@@ -47,6 +47,19 @@ enum SessionCmd {
         #[arg(long, hide = true)]
         stats: bool,
     },
+    /// Fork a captured session into a fresh native Claude/Codex session
+    Fork {
+        id: String,
+        /// Target harness to fork into
+        #[arg(long, value_enum)]
+        into: fork::Target,
+        /// Launch cwd override (default: the session's recorded cwd)
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        /// Write the session file but do not launch the target CLI
+        #[arg(long)]
+        no_launch: bool,
+    },
 }
 
 fn main() {
@@ -63,6 +76,30 @@ fn run() -> Result<()> {
         Cmd::Session(SessionCmd::List { all }) => list(&root, all),
         Cmd::Session(SessionCmd::Path { id, copy }) => path(&root, &id, copy),
         Cmd::Session(SessionCmd::Show { id, stats }) => show(&root, &id, stats),
+        Cmd::Session(SessionCmd::Fork {
+            id,
+            into,
+            cwd,
+            no_launch,
+        }) => {
+            let opts = fork::ForkOptions {
+                cwd,
+                no_launch,
+                ..Default::default()
+            };
+            let outcome = fork::fork(&root, &id, into, &opts)?;
+            eprintln!("forked {} -> {}", id, outcome.path.display());
+            if no_launch {
+                println!(
+                    "launch with: (cd {} && {})",
+                    outcome.cwd.display(),
+                    outcome.launch.join(" ")
+                );
+                Ok(())
+            } else {
+                fork::launch(&outcome)
+            }
+        }
     }
 }
 
