@@ -1,4 +1,4 @@
-//! Declarative jobs: ~/.config/plant/jobs/*.md — frontmatter (schedule + launch config)
+//! Declarative jobs: <vault>/jobs/*.md — frontmatter (schedule + launch config)
 //! + body. `cli:` present => agent job (render !`cmd` placeholders, type into a fresh
 //! Herdr pane); absent => script job (execute the body's !`cmd` lines in order).
 //! Outcomes append to ~/.local/state/plant/jobs/<name>.jsonl; the tail line is the
@@ -22,8 +22,13 @@ pub fn state_dir() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/state/plant")
 }
 
+/// Jobs live in the user's vault: sibling of the sessions dir (VAULT_SESSIONS or
+/// ~/.dotfiles/vault/sessions) => <vault>/jobs.
 fn jobs_dir() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".config/plant/jobs")
+    let sessions = std::env::var("VAULT_SESSIONS").map(PathBuf::from).unwrap_or_else(|_| {
+        PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".dotfiles/vault/sessions")
+    });
+    sessions.parent().map(Path::to_path_buf).unwrap_or(sessions).join("jobs")
 }
 
 /// Recognized config keys from real env then vault/.env — a private map, never
