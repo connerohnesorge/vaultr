@@ -78,6 +78,49 @@ fn ledger_sessions(vault: &Path, learner: &str) -> HashSet<String> {
     processed
 }
 
+fn epoch_now() -> u64 {
+    SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn inflight_path(vault: &Path, learner: &str) -> PathBuf {
+    vault
+        .join("..")
+        .join("learnings")
+        .join(format!(".inflight-{learner}.json"))
+}
+
+/// Sessions a still-running learn pass has claimed for `learner`, if the lease hasn't
+/// expired. The ledger is only written when a pass *completes*, so without this the next
+/// scheduler tick re-selects the same not-yet-ledgered batch and double-learns it (the
+/// duplicate-prompt bug). ponytail: one file per learner, expiry self-heals a crashed or
+/// timed-out pass — no explicit release path to leak.
+fn inflight_sessions(vault: &Path, learner: &str) -> HashSet<String> {
+    let Ok(text) = std::fs::read_to_string(inflight_path(vault, learner)) else {
+        return HashSet::new();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return HashSet::new();
+    };
+    if epoch_now() >= v.get("expires_at").and_then(|e| e.as_u64()).unwrap_or(0) {
+        return HashSet::new(); // expired lease: the pass is long gone, stop excluding
+    }
+    v.get("sids")
+        .and_then(|s| s.as_array())
+        .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+        .unwrap_or_default()
+}
+
+/// Claim `sids` as in-flight for `learner` until `expires_at` (epoch secs). Overwrites any
+/// prior lease for this learner. The learn job calls this at dispatch, before typing the
+/// prompt, so a slow pass can't be re-dispatched underneath it.
+pub fn claim_inflight(vault: &Path, learner: &str, sids: &[String], expires_at: u64) {
+    let body = serde_json::json!({ "sids": sids, "expires_at": expires_at });
+    let _ = std::fs::write(inflight_path(vault, learner), body.to_string());
+}
+
 fn capture_files(vault: &Path) -> Vec<(String, PathBuf)> {
     turns_files(vault, true)
 }
@@ -128,9 +171,10 @@ fn idle_for(path: &Path, idle: Duration) -> bool {
 
 pub fn eligible_sessions(vault: &Path, idle: Duration, max: usize, learner: &str) -> Vec<String> {
     let processed = ledger_sessions(vault, learner);
+    let inflight = inflight_sessions(vault, learner);
     let mut out = vec![];
     for (sid, path) in capture_files(vault) {
-        if processed.contains(&sid) || !idle_for(&path, idle) {
+        if processed.contains(&sid) || inflight.contains(&sid) || !idle_for(&path, idle) {
             continue;
         }
         let compressed = path.extension().and_then(|e| e.to_str()) == Some("zst");
@@ -376,6 +420,41 @@ mod tests {
         assert!(!claude.iter().any(|p| p.ends_with(claude_id)));
         assert!(codex.iter().any(|p| p.ends_with(claude_id)));
         assert!(!codex.iter().any(|p| p.ends_with(codex_id)));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn inflight_lease_dedupes_dispatch_until_expiry() {
+        // Reproduces the duplicate-prompt bug: an un-ledgered session is eligible, so a
+        // second tick during a running pass would re-dispatch it. The lease must exclude it.
+        let root = std::env::temp_dir().join(format!("plant-inflight-test-{}", std::process::id()));
+        let sessions = root.join("sessions");
+        let sid = "e768f4c4-inflight";
+        let dir = sessions.join("2026/07/16").join(sid);
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("turns.jsonl"), "{}\n".repeat(6)).unwrap(); // >5 turns => substantive
+        std::fs::create_dir_all(root.join("learnings")).unwrap();
+
+        // tick 1: not ledgered, not leased -> eligible (this is the dispatch that runs)
+        let first = eligible_sessions(&sessions, Duration::ZERO, 10, "claude");
+        assert!(first.iter().any(|p| p.ends_with(sid)), "un-ledgered session should be eligible");
+
+        // that dispatch claims the batch in-flight for the pass's lifetime
+        claim_inflight(&sessions, "claude", &[sid.to_string()], epoch_now() + 3600);
+
+        // tick 2 while the pass is still running (ledger not yet written): must be excluded
+        let during = eligible_sessions(&sessions, Duration::ZERO, 10, "claude");
+        assert!(
+            !during.iter().any(|p| p.ends_with(sid)),
+            "in-flight session must NOT be re-dispatched (this was the duplicate-prompt bug)"
+        );
+
+        // an expired lease (crashed/zombie pass) must self-heal, not wedge forever
+        claim_inflight(&sessions, "claude", &[sid.to_string()], epoch_now().saturating_sub(1));
+        let after = eligible_sessions(&sessions, Duration::ZERO, 10, "claude");
+        assert!(after.iter().any(|p| p.ends_with(sid)), "expired lease must stop excluding");
 
         let _ = std::fs::remove_dir_all(root);
     }

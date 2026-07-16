@@ -195,7 +195,9 @@ echo '{"decision":"block","reason":"The vault is still invalid. Run `vaultr vali
 }
 
 /// Eligible session dirs for a learner, or None when there's nothing to learn from.
-fn eligible(learner: &str) -> Option<String> {
+/// Claims the batch as in-flight (lease expiring `timeout` + slack from now) before
+/// returning, so the next tick can't re-dispatch the same not-yet-ledgered sessions.
+fn eligible(learner: &str, timeout: Duration) -> Option<String> {
     let vault = crate::vault_path();
     let list = crate::sweep::eligible_sessions(&vault, Duration::from_secs(3600), 10, learner);
     let (total, ledgered) = crate::sweep::eligibility_stats(&vault, learner);
@@ -203,17 +205,30 @@ fn eligible(learner: &str) -> Option<String> {
         "[eligible:{learner}] {} of {total} sessions ({ledgered} ledgered)",
         list.len()
     );
-    (!list.is_empty()).then(|| list.join(" "))
+    if list.is_empty() {
+        return None;
+    }
+    let sids: Vec<String> = list
+        .iter()
+        .filter_map(|d| {
+            std::path::Path::new(d)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(String::from)
+        })
+        .collect();
+    let expires_at = epoch_now() + timeout.as_secs() + 300;
+    crate::sweep::claim_inflight(&vault, learner, &sids, expires_at);
+    Some(list.join(" "))
 }
 
 /// The prompt an agent job types into its Herdr pane; None => nothing to do, skip.
-fn prompt(kind: Kind) -> Option<String> {
-    match kind {
+fn prompt(job: &Job) -> Option<String> {
+    match job.kind {
         Kind::Compress => None,
-        Kind::Learn => {
-            eligible("claude").map(|dirs| format!("/Vault learn --learner claude {dirs}"))
-        }
-        Kind::LearnCodex => eligible("codex").map(|dirs| {
+        Kind::Learn => eligible("claude", job.timeout)
+            .map(|dirs| format!("/Vault learn --learner claude {dirs}")),
+        Kind::LearnCodex => eligible("codex", job.timeout).map(|dirs| {
             format!(
                 "$Vault Learn with `--learner codex` and these session directories as input: {dirs}"
             )
@@ -577,7 +592,7 @@ pub async fn run_job(job: &Job) {
         }
         return;
     }
-    let Some(prompt) = prompt(job.kind) else {
+    let Some(prompt) = prompt(job) else {
         record(&job.name, "skipped", started, "nothing eligible");
         return;
     };
@@ -679,7 +694,9 @@ mod tests {
 
     #[test]
     fn reconcile_prompt_is_static_and_compress_has_none() {
-        assert_eq!(prompt(Kind::Reconcile).as_deref(), Some("/Vault reconcile"));
-        assert_eq!(prompt(Kind::Compress), None);
+        let reconcile = Job::new("reconcile", Kind::Reconcile, Duration::from_secs(3600));
+        let compress = Job::new("compress", Kind::Compress, Duration::from_secs(3600));
+        assert_eq!(prompt(&reconcile).as_deref(), Some("/Vault reconcile"));
+        assert_eq!(prompt(&compress), None);
     }
 }
