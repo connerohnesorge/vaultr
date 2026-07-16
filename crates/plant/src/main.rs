@@ -75,7 +75,7 @@ async fn subcommand(argv: &[String]) -> Option<i32> {
             let name = argv.get(3).cloned().unwrap_or_default();
             match jobs::load_jobs().into_iter().find(|j| j.name == name) {
                 Some(job) => {
-                    jobs::run_job(&job, &jobs::Cfg::load(&vault_path())).await;
+                    jobs::run_job(&job, &jobs::Cfg::load(&vault_root())).await;
                     Some(0)
                 }
                 None => {
