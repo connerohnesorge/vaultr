@@ -22,18 +22,19 @@ fn crash_log() -> PathBuf {
     dir.join("crash.log")
 }
 
-fn vault_path() -> PathBuf {
-    PathBuf::from(std::env::var("VAULT_SESSIONS").unwrap_or_else(|_| {
-        format!(
-            "{}/.dotfiles/vault/sessions",
-            std::env::var("HOME").expect("HOME")
-        )
-    }))
+/// Sessions root via the shared vaultr resolver ($VAULT_SESSIONS > ~/.dotfiles/vault/sessions).
+/// Resolution only fails when both env vars are unset; main resolves this before serving, so
+/// a failure here is a startup misconfiguration — exit loudly rather than capture to a wrong root.
+fn vault_root() -> PathBuf {
+    vaultr::vault::root(None).unwrap_or_else(|e| {
+        eprintln!("[plant] cannot resolve vault sessions root: {e}");
+        std::process::exit(1);
+    })
 }
 
 /// `plant sessions eligible [--learner claude|codex] [--idle 60m] [--max 10]`,
 /// `plant compress once [--idle 60m]`, and `plant jobs run <name>` (manual trigger of a
-/// built-in job; PLANT_KEEP_PANES=1 keeps the Herdr workspace open after the run).
+/// built-in job; panes are kept after the run unless PLANT_KEEP_PANES=0).
 async fn subcommand(argv: &[String]) -> Option<i32> {
     let flag = |name: &str| {
         argv.iter()
@@ -50,8 +51,8 @@ async fn subcommand(argv: &[String]) -> Option<i32> {
         (Some("sessions"), Some("eligible")) => {
             let max = flag("--max").and_then(|v| v.parse().ok()).unwrap_or(10);
             let learner = flag("--learner").unwrap_or_else(|| "claude".to_string());
-            let list = sweep::eligible_sessions(&vault_path(), idle, max, &learner);
-            let (total, ledgered) = sweep::eligibility_stats(&vault_path(), &learner);
+            let list = sweep::eligible_sessions(&vault_root(), idle, max, &learner);
+            let (total, ledgered) = sweep::eligibility_stats(&vault_root(), &learner);
             eprintln!(
                 "[eligible:{learner}] {} of {total} sessions ({ledgered} ledgered)",
                 list.len()
@@ -63,7 +64,7 @@ async fn subcommand(argv: &[String]) -> Option<i32> {
             Some(0)
         }
         (Some("compress"), Some("once")) => {
-            Some(if sweep::compress_sweep(&vault_path(), idle).await {
+            Some(if sweep::compress_sweep(&vault_root(), idle).await {
                 0
             } else {
                 1
@@ -158,7 +159,7 @@ async fn main() {
         std::process::exit(1);
     }));
 
-    let vault = vault_path();
+    let vault = vault_root();
 
     let otel = Arc::new(otel::Otel::new());
     let client = http_client();

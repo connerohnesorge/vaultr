@@ -86,6 +86,11 @@ pub fn content_root(sessions_root: &Path) -> Result<PathBuf> {
         .context("sessions root has no parent")
 }
 
+/// Learn-ledger path under the content root: learnings/.ledger.jsonl.
+pub fn ledger_path(content_root: &Path) -> PathBuf {
+    content_root.join("learnings/.ledger.jsonl")
+}
+
 /// Required frontmatter keys per content dir (warnings when missing).
 fn required_keys(dir: &str) -> &'static [&'static str] {
     match dir {
@@ -309,7 +314,7 @@ pub fn scan(content_root: &Path) -> Result<Report> {
     }
 
     // Ledger integrity: every non-empty line parses as JSON with session_id.
-    let ledger = content_root.join("learnings/.ledger.jsonl");
+    let ledger = ledger_path(content_root);
     if let Ok(text) = std::fs::read_to_string(&ledger) {
         for (i, line) in text.lines().enumerate() {
             if line.trim().is_empty() {
