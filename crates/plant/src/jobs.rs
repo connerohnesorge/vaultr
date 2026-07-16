@@ -17,8 +17,13 @@ pub fn state_dir() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/state/plant")
 }
 
-/// Recognized config keys from real env then vault/.env — a private map, never
-/// std::env::set_var: nothing here may leak into child process environments.
+/// Config keys read from real env first, then the vault/.env fallback. The fallback
+/// covers exactly the keys the job scheduler consults through Cfg: PLANT_JOBS
+/// (0 disables the scheduler), PLANT_JOBS_MAX_CONCURRENT (semaphore cap), and
+/// PLANT_KEEP_PANES (0 opts into per-job workspace cleanup; see cleanup_policy).
+/// Other PLANT_* keys (e.g. herdr.rs's PLANT_HERDR_INTERVAL_SECS, snapshot path)
+/// remain real-env only. A private map, never std::env::set_var: nothing here may
+/// leak into child process environments.
 pub struct Cfg(HashMap<String, String>);
 
 impl Cfg {
@@ -352,15 +357,18 @@ fn launch_line(job: &Job) -> String {
     s
 }
 
-fn cleanup_policy(job: &Job) -> WorkspaceCleanup {
-    if std::env::var("PLANT_KEEP_PANES").as_deref() == Ok("0") {
+/// Panes are kept open by default so failed agent runs stay inspectable; setting
+/// PLANT_KEEP_PANES=0 opts into auto-close honoring the per-job WorkspaceCleanup.
+/// Keep-by-default is a recorded product decision (commit 3f9d55e) — do not invert it.
+fn cleanup_policy(job: &Job, cfg: &Cfg) -> WorkspaceCleanup {
+    if cfg.get("PLANT_KEEP_PANES").as_deref() == Some("0") {
         job.cleanup
     } else {
         WorkspaceCleanup::Never
     }
 }
 
-pub async fn run_job(job: &Job) {
+pub async fn run_job(job: &Job, cfg: &Cfg) {
     let started = SystemTime::now();
     if job.kind == Kind::Compress {
         let ok =
@@ -395,7 +403,7 @@ pub async fn run_job(job: &Job) {
         launch: launch_line(job),
         prompt,
         timeout: job.timeout,
-        cleanup: cleanup_policy(job),
+        cleanup: cleanup_policy(job, cfg),
     };
     match herdr::run_agent(agent_run).await {
         AgentRunOutcome::Unavailable => {
@@ -426,6 +434,7 @@ pub async fn scheduler(cfg: Cfg) {
     );
     let sem = Arc::new(tokio::sync::Semaphore::new(cap));
     let running: Arc<Mutex<HashSet<String>>> = Default::default();
+    let cfg = Arc::new(cfg);
     tokio::time::sleep(Duration::from_secs(15)).await; // startup settle
     loop {
         for job in load_jobs() {
@@ -438,10 +447,10 @@ pub async fn scheduler(cfg: Cfg) {
                 continue;
             }
             running.lock().unwrap().insert(job.name.clone());
-            let (sem, running) = (sem.clone(), running.clone());
+            let (sem, running, cfg) = (sem.clone(), running.clone(), cfg.clone());
             tokio::spawn(async move {
                 let _permit = sem.acquire().await;
-                run_job(&job).await;
+                run_job(&job, &cfg).await;
                 running.lock().unwrap().remove(&job.name);
             });
         }
@@ -493,6 +502,23 @@ mod tests {
     fn launch_line_bypasses_shell_aliases() {
         assert!(launch_line(&by_name("learn-codex")).starts_with("command codex "));
         assert!(launch_line(&by_name("learn")).starts_with("command claude "));
+    }
+
+    #[test]
+    fn cleanup_policy_keeps_panes_unless_cfg_opts_out() {
+        // Guard: real-env PLANT_KEEP_PANES would shadow the map (Cfg checks env first).
+        assert!(std::env::var("PLANT_KEEP_PANES").is_err());
+        let job = by_name("learn");
+        assert_eq!(job.cleanup, WorkspaceCleanup::OnSuccess);
+        // Default (key absent anywhere): panes kept, per commit 3f9d55e.
+        let keep = Cfg(HashMap::new());
+        assert_eq!(cleanup_policy(&job, &keep), WorkspaceCleanup::Never);
+        // vault/.env fallback opts into the per-job policy, same as the real env.
+        let opt_out = Cfg(HashMap::from([(
+            "PLANT_KEEP_PANES".to_string(),
+            "0".to_string(),
+        )]));
+        assert_eq!(cleanup_policy(&job, &opt_out), job.cleanup);
     }
 
     #[test]

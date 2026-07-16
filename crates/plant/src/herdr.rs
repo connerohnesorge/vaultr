@@ -238,7 +238,13 @@ fn should_cleanup(cleanup: WorkspaceCleanup, outcome: &AgentRunOutcome) -> bool 
 /// Create an unfocused Herdr workspace, run and verify an agent, deliver one
 /// prompt, wait for completion, and apply the requested best-effort cleanup.
 pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
-    if !run30(&["herdr", "workspace", "list"]).await.ok {
+    let probe = run30(&["herdr", "workspace", "list"]).await;
+    if !probe.ok {
+        println!(
+            "[herdr:{}] unavailable ({})",
+            agent_run.label,
+            probe.failure_detail()
+        );
         return AgentRunOutcome::Unavailable;
     }
     let stale = close_by_label(&agent_run.label).await;
@@ -281,13 +287,14 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
                 "workspace create failed".to_string()
             });
         };
-        if !run30(&["herdr", "pane", "run", pane, &agent_run.launch])
-            .await
-            .ok
-        {
-            return AgentRunOutcome::Failed("pane run failed".to_string());
+        let launched = run30(&["herdr", "pane", "run", pane, &agent_run.launch]).await;
+        if !launched.ok {
+            return AgentRunOutcome::Failed(format!(
+                "pane run failed ({})",
+                launched.failure_detail()
+            ));
         }
-        if !run(
+        let ready = run(
             &[
                 "herdr",
                 "wait",
@@ -300,14 +307,14 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
             ],
             Duration::from_secs(70),
         )
-        .await
-        .ok
-        {
+        .await;
+        if !ready.ok {
+            let detail = ready.failure_detail();
             eprintln!(
-                "[herdr:{}] agent did not become ready in pane {pane}",
+                "[herdr:{}] agent did not become ready in pane {pane} ({detail})",
                 agent_run.label
             );
-            return AgentRunOutcome::Failed("agent never became ready".to_string());
+            return AgentRunOutcome::Failed(format!("agent never became ready ({detail})"));
         }
         // Agent detection precedes TUI input readiness by ~1-2 seconds.
         tokio::time::sleep(Duration::from_secs(3)).await;
@@ -316,6 +323,7 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
         }
         let needle: String = agent_run.prompt.chars().take(30).collect();
         let mut landed = false;
+        let mut read_failure = None;
         for _ in 0..3 {
             run30(&["herdr", "pane", "run", pane, &agent_run.prompt]).await;
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -331,6 +339,7 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
             ])
             .await;
             if !read.ok {
+                read_failure = Some(read.failure_detail());
                 break;
             }
             // Claude collapses large pastes to this placeholder; it proves delivery.
@@ -340,7 +349,10 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
             }
         }
         if !landed {
-            return AgentRunOutcome::Failed("prompt never landed in pane".to_string());
+            return AgentRunOutcome::Failed(match read_failure {
+                Some(detail) => format!("prompt never landed in pane (pane read: {detail})"),
+                None => "prompt never landed in pane".to_string(),
+            });
         }
         run30(&["herdr", "pane", "send-keys", pane, "Enter"]).await;
         run30(&["herdr", "pane", "send-keys", pane, "Enter"]).await;
@@ -363,16 +375,19 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
             "herdr", "pane", "read", pane, "--source", "recent", "--lines", "15",
         ])
         .await;
+        let detail = (!done.ok).then(|| done.failure_detail());
         println!(
             "[herdr:{}] agent {}; tail:\n{}",
             agent_run.label,
-            if done.ok { "done" } else { "TIMED OUT" },
+            match &detail {
+                None => "done".to_string(),
+                Some(d) => format!("FAILED ({d})"),
+            },
             tail.out.trim()
         );
-        if done.ok {
-            AgentRunOutcome::Succeeded("agent done".to_string())
-        } else {
-            AgentRunOutcome::Failed("agent timeout".to_string())
+        match detail {
+            None => AgentRunOutcome::Succeeded("agent done".to_string()),
+            Some(d) => AgentRunOutcome::Failed(format!("agent wait failed ({d})")),
         }
     }
     .await;
