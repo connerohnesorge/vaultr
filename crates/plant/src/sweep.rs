@@ -7,9 +7,39 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+/// How a subprocess run ended. Distinguishes the cases `ok: false` collapses:
+/// a timeout, a spawn error (binary missing from PATH), and a non-zero exit.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RunEnd {
+    /// The process ran to completion; `None` code means killed by a signal.
+    Exited(Option<i32>),
+    TimedOut,
+    SpawnFailed,
+}
+
 pub struct RunResult {
     pub ok: bool,
     pub out: String,
+    pub stderr: String,
+    pub end: RunEnd,
+}
+
+impl RunResult {
+    /// One-line diagnostic for failure logs: how the run ended, plus a stderr tail.
+    pub fn failure_detail(&self) -> String {
+        let how = match self.end {
+            RunEnd::Exited(Some(code)) => format!("exit {code}"),
+            RunEnd::Exited(None) => "killed by signal".to_string(),
+            RunEnd::TimedOut => "timed out".to_string(),
+            RunEnd::SpawnFailed => "spawn failed".to_string(),
+        };
+        let err: String = self.stderr.trim().chars().take(200).collect();
+        if err.is_empty() {
+            how
+        } else {
+            format!("{how}: {err}")
+        }
+    }
 }
 
 /// PATH that works no matter who spawned plant. The launchd KeepAlive agent hands us
@@ -41,10 +71,20 @@ pub async fn run(cmd: &[&str], timeout: Duration) -> RunResult {
         Ok(Ok(o)) => RunResult {
             ok: o.status.success(),
             out: String::from_utf8_lossy(&o.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+            end: RunEnd::Exited(o.status.code()),
         },
-        _ => RunResult {
+        Ok(Err(e)) => RunResult {
             ok: false,
             out: String::new(),
+            stderr: e.to_string(),
+            end: RunEnd::SpawnFailed,
+        },
+        Err(_) => RunResult {
+            ok: false,
+            out: String::new(),
+            stderr: String::new(),
+            end: RunEnd::TimedOut,
         },
     }
 }
@@ -338,23 +378,25 @@ pub async fn compress_sweep(vault: &Path, idle: Duration) -> bool {
         let herdr = path.with_file_name("herdr.jsonl");
         if herdr.is_file() {
             let herdr_s = herdr.display().to_string();
-            if !run(
+            let zstd = run(
                 &["zstd", "-19", "-T0", "-q", "--rm", &herdr_s],
                 Duration::from_secs(600),
             )
-            .await
-            .ok
-            {
+            .await;
+            if !zstd.ok {
+                eprintln!(
+                    "[compress] {sid}: herdr.jsonl seal skipped ({}); next sweep retries",
+                    zstd.failure_detail()
+                );
                 continue;
             }
         }
-        if run(
+        let zstd = run(
             &["zstd", "-19", "-T0", "-q", "--rm", &path_s],
             Duration::from_secs(600),
         )
-        .await
-        .ok
-        {
+        .await;
+        if zstd.ok {
             sealed += 1;
             let after = std::fs::metadata(format!("{path_s}.zst"))
                 .map(|m| m.len())
@@ -364,6 +406,11 @@ pub async fn compress_sweep(vault: &Path, idle: Duration) -> bool {
                 "[compress] {rel}: {:.1}MB -> {:.1}MB",
                 before as f64 / 1e6,
                 after as f64 / 1e6
+            );
+        } else {
+            eprintln!(
+                "[compress] {sid}: turns.jsonl seal skipped ({}); next sweep retries",
+                zstd.failure_detail()
             );
         }
     }

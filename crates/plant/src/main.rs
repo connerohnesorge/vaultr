@@ -33,7 +33,8 @@ fn vault_path() -> PathBuf {
 
 /// `plant sessions eligible [--learner claude|codex] [--idle 60m] [--max 10]`,
 /// `plant compress once [--idle 60m]`, and `plant jobs run <name>` (manual trigger of a
-/// built-in job; PLANT_KEEP_PANES=1 keeps the Herdr workspace open after the run).
+/// built-in job; the Herdr workspace stays open after the run unless PLANT_KEEP_PANES=0
+/// opts into the per-job cleanup policy — see jobs::cleanup_policy).
 async fn subcommand(argv: &[String]) -> Option<i32> {
     let flag = |name: &str| {
         argv.iter()
@@ -73,7 +74,7 @@ async fn subcommand(argv: &[String]) -> Option<i32> {
             let name = argv.get(3).cloned().unwrap_or_default();
             match jobs::load_jobs().into_iter().find(|j| j.name == name) {
                 Some(job) => {
-                    jobs::run_job(&job).await;
+                    jobs::run_job(&job, &jobs::Cfg::load(&vault_path())).await;
                     Some(0)
                 }
                 None => {
