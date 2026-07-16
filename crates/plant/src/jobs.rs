@@ -185,7 +185,7 @@ if vaultr validate >/dev/null 2>&1; then rm -f "$cf"; echo '{}'; exit 0; fi
 n=$(( $(cat "$cf" 2>/dev/null || echo 0) + 1 ))
 echo "$n" > "$cf"
 if [ "$n" -ge 5 ]; then echo '{}'; exit 0; fi
-echo '{"decision":"block","reason":"The vault is still invalid. Run `vaultr validate --json`, fix every remaining error (repair or remove broken [[wikilinks]], fix markdown path links, repair corrupt ledger lines). For intentional literal examples append <!-- vault-validate: ignore --> to that line instead of deleting it. Never touch vault/sessions/ capture data. Stop only when `vaultr validate` exits 0."}'
+echo '{"decision":"block","reason":"The vault is still invalid. Run `vaultr validate --json`, fix every remaining error (repair or remove broken [[wikilinks]], fix markdown path links, repair corrupt ledger lines, and for a preference-pool error consolidate vault/preferences/*.md under the byte cap by merging overlapping / shortening verbose / deleting stale preferences — never silently drop one). For intentional literal examples append <!-- vault-validate: ignore --> to that line instead of deleting it. Never touch vault/sessions/ capture data. Stop only when `vaultr validate` exits 0."}'
 "#;
     std::fs::write(&path, script)?;
     use std::os::unix::fs::PermissionsExt;
@@ -236,7 +236,9 @@ fn prompt(kind: Kind) -> Option<String> {
                 "The knowledge vault at ~/.dotfiles/vault has {} validation error(s). \
                  Fix them all: repair or remove broken [[wikilinks]] (prefer repairing the \
                  target), fix markdown path links, repair corrupt learnings/.ledger.jsonl \
-                 lines. For intentional literal examples append \
+                 lines; for a preference-pool error consolidate vault/preferences/*.md \
+                 under the byte cap (merge overlapping, shorten verbose, delete stale — \
+                 never silently drop a preference). For intentional literal examples append \
                  <!-- vault-validate: ignore --> to that line. Never touch vault/sessions/ \
                  capture data. Re-run `vaultr validate --json` and iterate until it exits 0.\n\
                  Current errors:\n{}",

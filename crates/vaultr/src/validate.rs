@@ -2,8 +2,9 @@
 //! markdown path links, and learn-ledger integrity. Read-only over the vault.
 //!
 //! Severity model: broken links / bad md paths / unparseable ledger lines / duplicate
-//! slugs (bare-[[slug]] links become ambiguous) are errors; frontmatter gaps are
-//! warnings — 87 legacy files have no frontmatter and must not trip the repair loop.
+//! slugs (bare-[[slug]] links become ambiguous) / an oversize preference pool are
+//! errors; frontmatter gaps are warnings — 87 legacy files have no frontmatter and
+//! must not trip the repair loop.
 //! A line containing `<!-- vault-validate: ignore -->` is exempt from link checks.
 
 use anyhow::{Context, Result};
@@ -25,6 +26,9 @@ pub const CONTENT_DIRS: &[&str] = &[
 ];
 
 const IGNORE_MARKER: &str = "<!-- vault-validate: ignore -->";
+
+/// preferences/*.md are inlined verbatim into every session's digest — hard cap.
+const PREF_POOL_CAP: u64 = 5120;
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -324,6 +328,25 @@ pub fn scan(content_root: &Path) -> Result<Report> {
                 });
             }
         }
+    }
+
+    // Preference pool cap: the pool rides in every session, so oversize is an error
+    // the repair loop must consolidate (merge/shorten/delete), never silently drop.
+    let pref_bytes: u64 = md_files(&content_root.join("preferences"))
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).ok())
+        .map(|m| m.len())
+        .sum();
+    if pref_bytes > PREF_POOL_CAP {
+        report.findings.push(Finding {
+            severity: Severity::Error,
+            kind: "preference-pool",
+            file: "preferences".into(),
+            line: 0,
+            detail: format!(
+                "pool is {pref_bytes}B, cap {PREF_POOL_CAP}B — consolidate: merge overlapping, shorten verbose, delete stale; never drop a preference silently"
+            ),
+        });
     }
 
     // sources: frontmatter session-UUID refs must exist in the sessions index.
