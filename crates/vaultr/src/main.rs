@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use vaultr::{fork, normalize, recon, render, vault};
+use vaultr::{fork, normalize, recon, render, validate, vault};
 
 #[derive(Parser)]
 #[command(
@@ -23,6 +23,15 @@ enum Cmd {
     /// Session operations
     #[command(subcommand)]
     Session(SessionCmd),
+    /// Validate vault content: wikilink resolution, frontmatter, md paths, ledger
+    Validate {
+        /// Emit the report as JSON
+        #[arg(long)]
+        json: bool,
+        /// Also fail (exit 1) on warnings
+        #[arg(long)]
+        strict: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -73,6 +82,10 @@ fn run() -> Result<()> {
     let cli = Cli::parse();
     let root = vault::root(cli.vault.as_deref())?;
     match cli.command {
+        Cmd::Validate { json, strict } => {
+            let code = validate::run(&root, json, strict)?;
+            std::process::exit(code);
+        }
         Cmd::Session(SessionCmd::List { all }) => list(&root, all),
         Cmd::Session(SessionCmd::Path { id, copy }) => path(&root, &id, copy),
         Cmd::Session(SessionCmd::Show { id, stats }) => show(&root, &id, stats),

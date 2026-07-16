@@ -57,6 +57,8 @@ pub enum Kind {
     Learn,
     LearnCodex,
     Reconcile,
+    Validate,
+    ValidateRepair,
 }
 
 #[derive(Clone)]
@@ -147,7 +149,49 @@ pub fn load_jobs() -> Vec<Job> {
             model: Some("opus[1m]".into()),
             ..Job::new("reconcile", Kind::Reconcile, Duration::from_secs(2 * 3600))
         },
+        Job::new("validate", Kind::Validate, Duration::from_secs(3600)),
+        Job {
+            cli: Some("codex".into()),
+            model: Some("gpt-5.6-sol".into()),
+            // Stop hook injected per-invocation: codex may not stop until the vault
+            // validates clean (the hook script self-limits to 5 continuations)
+            args: Some(format!(
+                "-c model_reasoning_effort=xhigh --dangerously-bypass-hook-trust \
+                 -c 'hooks.Stop=[{{hooks=[{{type=\"command\",command=\"{}\",timeout=120}}]}}]'",
+                stop_hook_path().display()
+            )),
+            close_pane: ClosePane::OnSuccess,
+            ..Job::new(
+                "validate-repair",
+                Kind::ValidateRepair,
+                Duration::from_secs(3600),
+            )
+        },
     ]
+}
+
+fn stop_hook_path() -> PathBuf {
+    state_dir().join("hooks/stop_until_valid.sh")
+}
+
+/// Idempotently (re)write the codex Stop hook script and reset its continuation counter.
+fn write_stop_hook() -> std::io::Result<()> {
+    let path = stop_hook_path();
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    let script = r#"#!/bin/sh
+# plant validate-repair Stop hook: block codex from stopping until the vault validates.
+cf="$HOME/.local/state/plant/hooks/validate-repair.count"
+if vaultr validate >/dev/null 2>&1; then rm -f "$cf"; echo '{}'; exit 0; fi
+n=$(( $(cat "$cf" 2>/dev/null || echo 0) + 1 ))
+echo "$n" > "$cf"
+if [ "$n" -ge 5 ]; then echo '{}'; exit 0; fi
+echo '{"decision":"block","reason":"The vault is still invalid. Run `vaultr validate --json`, fix every remaining error (repair or remove broken [[wikilinks]], fix markdown path links, repair corrupt ledger lines). For intentional literal examples append <!-- vault-validate: ignore --> to that line instead of deleting it. Never touch vault/sessions/ capture data. Stop only when `vaultr validate` exits 0."}'
+"#;
+    std::fs::write(&path, script)?;
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
+    let _ = std::fs::remove_file(state_dir().join("hooks/validate-repair.count"));
+    Ok(())
 }
 
 /// Eligible session dirs for a learner, or None when there's nothing to learn from.
@@ -175,7 +219,38 @@ fn prompt(kind: Kind) -> Option<String> {
             )
         }),
         Kind::Reconcile => Some("/Vault reconcile".to_string()),
+        Kind::Validate => None,
+        Kind::ValidateRepair => {
+            let report = vault_validate()?;
+            if report.errors() == 0 {
+                return None;
+            }
+            let errors: Vec<String> = report
+                .findings
+                .iter()
+                .filter(|f| f.severity == vaultr::validate::Severity::Error)
+                .take(50)
+                .map(|f| format!("- {} {}:{} {}", f.kind, f.file, f.line, f.detail))
+                .collect();
+            Some(format!(
+                "The knowledge vault at ~/.dotfiles/vault has {} validation error(s). \
+                 Fix them all: repair or remove broken [[wikilinks]] (prefer repairing the \
+                 target), fix markdown path links, repair corrupt learnings/.ledger.jsonl \
+                 lines. For intentional literal examples append \
+                 <!-- vault-validate: ignore --> to that line. Never touch vault/sessions/ \
+                 capture data. Re-run `vaultr validate --json` and iterate until it exits 0.\n\
+                 Current errors:\n{}",
+                report.errors(),
+                errors.join("\n")
+            ))
+        }
     }
+}
+
+/// Run the vault content validator; None on scan failure (skip this tick).
+fn vault_validate() -> Option<vaultr::validate::Report> {
+    let root = vaultr::validate::content_root(&crate::vault_path()).ok()?;
+    vaultr::validate::scan(&root).ok()
 }
 
 fn epoch_now() -> u64 {
@@ -490,10 +565,26 @@ pub async fn run_job(job: &Job) {
         record(&job.name, outcome, started, "compress sweep");
         return;
     }
+    if job.kind == Kind::Validate {
+        match vault_validate() {
+            Some(report) => {
+                let outcome = if report.errors() == 0 { "success" } else { "failed" };
+                record(&job.name, outcome, started, &report.summary());
+            }
+            None => record(&job.name, "failed", started, "vault scan failed"),
+        }
+        return;
+    }
     let Some(prompt) = prompt(job.kind) else {
         record(&job.name, "skipped", started, "nothing eligible");
         return;
     };
+    if job.kind == Kind::ValidateRepair {
+        if let Err(e) = write_stop_hook() {
+            record(&job.name, "failed", started, &format!("stop hook write: {e}"));
+            return;
+        }
+    }
     match run_agent(job, &prompt).await {
         None => println!("[job:{}] herdr down, retry next tick", job.name),
         Some((true, detail)) => record(&job.name, "success", started, &detail),
@@ -564,7 +655,14 @@ mod tests {
     #[test]
     fn built_in_jobs_have_expected_shape() {
         let jobs = load_jobs();
-        assert_eq!(jobs.len(), 4);
+        assert_eq!(jobs.len(), 6);
+        assert_eq!(by_name("validate").kind, Kind::Validate);
+        let repair = by_name("validate-repair");
+        assert_eq!(repair.cli.as_deref(), Some("codex"));
+        let args = repair.args.unwrap();
+        assert!(args.contains("--dangerously-bypass-hook-trust"));
+        assert!(args.contains("hooks.Stop="));
+        assert!(args.contains("stop_until_valid.sh"));
         assert_eq!(by_name("compress").kind, Kind::Compress);
         assert_eq!(by_name("learn").close_pane, ClosePane::OnSuccess);
         assert_eq!(by_name("reconcile").close_pane, ClosePane::Always);

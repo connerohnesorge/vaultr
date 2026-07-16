@@ -5,5 +5,6 @@ pub mod normalize;
 pub mod recon;
 pub mod render;
 pub mod translate;
+pub mod validate;
 pub mod vault;
 pub mod writeio;
