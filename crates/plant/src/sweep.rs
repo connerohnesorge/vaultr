@@ -7,9 +7,39 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
+/// How a subprocess run ended. Distinguishes the cases `ok: false` collapses:
+/// a timeout, a spawn error (binary missing from PATH), and a non-zero exit.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RunEnd {
+    /// The process ran to completion; `None` code means killed by a signal.
+    Exited(Option<i32>),
+    TimedOut,
+    SpawnFailed,
+}
+
 pub struct RunResult {
     pub ok: bool,
     pub out: String,
+    pub stderr: String,
+    pub end: RunEnd,
+}
+
+impl RunResult {
+    /// One-line diagnostic for failure logs: how the run ended, plus a stderr tail.
+    pub fn failure_detail(&self) -> String {
+        let how = match self.end {
+            RunEnd::Exited(Some(code)) => format!("exit {code}"),
+            RunEnd::Exited(None) => "killed by signal".to_string(),
+            RunEnd::TimedOut => "timed out".to_string(),
+            RunEnd::SpawnFailed => "spawn failed".to_string(),
+        };
+        let err: String = self.stderr.trim().chars().take(200).collect();
+        if err.is_empty() {
+            how
+        } else {
+            format!("{how}: {err}")
+        }
+    }
 }
 
 /// PATH that works no matter who spawned plant. The launchd KeepAlive agent hands us
@@ -41,10 +71,20 @@ pub async fn run(cmd: &[&str], timeout: Duration) -> RunResult {
         Ok(Ok(o)) => RunResult {
             ok: o.status.success(),
             out: String::from_utf8_lossy(&o.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
+            end: RunEnd::Exited(o.status.code()),
         },
-        _ => RunResult {
+        Ok(Err(e)) => RunResult {
             ok: false,
             out: String::new(),
+            stderr: e.to_string(),
+            end: RunEnd::SpawnFailed,
+        },
+        Err(_) => RunResult {
+            ok: false,
+            out: String::new(),
+            stderr: String::new(),
+            end: RunEnd::TimedOut,
         },
     }
 }
@@ -130,36 +170,19 @@ fn capture_files(vault: &Path) -> Vec<(String, PathBuf)> {
     turns_files(vault, true)
 }
 
-/// glob */*/*/*/turns.jsonl[.zst] under vault -> (session_id, path)
+/// YYYY/MM/DD/<id>/turns.jsonl[.zst] under vault -> (session_id, path).
+/// Uses the shared digit-filtered walker, so non-date dirs (e.g. `.meta`) are skipped.
 fn turns_files(vault: &Path, include_compressed: bool) -> Vec<(String, PathBuf)> {
     let mut out = vec![];
-    let dirs = |p: &Path| -> Vec<PathBuf> {
-        std::fs::read_dir(p)
-            .map(|rd| {
-                rd.flatten()
-                    .map(|e| e.path())
-                    .filter(|p| p.is_dir())
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    for y in dirs(vault) {
-        for m in dirs(&y) {
-            for d in dirs(&m) {
-                for sess in dirs(&d) {
-                    let f = if include_compressed {
-                        vaultr::vault::capture_file(&sess).ok()
-                    } else {
-                        let raw = sess.join("turns.jsonl");
-                        raw.is_file().then_some(raw)
-                    };
-                    if let Some(f) = f {
-                        if let Some(sid) = sess.file_name().and_then(|s| s.to_str()) {
-                            out.push((sid.to_string(), f));
-                        }
-                    }
-                }
-            }
+    for (sid, sess) in vaultr::vault::walk_session_dirs(vault) {
+        let f = if include_compressed {
+            vaultr::vault::capture_file(&sess).ok()
+        } else {
+            let raw = sess.join("turns.jsonl");
+            raw.is_file().then_some(raw)
+        };
+        if let Some(f) = f {
+            out.push((sid, f));
         }
     }
     out
@@ -343,23 +366,25 @@ pub async fn compress_sweep(vault: &Path, idle: Duration) -> bool {
         let herdr = path.with_file_name("herdr.jsonl");
         if herdr.is_file() {
             let herdr_s = herdr.display().to_string();
-            if !run(
+            let zstd = run(
                 &["zstd", "-19", "-T0", "-q", "--rm", &herdr_s],
                 Duration::from_secs(600),
             )
-            .await
-            .ok
-            {
+            .await;
+            if !zstd.ok {
+                eprintln!(
+                    "[compress] {sid}: herdr.jsonl seal skipped ({}); next sweep retries",
+                    zstd.failure_detail()
+                );
                 continue;
             }
         }
-        if run(
+        let zstd = run(
             &["zstd", "-19", "-T0", "-q", "--rm", &path_s],
             Duration::from_secs(600),
         )
-        .await
-        .ok
-        {
+        .await;
+        if zstd.ok {
             sealed += 1;
             let after = std::fs::metadata(format!("{path_s}.zst"))
                 .map(|m| m.len())
@@ -369,6 +394,11 @@ pub async fn compress_sweep(vault: &Path, idle: Duration) -> bool {
                 "[compress] {rel}: {:.1}MB -> {:.1}MB",
                 before as f64 / 1e6,
                 after as f64 / 1e6
+            );
+        } else {
+            eprintln!(
+                "[compress] {sid}: turns.jsonl seal skipped ({}); next sweep retries",
+                zstd.failure_detail()
             );
         }
     }
@@ -433,6 +463,39 @@ mod tests {
         assert!(!claude.iter().any(|p| p.ends_with(claude_id)));
         assert!(codex.iter().any(|p| p.ends_with(claude_id)));
         assert!(!codex.iter().any(|p| p.ends_with(codex_id)));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn walker_skips_non_date_dirs_but_finds_dated_sessions() {
+        // The walker feeds the destructive sealing path: selection must be exact.
+        let root = std::env::temp_dir().join(format!("plant-walker-test-{}", std::process::id()));
+        let sessions = root.join("sessions");
+        let sid = "abc123-real-session";
+        let _ = std::fs::remove_dir_all(&root);
+        // Normal dated session: must be found.
+        let dated = sessions.join("2026/07/16").join(sid);
+        std::fs::create_dir_all(&dated).unwrap();
+        std::fs::write(dated.join("turns.jsonl"), "{}\n").unwrap();
+        // Non-date dirs at various levels: must never be descended into.
+        for bogus in [".meta/2026/07", "notes/07/16", "2026/backup/16", "2026/07/.tmp"] {
+            let d = sessions.join(bogus).join("phantom-session");
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("turns.jsonl"), "{}\n").unwrap();
+        }
+
+        let raw = turns_files(&sessions, false);
+        assert_eq!(raw.len(), 1, "only the dated session, got {raw:?}");
+        assert_eq!(raw[0].0, sid);
+        assert_eq!(raw[0].1, dated.join("turns.jsonl"));
+
+        // include_compressed also picks up sealed sessions, still date-filtered.
+        std::fs::remove_file(dated.join("turns.jsonl")).unwrap();
+        std::fs::write(dated.join("turns.jsonl.zst"), "sealed").unwrap();
+        let all = turns_files(&sessions, true);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].1, dated.join("turns.jsonl.zst"));
 
         let _ = std::fs::remove_dir_all(root);
     }
