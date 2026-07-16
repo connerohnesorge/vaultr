@@ -137,16 +137,9 @@ pub fn session_dir(root: &Path, session: &Session) -> Result<PathBuf> {
             return Ok(candidate);
         }
     }
-    // Fallback: scan YYYY/MM/DD for the id.
-    for y in read_dirs(root) {
-        for m in read_dirs(&y) {
-            for d in read_dirs(&m) {
-                let candidate = d.join(&session.id);
-                if candidate.is_dir() {
-                    return Ok(candidate);
-                }
-            }
-        }
+    // Fallback: scan YYYY/MM/DD for the id (lazy walk, stops at the first hit).
+    if let Some((_, dir)) = walk_session_dirs(root).find(|(sid, _)| *sid == session.id) {
+        return Ok(dir);
     }
     bail!(
         "session directory for {} not found under {}",
@@ -168,20 +161,40 @@ pub fn capture_file(dir: &Path) -> Result<PathBuf> {
     bail!("no turns.jsonl or turns.jsonl.zst in {}", dir.display())
 }
 
-fn read_dirs(path: &Path) -> Vec<PathBuf> {
+/// Walk `<root>/YYYY/MM/DD/<session-id>` lazily, yielding `(session_id, session_dir)`
+/// in sorted (oldest date first) order. Only all-ASCII-digit directory names count as
+/// date levels, so index dirs like `.meta` at the root are never entered. Unreadable
+/// dirs are skipped.
+pub fn walk_session_dirs(root: &Path) -> impl Iterator<Item = (String, PathBuf)> {
+    read_dirs(root).into_iter().flat_map(|y| {
+        read_dirs(&y).into_iter().flat_map(|m| {
+            read_dirs(&m).into_iter().flat_map(|d| {
+                // Session ids are UUID-like, so the leaf level takes any dir name.
+                read_dirs_where(&d, |_| true).into_iter().filter_map(|sess| {
+                    let sid = sess.file_name()?.to_str()?.to_string();
+                    Some((sid, sess))
+                })
+            })
+        })
+    })
+}
+
+/// Sorted subdirectories of `path` whose (UTF-8) name passes `keep`.
+fn read_dirs_where(path: &Path, keep: fn(&str) -> bool) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = std::fs::read_dir(path)
         .map(|rd| {
             rd.flatten()
                 .map(|e| e.path())
                 .filter(|p| {
-                    p.is_dir()
-                        && p.file_name()
-                            .and_then(|n| n.to_str())
-                            .is_some_and(|n| n.chars().all(|c| c.is_ascii_digit()))
+                    p.is_dir() && p.file_name().and_then(|n| n.to_str()).is_some_and(keep)
                 })
                 .collect()
         })
         .unwrap_or_default();
     dirs.sort();
     dirs
+}
+
+fn read_dirs(path: &Path) -> Vec<PathBuf> {
+    read_dirs_where(path, |n| n.chars().all(|c| c.is_ascii_digit()))
 }

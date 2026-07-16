@@ -165,36 +165,19 @@ fn capture_files(vault: &Path) -> Vec<(String, PathBuf)> {
     turns_files(vault, true)
 }
 
-/// glob */*/*/*/turns.jsonl[.zst] under vault -> (session_id, path)
+/// YYYY/MM/DD/<id>/turns.jsonl[.zst] under vault -> (session_id, path).
+/// Uses the shared digit-filtered walker, so non-date dirs (e.g. `.meta`) are skipped.
 fn turns_files(vault: &Path, include_compressed: bool) -> Vec<(String, PathBuf)> {
     let mut out = vec![];
-    let dirs = |p: &Path| -> Vec<PathBuf> {
-        std::fs::read_dir(p)
-            .map(|rd| {
-                rd.flatten()
-                    .map(|e| e.path())
-                    .filter(|p| p.is_dir())
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    for y in dirs(vault) {
-        for m in dirs(&y) {
-            for d in dirs(&m) {
-                for sess in dirs(&d) {
-                    let f = if include_compressed {
-                        vaultr::vault::capture_file(&sess).ok()
-                    } else {
-                        let raw = sess.join("turns.jsonl");
-                        raw.is_file().then_some(raw)
-                    };
-                    if let Some(f) = f {
-                        if let Some(sid) = sess.file_name().and_then(|s| s.to_str()) {
-                            out.push((sid.to_string(), f));
-                        }
-                    }
-                }
-            }
+    for (sid, sess) in vaultr::vault::walk_session_dirs(vault) {
+        let f = if include_compressed {
+            vaultr::vault::capture_file(&sess).ok()
+        } else {
+            let raw = sess.join("turns.jsonl");
+            raw.is_file().then_some(raw)
+        };
+        if let Some(f) = f {
+            out.push((sid, f));
         }
     }
     out
@@ -467,6 +450,39 @@ mod tests {
         assert!(!claude.iter().any(|p| p.ends_with(claude_id)));
         assert!(codex.iter().any(|p| p.ends_with(claude_id)));
         assert!(!codex.iter().any(|p| p.ends_with(codex_id)));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn walker_skips_non_date_dirs_but_finds_dated_sessions() {
+        // The walker feeds the destructive sealing path: selection must be exact.
+        let root = std::env::temp_dir().join(format!("plant-walker-test-{}", std::process::id()));
+        let sessions = root.join("sessions");
+        let sid = "abc123-real-session";
+        let _ = std::fs::remove_dir_all(&root);
+        // Normal dated session: must be found.
+        let dated = sessions.join("2026/07/16").join(sid);
+        std::fs::create_dir_all(&dated).unwrap();
+        std::fs::write(dated.join("turns.jsonl"), "{}\n").unwrap();
+        // Non-date dirs at various levels: must never be descended into.
+        for bogus in [".meta/2026/07", "notes/07/16", "2026/backup/16", "2026/07/.tmp"] {
+            let d = sessions.join(bogus).join("phantom-session");
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("turns.jsonl"), "{}\n").unwrap();
+        }
+
+        let raw = turns_files(&sessions, false);
+        assert_eq!(raw.len(), 1, "only the dated session, got {raw:?}");
+        assert_eq!(raw[0].0, sid);
+        assert_eq!(raw[0].1, dated.join("turns.jsonl"));
+
+        // include_compressed also picks up sealed sessions, still date-filtered.
+        std::fs::remove_file(dated.join("turns.jsonl")).unwrap();
+        std::fs::write(dated.join("turns.jsonl.zst"), "sealed").unwrap();
+        let all = turns_files(&sessions, true);
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].1, dated.join("turns.jsonl.zst"));
 
         let _ = std::fs::remove_dir_all(root);
     }
