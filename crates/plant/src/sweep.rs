@@ -99,15 +99,13 @@ fn turns_files(vault: &Path, include_compressed: bool) -> Vec<(String, PathBuf)>
         for m in dirs(&y) {
             for d in dirs(&m) {
                 for sess in dirs(&d) {
-                    let raw = sess.join("turns.jsonl");
-                    let f = if raw.is_file() {
-                        raw
-                    } else if include_compressed {
-                        sess.join("turns.jsonl.zst")
+                    let f = if include_compressed {
+                        vaultr::vault::capture_file(&sess).ok()
                     } else {
-                        continue;
+                        let raw = sess.join("turns.jsonl");
+                        raw.is_file().then_some(raw)
                     };
-                    if f.is_file() {
+                    if let Some(f) = f {
                         if let Some(sid) = sess.file_name().and_then(|s| s.to_str()) {
                             out.push((sid.to_string(), f));
                         }

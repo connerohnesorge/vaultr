@@ -36,7 +36,7 @@ fn now_ns() -> String {
     let d = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    format!("{}", d.as_millis() as u128 * 1_000_000)
+    format!("{}", d.as_millis() * 1_000_000)
 }
 
 fn attributes(values: &[(&str, Value)]) -> Value {

@@ -19,4 +19,4 @@ futures-util = "0.3"
 bytes = "1"
 tokio-stream = "0.1"
 libc = "0.2"
-
+vaultr = { path = "../vaultr" }

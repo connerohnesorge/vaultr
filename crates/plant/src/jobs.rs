@@ -145,11 +145,7 @@ pub fn load_jobs() -> Vec<Job> {
         Job {
             cli: Some("claude".into()),
             model: Some("opus[1m]".into()),
-            ..Job::new(
-                "reconcile",
-                Kind::Reconcile,
-                Duration::from_secs(2 * 3600),
-            )
+            ..Job::new("reconcile", Kind::Reconcile, Duration::from_secs(2 * 3600))
         },
     ]
 }

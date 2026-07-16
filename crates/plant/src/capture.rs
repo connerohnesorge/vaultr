@@ -10,6 +10,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
+use vaultr::vault::{dated_session_dir, Meta};
 
 pub struct CapturedRequest {
     pub method: String,
@@ -89,32 +90,7 @@ fn civil(secs: i64) -> (i64, u32, u32, u32, u32, u32) {
     )
 }
 
-/// Parse an ISO timestamp back to SystemTime (meta original_start). Best-effort.
-fn parse_iso(s: &str) -> Option<SystemTime> {
-    let b = s.as_bytes();
-    if b.len() < 19 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' {
-        return None;
-    }
-    let num = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
-    let (y, mo, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
-    let (h, mi, sec) = (num(11..13)?, num(14..16)?, num(17..19)?);
-    // civil -> days (inverse of above)
-    let yy = if mo <= 2 { y - 1 } else { y };
-    let era = yy.div_euclid(400);
-    let yoe = yy - era * 400;
-    let mp = if mo > 2 { mo - 3 } else { mo + 9 };
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146097 + doe - 719468;
-    let secs = days * 86400 + h * 3600 + mi * 60 + sec;
-    u64::try_from(secs)
-        .ok()
-        .map(|s| SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(s))
-}
-
 /// vault/YYYY/MM/DD/<session_id>, dated from meta original_start when parseable.
-/// NOTE: TS used local time via Date getters; we use UTC — dates match TS behavior
-/// only when the meta timestamp is ISO-UTC, which it always is (iso_now).
 pub fn session_dir(vault: &Path, session_id: &str) -> std::io::Result<PathBuf> {
     let key = format!("{}\0{}", vault.display(), session_id);
     let mut guard = SESSION_DIRS.lock().unwrap();
@@ -122,28 +98,13 @@ pub fn session_dir(vault: &Path, session_id: &str) -> std::io::Result<PathBuf> {
     if let Some(dir) = map.get(&key) {
         return Ok(dir.clone());
     }
-    let mut when = SystemTime::now();
-    if let Ok(text) = fs::read_to_string(vault.join(".meta").join(format!("{session_id}.json"))) {
-        if let Ok(meta) = serde_json::from_str::<Value>(&text) {
-            if let Some(t) = meta
-                .get("original_start")
-                .and_then(Value::as_str)
-                .and_then(parse_iso)
-            {
-                when = t;
-            }
-        }
-    }
-    let secs = when
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
-    let (y, m, d, ..) = civil(secs);
-    let dir = vault
-        .join(format!("{y:04}"))
-        .join(format!("{m:02}"))
-        .join(format!("{d:02}"))
-        .join(session_id);
+    let original_start = fs::read_to_string(vault.join(".meta").join(format!("{session_id}.json")))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Meta>(&text).ok())
+        .and_then(|meta| meta.original_start);
+    let dir = dated_session_dir(vault, session_id, original_start.as_deref())
+        .or_else(|| dated_session_dir(vault, session_id, Some(&iso_now())))
+        .expect("iso_now returns RFC 3339");
     fs::create_dir_all(&dir)?;
     map.insert(key, dir.clone());
     Ok(dir)
@@ -179,26 +140,25 @@ pub fn update_meta(
         "{}.json",
         ids.session_id.as_deref().unwrap_or("unknown")
     ));
-    let meta: Value = fs::read_to_string(&path)
+    let mut meta: Meta = fs::read_to_string(&path)
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
-        .unwrap_or(Value::Null);
-    let get = |k: &str| meta.get(k).cloned().unwrap_or(Value::Null);
+        .unwrap_or_default();
     let now = iso_now();
-    let out = json!({
-        "schema_version": 1,
-        "harness": adapter.harness,
-        "session_id": ids.session_id,
-        "thread_id": ids.thread_id.clone().map(Value::String).unwrap_or_else(|| get("thread_id")),
-        "cwd": get("cwd"),
-        "git_branch": get("git_branch"),
-        "transcript_path": get("transcript_path"),
-        "model": model.map(|m| Value::String(m.to_string())).unwrap_or_else(|| get("model")),
-        "session_start_source": if get("session_start_source").is_null() { json!("wire") } else { get("session_start_source") },
-        "original_start": if get("original_start").is_null() { json!(now) } else { get("original_start") },
-        "last_observation": now,
-    });
-    fs::write(&path, to_string_pretty_1(&out) + "\n")
+    meta.schema_version = Some(1);
+    meta.harness = Some(adapter.harness.to_string());
+    meta.session_id.clone_from(&ids.session_id);
+    if ids.thread_id.is_some() {
+        meta.thread_id.clone_from(&ids.thread_id);
+    }
+    if let Some(model) = model {
+        meta.model = Some(model.to_string());
+    }
+    meta.session_start_source
+        .get_or_insert_with(|| "wire".to_string());
+    meta.original_start.get_or_insert_with(|| now.clone());
+    meta.last_observation = Some(now);
+    fs::write(&path, to_string_pretty_1(&json!(meta)) + "\n")
 }
 
 /// commonPrefix: element-wise JSON equality.
@@ -363,4 +323,78 @@ pub fn to_string_pretty_1(value: &Value) -> String {
     let mut ser = serde_json::Serializer::with_formatter(&mut buf, fmt);
     serde::Serialize::serialize(value, &mut ser).expect("json serialize");
     String::from_utf8(buf).expect("utf8")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_dir_creates_from_meta_without_scanning_and_caches() {
+        let vault = std::env::temp_dir().join(format!("plant-capture-{}", uuid::Uuid::new_v4()));
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let meta_dir = vault.join(".meta");
+        fs::create_dir_all(&meta_dir).unwrap();
+        fs::create_dir_all(vault.join("2000/01/01").join(&session_id)).unwrap();
+        let meta_path = meta_dir.join(format!("{session_id}.json"));
+        fs::write(
+            &meta_path,
+            r#"{"original_start":"2026-07-10T23:30:00-02:00"}"#,
+        )
+        .unwrap();
+
+        let dir = session_dir(&vault, &session_id).unwrap();
+        assert!(dir.ends_with(format!("2026/07/11/{session_id}")));
+        assert!(dir.is_dir());
+        fs::write(meta_path, r#"{"original_start":"2030-01-01T00:00:00Z"}"#).unwrap();
+        assert_eq!(session_dir(&vault, &session_id).unwrap(), dir);
+
+        fs::remove_dir_all(vault).unwrap();
+    }
+
+    #[test]
+    fn update_meta_emits_complete_shape_and_preserves_writer_policy() {
+        let vault = std::env::temp_dir().join(format!("plant-meta-{}", uuid::Uuid::new_v4()));
+        let session_id = uuid::Uuid::new_v4().to_string();
+        let path = vault.join(".meta").join(format!("{session_id}.json"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(
+            &path,
+            r#"{"thread_id":"thread","cwd":"/tmp","git_branch":"main","transcript_path":"/tmp/transcript","model":"old","session_start_source":"native","original_start":"2026-07-10T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let ids = Identity {
+            session_id: Some(session_id.clone()),
+            ..Default::default()
+        };
+        let adapter = crate::adapter::adapters().remove(0);
+
+        update_meta(&vault, &adapter, &ids, Some("new")).unwrap();
+        let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        let object = value.as_object().unwrap();
+        assert_eq!(object.len(), 11);
+        for key in [
+            "schema_version",
+            "harness",
+            "session_id",
+            "thread_id",
+            "cwd",
+            "git_branch",
+            "transcript_path",
+            "model",
+            "session_start_source",
+            "original_start",
+            "last_observation",
+        ] {
+            assert!(object.contains_key(key), "missing {key}");
+        }
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["session_id"], session_id);
+        assert_eq!(value["thread_id"], "thread");
+        assert_eq!(value["model"], "new");
+        assert_eq!(value["session_start_source"], "native");
+        assert!(serde_json::from_value::<Meta>(value).is_ok());
+
+        fs::remove_dir_all(vault).unwrap();
+    }
 }

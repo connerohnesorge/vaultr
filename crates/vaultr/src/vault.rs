@@ -1,27 +1,52 @@
 //! Vault root resolution, .meta index reading, session id resolution.
 
 use anyhow::{bail, Context, Result};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 /// Per-session index entry from `<root>/.meta/<session-uuid>.json`.
 /// All fields lenient — some entries omit or null them.
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct Meta {
+    #[serde(default)]
+    pub schema_version: Option<u64>,
     #[serde(default)]
     pub harness: Option<String>,
     #[serde(default)]
     pub session_id: Option<String>,
     #[serde(default)]
+    pub thread_id: Option<String>,
+    #[serde(default)]
     pub cwd: Option<String>,
     #[serde(default)]
     pub git_branch: Option<String>,
     #[serde(default)]
+    pub transcript_path: Option<String>,
+    #[serde(default)]
     pub model: Option<String>,
+    #[serde(default)]
+    pub session_start_source: Option<String>,
     #[serde(default)]
     pub original_start: Option<String>,
     #[serde(default)]
     pub last_observation: Option<String>,
+}
+
+/// Derive `<root>/YYYY/MM/DD/<session_id>` from an RFC 3339 timestamp in UTC.
+pub fn dated_session_dir(
+    root: &Path,
+    session_id: &str,
+    original_start: Option<&str>,
+) -> Option<PathBuf> {
+    let date = chrono::DateTime::parse_from_rfc3339(original_start?)
+        .ok()?
+        .with_timezone(&chrono::Utc);
+    Some(
+        root.join(date.format("%Y").to_string())
+            .join(date.format("%m").to_string())
+            .join(date.format("%d").to_string())
+            .join(session_id),
+    )
 }
 
 impl Meta {
@@ -105,16 +130,11 @@ pub fn resolve_id(root: &Path, query: &str) -> Result<Session> {
 /// Locate the session directory `<root>/YYYY/MM/DD/<id>`.
 /// Tries the date derived from original_start first, then scans.
 pub fn session_dir(root: &Path, session: &Session) -> Result<PathBuf> {
-    if let Some(start) = &session.meta.original_start {
-        if start.len() >= 10 {
-            let candidate = root
-                .join(&start[0..4])
-                .join(&start[5..7])
-                .join(&start[8..10])
-                .join(&session.id);
-            if candidate.is_dir() {
-                return Ok(candidate);
-            }
+    if let Some(candidate) =
+        dated_session_dir(root, &session.id, session.meta.original_start.as_deref())
+    {
+        if candidate.is_dir() {
+            return Ok(candidate);
         }
     }
     // Fallback: scan YYYY/MM/DD for the id.
