@@ -13,6 +13,7 @@ fn fixture(name: &str) -> PathBuf {
 fn claude_append_reconstructs_and_appends_trailing_response() {
     let r = recon::reconstruct(&fixture("claude_append.jsonl")).unwrap();
     assert_eq!(r.key, "messages");
+    assert_eq!(r.harness, Some(recon::Harness::Claude));
     assert_eq!(r.history_len, 4); // system, user, assistant, tool_result-user
     assert_eq!(r.trailing_appended, 1);
     assert_eq!(r.messages.len(), 5);
@@ -25,6 +26,7 @@ fn claude_append_reconstructs_and_appends_trailing_response() {
 fn codex_append_reconstructs_with_trailing_items() {
     let r = recon::reconstruct(&fixture("codex_append.jsonl")).unwrap();
     assert_eq!(r.key, "input");
+    assert_eq!(r.harness, Some(recon::Harness::Codex));
     assert_eq!(r.history_len, 5);
     assert_eq!(r.trailing_appended, 1);
     let last = r.messages.last().unwrap();
@@ -51,6 +53,45 @@ fn compaction_replaces_history() {
         r.messages[0]["content"][0]["text"],
         "Summary of prior conversation."
     );
+}
+
+#[test]
+fn harness_falls_back_to_input_key_when_envelopes_lack_field() {
+    // No `harness` field anywhere: key == "input" resolves Codex.
+    let codex = json!({
+        "schema_version": 1,
+        "request": {"body_delta": {"history": {"key": "input", "prefix_length": 0,
+            "append": [{"type": "message", "role": "user",
+                        "content": [{"type": "input_text", "text": "hi"}]}]}}},
+        "response": {"complete": false}
+    });
+    let r = recon::reconstruct_reader(format!("{codex}\n").as_bytes()).unwrap();
+    assert_eq!(r.harness, Some(recon::Harness::Codex));
+
+    // key == "messages" alone resolves nothing — identity stays undetermined
+    // so callers may consult meta.harness as a last resort.
+    let claude = json!({
+        "schema_version": 1,
+        "request": {"body_delta": {"history": {"key": "messages", "prefix_length": 0,
+            "append": [{"role": "user", "content": "hi"}]}}},
+        "response": {"complete": false}
+    });
+    let r = recon::reconstruct_reader(format!("{claude}\n").as_bytes()).unwrap();
+    assert_eq!(r.harness, None);
+}
+
+#[test]
+fn harness_envelope_field_outranks_key() {
+    // An envelope that says codex is codex even if a delta uses "messages".
+    let env = json!({
+        "schema_version": 1,
+        "harness": "codex",
+        "request": {"body_delta": {"history": {"key": "messages", "prefix_length": 0,
+            "append": [{"role": "user", "content": "hi"}]}}},
+        "response": {"complete": false}
+    });
+    let r = recon::reconstruct_reader(format!("{env}\n").as_bytes()).unwrap();
+    assert_eq!(r.harness, Some(recon::Harness::Codex));
 }
 
 #[test]

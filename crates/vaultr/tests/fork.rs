@@ -306,8 +306,19 @@ fn fixture_vault(
     history: &[Value],
     cwd: Option<&str>,
 ) -> (tempfile::TempDir, String) {
+    fixture_vault_with(harness, harness, history, cwd)
+}
+
+/// Like `fixture_vault`, but lets the sidecar meta.harness disagree with the
+/// harness recorded on the wire envelopes.
+fn fixture_vault_with(
+    meta_harness: &str,
+    env_harness: &str,
+    history: &[Value],
+    cwd: Option<&str>,
+) -> (tempfile::TempDir, String) {
     let root = tmp();
-    let id = if harness == "codex" {
+    let id = if env_harness == "codex" {
         uuid::Uuid::now_v7().to_string()
     } else {
         uuid::Uuid::new_v4().to_string()
@@ -318,11 +329,11 @@ fn fixture_vault(
         meta_dir.join(format!("{id}.json")),
         serde_json::to_string(&json!({
             "schema_version": 1,
-            "harness": harness,
+            "harness": meta_harness,
             "session_id": id,
             "cwd": cwd,
             "git_branch": "main",
-            "model": if harness == "codex" { "gpt-5.6-sol" } else { "claude-opus-4-8" },
+            "model": if env_harness == "codex" { "gpt-5.6-sol" } else { "claude-opus-4-8" },
             "original_start": "2026-07-01T00:00:00.000Z",
             "last_observation": "2026-07-01T00:00:00.000Z",
         }))
@@ -331,14 +342,14 @@ fn fixture_vault(
     .unwrap();
     let sdir = root.path().join("2026/07/01").join(&id);
     std::fs::create_dir_all(&sdir).unwrap();
-    let key = if harness == "codex" {
+    let key = if env_harness == "codex" {
         "input"
     } else {
         "messages"
     };
     let envelope = json!({
         "schema_version": 1,
-        "harness": harness,
+        "harness": env_harness,
         "session_id": id,
         "request": {"body_delta": {"history": {"key": key, "prefix_length": 0, "append": history}}},
         "response": {"complete": false}
@@ -492,6 +503,48 @@ fn fork_cross_harness_claude_to_codex() {
     let fname = out.path.file_stem().unwrap().to_string_lossy().to_string();
     assert!(fname.ends_with(&out.new_id));
     assert_eq!(recs[0]["payload"]["id"].as_str().unwrap(), out.new_id);
+}
+
+#[test]
+fn fork_envelope_harness_outranks_stale_meta() {
+    // The crack this guards: envelopes say codex but the mutable sidecar says
+    // claude — the fork must still take the codex passthrough path, not the
+    // claude branch (which would translate the items and corrupt the fork).
+    let cfg = tmp();
+    let workdir = tmp();
+    let mut history = vec![
+        json!({"type": "additional_tools", "role": "developer"}),
+        json!({"type": "message", "role": "developer",
+               "content": [{"type": "input_text", "text": "You are Codex, an agent based on GPT-5. ..."}]}),
+    ];
+    history.extend(codex_items());
+    let (root, id) = fixture_vault_with(
+        "claude",
+        "codex",
+        &history,
+        Some(&workdir.path().to_string_lossy()),
+    );
+    let out = fork::fork(
+        root.path(),
+        &id,
+        Target::Codex,
+        &opts(None, cfg.path(), cfg.path()),
+    )
+    .unwrap();
+    let recs = read_jsonl(&out.path);
+    // Passthrough proof: base instructions lifted into session_meta (the
+    // translate path never sets them) …
+    assert_eq!(
+        recs[0]["payload"]["base_instructions"]["text"],
+        "You are Codex, an agent based on GPT-5. ..."
+    );
+    // … and the opaque reasoning item survives verbatim (translate drops it).
+    let reasoning: Vec<&Value> = recs
+        .iter()
+        .filter(|r| r["type"] == "response_item" && r["payload"]["type"] == "reasoning")
+        .collect();
+    assert_eq!(reasoning.len(), 1);
+    assert_eq!(reasoning[0]["payload"]["encrypted_content"], "OPAQUE==");
 }
 
 fn walk_files(dir: &Path) -> Vec<PathBuf> {
