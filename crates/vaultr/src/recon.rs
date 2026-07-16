@@ -9,10 +9,41 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
+/// Harness identity of a capture, derived once during reconstruction.
+///
+/// Precedence: the envelope `harness` field is ground truth — envelopes are
+/// the captured wire truth, whereas `.meta/<id>.json` is a mutable
+/// hook-merged sidecar that can go stale or be wrong. When envelopes lack
+/// the field, a history key of "input" resolves to Codex. Only when neither
+/// resolves (`Recon::harness` is `None`) may callers fall back to
+/// meta.harness.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Harness {
+    Claude,
+    Codex,
+}
+
+impl Harness {
+    /// Map a recorded harness label to an identity. Accepts the "claude"
+    /// alias alongside the canonical "claude-code"; unknown labels resolve
+    /// nothing so callers fall through to their next source.
+    pub fn from_label(label: &str) -> Option<Harness> {
+        match label {
+            "codex" => Some(Harness::Codex),
+            "claude-code" | "claude" => Some(Harness::Claude),
+            _ => None,
+        }
+    }
+}
+
 /// Result of reconstructing a capture.
 pub struct Recon {
     /// History key seen on the wire: "messages" (Anthropic) or "input" (Codex).
     pub key: String,
+    /// Harness identity derived from the envelopes (see [`Harness`] for the
+    /// precedence rules). `None` for degenerate captures where neither the
+    /// envelope `harness` field nor the history key resolved.
+    pub harness: Option<Harness>,
     /// Message count from history deltas alone (matches recon.mjs `count`).
     pub history_len: usize,
     /// Final history, with the trailing completed response (if any) appended.
@@ -40,7 +71,7 @@ pub fn reconstruct_reader<R: Read>(reader: R) -> Result<Recon> {
     let mut msgs: Vec<Value> = Vec::new();
     let mut hash_dict: HashMap<String, Value> = HashMap::new();
     let mut key = String::from("messages");
-    let mut harness = String::new();
+    let mut harness: Option<Harness> = None;
     let mut trailing: Vec<Value> = Vec::new();
     let mut envelopes = 0usize;
     let mut buf = String::new();
@@ -61,18 +92,35 @@ pub fn reconstruct_reader<R: Read>(reader: R) -> Result<Recon> {
             continue;
         };
         envelopes += 1;
-        if let Some(h) = env.get("harness").and_then(Value::as_str) {
-            harness = h.to_string();
+        // Derive harness identity once, envelope-first: the envelope field is
+        // the captured wire truth; key == "input" resolves Codex only while
+        // no envelope has said otherwise.
+        match env
+            .get("harness")
+            .and_then(Value::as_str)
+            .and_then(Harness::from_label)
+        {
+            Some(h) => harness = Some(h),
+            None => {
+                if harness.is_none()
+                    && env
+                        .pointer("/request/body_delta/history/key")
+                        .and_then(Value::as_str)
+                        == Some("input")
+                {
+                    harness = Some(Harness::Codex);
+                }
+            }
         }
         // The response of every envelope *before* the last is reflected in the
         // next request's history delta; only the final envelope's completed
         // response needs appending. Track it per-envelope, keeping only the last.
-        trailing = extract_response_output(&env, &harness);
+        trailing = extract_response_output(&env, harness);
         // Codex stamps each replayed item with the turn it belongs to; the
         // request-side items of this turn carry it already (baked into the
         // wire), but the response-side items we append here don't — add it so
         // a fork's resume replays them byte-identically to a native resume.
-        if harness == "codex" {
+        if harness == Some(Harness::Codex) {
             if let Some(turn_id) = env.get("turn_id").and_then(Value::as_str) {
                 for item in &mut trailing {
                     if let Some(o) = item.as_object_mut() {
@@ -99,6 +147,7 @@ pub fn reconstruct_reader<R: Read>(reader: R) -> Result<Recon> {
     msgs.extend(trailing);
     Ok(Recon {
         key,
+        harness,
         history_len,
         messages: msgs,
         trailing_appended,
@@ -132,7 +181,7 @@ fn apply_delta(h: &Value, msgs: &mut Vec<Value>, hash_dict: &mut HashMap<String,
 /// v1 envelopes carry `response.sse` (raw SSE text); v2 carry `response.events`
 /// (parsed event array). Returns wire-shaped items ready to append to history:
 /// Anthropic → one assistant message; Codex → the Responses output items.
-fn extract_response_output(env: &Value, harness: &str) -> Vec<Value> {
+fn extract_response_output(env: &Value, harness: Option<Harness>) -> Vec<Value> {
     let Some(resp) = env.get("response") else {
         return vec![];
     };
@@ -146,12 +195,7 @@ fn extract_response_output(env: &Value, harness: &str) -> Vec<Value> {
     } else {
         return vec![];
     };
-    if harness == "codex"
-        || env
-            .pointer("/request/body_delta/history/key")
-            .and_then(Value::as_str)
-            == Some("input")
-    {
+    if harness == Some(Harness::Codex) {
         codex_output(&events)
     } else {
         anthropic_output(&events)

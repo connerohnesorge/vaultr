@@ -7,6 +7,7 @@
 //! array to be byte-identical to a native resume). Cross-harness forks go
 //! through the normalized model plus best-effort tool translation.
 
+use crate::recon::Harness;
 use crate::{claude_writer, codex_writer, normalize, recon, translate, vault};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
@@ -14,12 +15,6 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum Target {
-    Claude,
-    Codex,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SourceHarness {
     Claude,
     Codex,
 }
@@ -54,7 +49,18 @@ pub fn fork(root: &Path, id: &str, target: Target, opts: &ForkOptions) -> Result
     if recon.messages.is_empty() {
         bail!("session {} reconstructed to an empty history", session.id);
     }
-    let source = source_harness(&session.meta, &recon.key);
+    // Recon's envelope-derived identity is authoritative: envelopes are the
+    // captured wire truth, while .meta/<id>.json is a mutable hook-merged
+    // sidecar that can go stale. meta.harness is consulted only for degenerate
+    // captures where neither the envelope field nor the history key resolved.
+    let source = recon.harness.unwrap_or_else(|| {
+        session
+            .meta
+            .harness
+            .as_deref()
+            .and_then(Harness::from_label)
+            .unwrap_or(Harness::Claude)
+    });
 
     // Resolve and validate the launch cwd BEFORE any write.
     let cwd =
@@ -75,7 +81,7 @@ pub fn fork(root: &Path, id: &str, target: Target, opts: &ForkOptions) -> Result
 
     let (new_id, path, launch) = match target {
         Target::Claude => {
-            let messages: Vec<Value> = if source == SourceHarness::Claude {
+            let messages: Vec<Value> = if source == Harness::Claude {
                 recon.messages.clone()
             } else {
                 translate::to_anthropic(&normalize::normalize(&recon.messages))
@@ -91,7 +97,7 @@ pub fn fork(root: &Path, id: &str, target: Target, opts: &ForkOptions) -> Result
             (id, path, launch)
         }
         Target::Codex => {
-            let (items, base_instructions) = if source == SourceHarness::Codex {
+            let (items, base_instructions) = if source == Harness::Codex {
                 prepare_codex_passthrough(&recon.messages)
             } else {
                 (
@@ -137,15 +143,6 @@ pub fn launch(outcome: &ForkOutcome) -> Result<()> {
             bail!("{} exited with {status}", outcome.launch.join(" "));
         }
         Ok(())
-    }
-}
-
-fn source_harness(meta: &vault::Meta, recon_key: &str) -> SourceHarness {
-    match meta.harness.as_deref() {
-        Some("codex") => SourceHarness::Codex,
-        Some("claude-code") | Some("claude") => SourceHarness::Claude,
-        _ if recon_key == "input" => SourceHarness::Codex,
-        _ => SourceHarness::Claude,
     }
 }
 
