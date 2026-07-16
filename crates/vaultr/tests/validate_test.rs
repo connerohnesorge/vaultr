@@ -39,6 +39,12 @@ fn validate_fixture_vault() {
         "runbooks/no-fm.md",
         "no frontmatter here\n[dead](/learnings/nope.md)\n[alive](/learnings/good-note.md)\n",
     );
+    // same slug in two content dirs = error (ambiguous bare [[wikilink]])
+    write(
+        root,
+        "incidents/good-note.md",
+        "---\ntype: Incident\ntitle: collides\n---\nbody\n",
+    );
     // corrupt ledger line = error
     write(
         root,
@@ -52,7 +58,10 @@ fn validate_fixture_vault() {
         .iter()
         .filter(|f| f.severity == validate::Severity::Error)
         .collect();
-    assert_eq!(errs.len(), 3, "findings: {:#?}", report.findings);
+    assert_eq!(errs.len(), 4, "findings: {:#?}", report.findings);
+    assert!(errs
+        .iter()
+        .any(|f| f.kind == "duplicate-slug" && f.detail.contains("good-note")));
     assert!(errs.iter().any(|f| f.kind == "wikilink" && f.detail.contains("does-not-exist")));
     assert!(errs.iter().any(|f| f.kind == "mdpath" && f.detail.contains("/learnings/nope.md")));
     assert!(errs.iter().any(|f| f.kind == "ledger" && f.line == 2));

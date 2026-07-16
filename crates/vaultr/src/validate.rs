@@ -1,9 +1,9 @@
 //! Strict vault content validation: [[wikilink]] resolution, frontmatter schema,
 //! markdown path links, and learn-ledger integrity. Read-only over the vault.
 //!
-//! Severity model: broken links / bad md paths / unparseable ledger lines are errors
-//! (the vault is "invalid"); frontmatter gaps and duplicate slugs are warnings —
-//! 87 legacy files have no frontmatter and must not trip the repair loop.
+//! Severity model: broken links / bad md paths / unparseable ledger lines / duplicate
+//! slugs (bare-[[slug]] links become ambiguous) are errors; frontmatter gaps are
+//! warnings — 87 legacy files have no frontmatter and must not trip the repair loop.
 //! A line containing `<!-- vault-validate: ignore -->` is exempt from link checks.
 
 use anyhow::{Context, Result};
@@ -204,7 +204,7 @@ pub fn scan(content_root: &Path) -> Result<Report> {
         let dirs: Vec<String> = dirs.iter().filter(|d| *d != "digests").cloned().collect();
         if dirs.len() > 1 {
             report.findings.push(Finding {
-                severity: Severity::Warning,
+                severity: Severity::Error,
                 kind: "duplicate-slug",
                 file: format!("{}/{slug}.md", dirs[0]),
                 line: 0,

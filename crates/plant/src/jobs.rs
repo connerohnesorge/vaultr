@@ -666,7 +666,7 @@ mod tests {
         assert_eq!(by_name("compress").kind, Kind::Compress);
         assert_eq!(by_name("learn").close_pane, ClosePane::OnSuccess);
         assert_eq!(by_name("reconcile").close_pane, ClosePane::Always);
-        assert_eq!(by_name("reconcile").every, Duration::from_secs(2 * 3600));
+        assert_eq!(by_name("reconcile").every, Duration::from_secs(3600));
     }
 
     #[test]
