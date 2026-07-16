@@ -1,4 +1,4 @@
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::fs;
 use std::path::PathBuf;
 use vaultr::{normalize, recon};
@@ -102,10 +102,18 @@ fn normalize_excludes_scaffolding_and_strips_reminders() {
     }
     // assistant turn: thinking excluded, text + tool_use kept
     assert_eq!(n[1].blocks.len(), 2);
-    assert!(matches!(&n[1].blocks[1], normalize::Block::ToolUse { name, .. } if name == "Read"));
+    assert!(matches!(
+        &n[1].blocks[1],
+        normalize::Block::ToolUse {
+            name,
+            correlation_id,
+            ..
+        } if name == "Read" && correlation_id.as_deref() == Some("t1")
+    ));
     assert!(matches!(
         &n[2].blocks[0],
-        normalize::Block::ToolResult { .. }
+        normalize::Block::ToolResult { correlation_id, .. }
+        if correlation_id.as_deref() == Some("t1")
     ));
 }
 
@@ -116,13 +124,51 @@ fn normalize_codex_items() {
     // developer msg + reasoning dropped: user, tool_use, tool_result, assistant
     assert_eq!(n.len(), 4);
     assert!(
-        matches!(&n[1].blocks[0], normalize::Block::ToolUse { name, input }
-        if name == "shell" && input["cmd"] == Value::String("ls".into()))
+        matches!(&n[1].blocks[0], normalize::Block::ToolUse { name, input, correlation_id }
+        if name == "shell"
+            && input["cmd"] == Value::String("ls".into())
+            && correlation_id.as_deref() == Some("c1"))
     );
     assert!(
-        matches!(&n[2].blocks[0], normalize::Block::ToolResult { content } if content.contains("a.txt"))
+        matches!(&n[2].blocks[0], normalize::Block::ToolResult { content, correlation_id }
+        if content.contains("a.txt") && correlation_id.as_deref() == Some("c1"))
     );
     assert_eq!(n[3].role, normalize::Role::Assistant);
+}
+
+#[test]
+fn normalize_preserves_only_string_correlation_ids() {
+    let n = normalize::normalize(&[
+        json!({"type": "function_call", "name": "shell", "call_id": "", "arguments": {}}),
+        json!({"type": "function_call_output", "call_id": 7, "output": "done"}),
+        json!({"role": "assistant", "content": [
+            {"type": "tool_use", "id": "claude-id", "name": "Bash", "input": {}}
+        ]}),
+        json!({"role": "user", "content": [
+            {"type": "tool_result", "content": "done"}
+        ]}),
+    ]);
+
+    assert!(matches!(
+        &n[0].blocks[0],
+        normalize::Block::ToolUse { correlation_id, .. }
+        if correlation_id.as_deref() == Some("")
+    ));
+    assert!(matches!(
+        &n[1].blocks[0],
+        normalize::Block::ToolResult { correlation_id, .. }
+        if correlation_id.is_none()
+    ));
+    assert!(matches!(
+        &n[2].blocks[0],
+        normalize::Block::ToolUse { correlation_id, .. }
+        if correlation_id.as_deref() == Some("claude-id")
+    ));
+    assert!(matches!(
+        &n[3].blocks[0],
+        normalize::Block::ToolResult { correlation_id, .. }
+        if correlation_id.is_none()
+    ));
 }
 
 #[test]

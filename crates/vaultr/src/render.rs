@@ -16,7 +16,7 @@ pub fn markdown(messages: &[Message]) -> String {
                     body.push_str("\n\n");
                 }
                 Block::Image => body.push_str("*[image]*\n\n"),
-                Block::ToolUse { name, input } => {
+                Block::ToolUse { name, input, .. } => {
                     let compact = serde_json::to_string(input).unwrap_or_default();
                     body.push_str(&format!(
                         "> `{}` {}\n\n",

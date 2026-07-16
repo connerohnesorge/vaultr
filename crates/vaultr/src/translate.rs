@@ -5,6 +5,7 @@
 
 use crate::normalize::{Block, Message, Role};
 use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
 
 /// Codex tool name -> Claude tool name.
 pub fn codex_to_claude(name: &str) -> Option<&'static str> {
@@ -44,15 +45,33 @@ fn tool_result_text(content: &str) -> String {
     format!("[tool result]\n{content}")
 }
 
-/// Pairing state: for each ToolUse emitted, remember Some(id) when it became
-/// a native tool call (so its result must reference that id), or None when it
-/// degraded to text (so its result degrades to text too).
-type PendingIds = std::collections::VecDeque<Option<String>>;
+fn valid_correlations(messages: &[Message]) -> HashSet<&str> {
+    let mut occurrences: HashMap<&str, Vec<bool>> = HashMap::new();
+    for block in messages.iter().flat_map(|message| &message.blocks) {
+        let (id, is_use) = match block {
+            Block::ToolUse {
+                correlation_id: Some(id),
+                ..
+            } if !id.is_empty() => (id.as_str(), true),
+            Block::ToolResult {
+                correlation_id: Some(id),
+                ..
+            } if !id.is_empty() => (id.as_str(), false),
+            _ => continue,
+        };
+        occurrences.entry(id).or_default().push(is_use);
+    }
+    occurrences
+        .into_iter()
+        .filter_map(|(id, order)| (order.as_slice() == [true, false]).then_some(id))
+        .collect()
+}
 
 /// Convert normalized messages into Anthropic wire messages (for a Claude fork).
 pub fn to_anthropic(messages: &[Message]) -> Vec<Value> {
     let mut out = Vec::new();
-    let mut pending: PendingIds = Default::default();
+    let valid = valid_correlations(messages);
+    let mut ids: HashMap<&str, String> = HashMap::new();
     for m in messages {
         let role = match m.role {
             Role::User => "user",
@@ -63,21 +82,27 @@ pub fn to_anthropic(messages: &[Message]) -> Vec<Value> {
             match b {
                 Block::Text(t) => blocks.push(json!({"type": "text", "text": t})),
                 Block::Image => blocks.push(json!({"type": "text", "text": "[image]"})),
-                Block::ToolUse { name, input } => match codex_to_claude(name) {
-                    Some(mapped) => {
+                Block::ToolUse {
+                    name,
+                    input,
+                    correlation_id,
+                } => match (correlation_id.as_deref(), codex_to_claude(name)) {
+                    (Some(source_id), Some(mapped)) if valid.contains(source_id) => {
                         let id = format!("toolu_{}", uuid::Uuid::new_v4().simple());
                         blocks.push(json!({
                             "type": "tool_use", "id": id, "name": mapped,
                             "input": adapt_input_to_claude(mapped, input),
                         }));
-                        pending.push_back(Some(id));
+                        ids.insert(source_id, id);
                     }
-                    None => {
+                    _ => {
                         blocks.push(json!({"type": "text", "text": tool_use_text(name, input)}));
-                        pending.push_back(None);
                     }
                 },
-                Block::ToolResult { content } => match pending.pop_front().flatten() {
+                Block::ToolResult {
+                    content,
+                    correlation_id,
+                } => match correlation_id.as_deref().and_then(|id| ids.get(id)) {
                     Some(id) => blocks.push(json!({
                         "type": "tool_result", "tool_use_id": id, "content": content,
                     })),
@@ -95,7 +120,8 @@ pub fn to_anthropic(messages: &[Message]) -> Vec<Value> {
 /// Convert normalized messages into Codex Responses input items (for a Codex fork).
 pub fn to_codex(messages: &[Message]) -> Vec<Value> {
     let mut out = Vec::new();
-    let mut pending: PendingIds = Default::default();
+    let valid = valid_correlations(messages);
+    let mut ids: HashMap<&str, String> = HashMap::new();
     for m in messages {
         let mut texts: Vec<Value> = Vec::new();
         let (role, text_type) = match m.role {
@@ -114,8 +140,12 @@ pub fn to_codex(messages: &[Message]) -> Vec<Value> {
             match b {
                 Block::Text(t) => texts.push(json!({"type": text_type, "text": t})),
                 Block::Image => texts.push(json!({"type": text_type, "text": "[image]"})),
-                Block::ToolUse { name, input } => match claude_to_codex(name) {
-                    Some(mapped) => {
+                Block::ToolUse {
+                    name,
+                    input,
+                    correlation_id,
+                } => match (correlation_id.as_deref(), claude_to_codex(name)) {
+                    (Some(source_id), Some(mapped)) if valid.contains(source_id) => {
                         flush(&mut texts, &mut out);
                         let call_id = format!("call_{}", uuid::Uuid::new_v4().simple());
                         out.push(json!({
@@ -124,14 +154,16 @@ pub fn to_codex(messages: &[Message]) -> Vec<Value> {
                             "arguments": serde_json::to_string(input).unwrap_or_default(),
                             "call_id": call_id,
                         }));
-                        pending.push_back(Some(call_id));
+                        ids.insert(source_id, call_id);
                     }
-                    None => {
+                    _ => {
                         texts.push(json!({"type": text_type, "text": tool_use_text(name, input)}));
-                        pending.push_back(None);
                     }
                 },
-                Block::ToolResult { content } => match pending.pop_front().flatten() {
+                Block::ToolResult {
+                    content,
+                    correlation_id,
+                } => match correlation_id.as_deref().and_then(|id| ids.get(id)) {
                     Some(call_id) => {
                         flush(&mut texts, &mut out);
                         out.push(json!({
@@ -187,12 +219,14 @@ mod tests {
                 blocks: vec![Block::ToolUse {
                     name: "shell".into(),
                     input: json!({"command": ["bash", "-lc", "ls"]}),
+                    correlation_id: Some("mapped".into()),
                 }],
             },
             Message {
                 role: Role::User,
                 blocks: vec![Block::ToolResult {
                     content: "a.txt".into(),
+                    correlation_id: Some("mapped".into()),
                 }],
             },
             Message {
@@ -200,12 +234,14 @@ mod tests {
                 blocks: vec![Block::ToolUse {
                     name: "weird_tool".into(),
                     input: json!({"x": 1}),
+                    correlation_id: Some("unmapped".into()),
                 }],
             },
             Message {
                 role: Role::User,
                 blocks: vec![Block::ToolResult {
                     content: "ok".into(),
+                    correlation_id: Some("unmapped".into()),
                 }],
             },
         ]
@@ -242,12 +278,14 @@ mod tests {
                 blocks: vec![Block::ToolUse {
                     name: "Bash".into(),
                     input: json!({"command": "ls"}),
+                    correlation_id: Some("mapped".into()),
                 }],
             },
             Message {
                 role: Role::User,
                 blocks: vec![Block::ToolResult {
                     content: "a.txt".into(),
+                    correlation_id: Some("mapped".into()),
                 }],
             },
         ];
@@ -267,12 +305,14 @@ mod tests {
                 blocks: vec![Block::ToolUse {
                     name: "Artifact".into(),
                     input: json!({"file_path": "x.html"}),
+                    correlation_id: Some("unmapped".into()),
                 }],
             },
             Message {
                 role: Role::User,
                 blocks: vec![Block::ToolResult {
                     content: "done".into(),
+                    correlation_id: Some("unmapped".into()),
                 }],
             },
         ];
@@ -286,5 +326,102 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("[tool result]"));
+    }
+
+    fn tool_use(name: &str, id: Option<&str>) -> Message {
+        Message {
+            role: Role::Assistant,
+            blocks: vec![Block::ToolUse {
+                name: name.into(),
+                input: json!({}),
+                correlation_id: id.map(String::from),
+            }],
+        }
+    }
+
+    fn tool_result(content: &str, id: Option<&str>) -> Message {
+        Message {
+            role: Role::User,
+            blocks: vec![Block::ToolResult {
+                content: content.into(),
+                correlation_id: id.map(String::from),
+            }],
+        }
+    }
+
+    fn interleaved(name: &str) -> Vec<Message> {
+        vec![
+            tool_use(name, Some("source-a")),
+            tool_use(name, Some("source-b")),
+            tool_result("result-b", Some("source-b")),
+            tool_result("result-a", Some("source-a")),
+        ]
+    }
+
+    #[test]
+    fn codex_to_claude_pairs_interleaved_results_by_correlation() {
+        let out = to_anthropic(&interleaved("shell"));
+        let call_a = &out[0]["content"][0];
+        let call_b = &out[1]["content"][0];
+        let result_b = &out[2]["content"][0];
+        let result_a = &out[3]["content"][0];
+
+        assert_ne!(call_a["id"], "source-a");
+        assert_ne!(call_b["id"], "source-b");
+        assert_ne!(call_a["id"], call_b["id"]);
+        assert_eq!(result_b["tool_use_id"], call_b["id"]);
+        assert_eq!(result_a["tool_use_id"], call_a["id"]);
+    }
+
+    #[test]
+    fn claude_to_codex_pairs_interleaved_results_by_correlation() {
+        let out = to_codex(&interleaved("Bash"));
+
+        assert_ne!(out[0]["call_id"], "source-a");
+        assert_ne!(out[1]["call_id"], "source-b");
+        assert_ne!(out[0]["call_id"], out[1]["call_id"]);
+        assert_eq!(out[2]["call_id"], out[1]["call_id"]);
+        assert_eq!(out[3]["call_id"], out[0]["call_id"]);
+    }
+
+    #[test]
+    fn malformed_correlations_degrade_without_harming_valid_pair() {
+        let messages = vec![
+            tool_result("early", Some("backward")),
+            tool_use("shell", Some("valid")),
+            tool_use("shell", None),
+            tool_use("shell", Some("")),
+            tool_use("shell", Some("duplicate-use")),
+            tool_use("shell", Some("duplicate-use")),
+            tool_use("shell", Some("duplicate-result")),
+            tool_use("shell", Some("orphan-use")),
+            tool_use("shell", Some("backward")),
+            tool_result("valid", Some("valid")),
+            tool_result("missing", None),
+            tool_result("empty", Some("")),
+            tool_result("duplicate use", Some("duplicate-use")),
+            tool_result("duplicate result 1", Some("duplicate-result")),
+            tool_result("duplicate result 2", Some("duplicate-result")),
+            tool_result("orphan result", Some("orphan-result")),
+        ];
+        let out = to_anthropic(&messages);
+        let blocks: Vec<&Value> = out
+            .iter()
+            .flat_map(|message| message["content"].as_array().unwrap())
+            .collect();
+        let uses: Vec<&&Value> = blocks
+            .iter()
+            .filter(|block| block["type"] == "tool_use")
+            .collect();
+        let results: Vec<&&Value> = blocks
+            .iter()
+            .filter(|block| block["type"] == "tool_result")
+            .collect();
+
+        assert_eq!(uses.len(), 1);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["tool_use_id"], uses[0]["id"]);
+        assert_ne!(uses[0]["id"], "valid");
+        assert_eq!(blocks.len(), messages.len());
     }
 }

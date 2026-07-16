@@ -12,8 +12,15 @@ pub enum Role {
 pub enum Block {
     Text(String),
     Image,
-    ToolUse { name: String, input: Value },
-    ToolResult { content: String },
+    ToolUse {
+        name: String,
+        input: Value,
+        correlation_id: Option<String>,
+    },
+    ToolResult {
+        content: String,
+        correlation_id: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -59,14 +66,21 @@ fn normalize_one(m: &Value) -> Option<Message> {
             };
             return Some(Message {
                 role: Role::Assistant,
-                blocks: vec![Block::ToolUse { name, input }],
+                blocks: vec![Block::ToolUse {
+                    name,
+                    input,
+                    correlation_id: obj.get("call_id").and_then(Value::as_str).map(String::from),
+                }],
             });
         }
         Some("function_call_output") | Some("custom_tool_call_output") => {
             let content = text_of(obj.get("output").unwrap_or(&Value::Null));
             return Some(Message {
                 role: Role::User,
-                blocks: vec![Block::ToolResult { content }],
+                blocks: vec![Block::ToolResult {
+                    content,
+                    correlation_id: obj.get("call_id").and_then(Value::as_str).map(String::from),
+                }],
             });
         }
         Some("reasoning") => return None, // opaque/encrypted reasoning
@@ -106,9 +120,14 @@ fn normalize_one(m: &Value) -> Option<Message> {
                             .unwrap_or("tool")
                             .to_string(),
                         input: b.get("input").cloned().unwrap_or(Value::Null),
+                        correlation_id: b.get("id").and_then(Value::as_str).map(String::from),
                     }),
                     "tool_result" => blocks.push(Block::ToolResult {
                         content: text_of(b.get("content").unwrap_or(&Value::Null)),
+                        correlation_id: b
+                            .get("tool_use_id")
+                            .and_then(Value::as_str)
+                            .map(String::from),
                     }),
                     // thinking / redacted_thinking / anything else: excluded
                     _ => {}
