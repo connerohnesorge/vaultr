@@ -4,7 +4,7 @@
 
 ### Requirement: Scheduled cross-session reflection
 
-Plant MUST run a daily `reflect` agent job that dispatches `/Vault reflect` to
+Plant MUST run a `reflect` agent job every 2 hours that dispatches `/Vault reflect` to
 Claude (`opus[1m]`) through the standard Herdr agent lifecycle, and MUST skip
 the run when no new learnings have been ledgered since the job's last recorded
 attempt.

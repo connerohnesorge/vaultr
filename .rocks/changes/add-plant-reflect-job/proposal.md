@@ -9,8 +9,8 @@ Rocks proposals. A scheduled cross-session reflection closes that gap.
 
 ## What Changes
 
-- New `Kind::Reflect` Cultivation Job in plant: daily, Claude `opus[1m]`,
-  dispatches `/Vault reflect` into a Herdr pane (same lifecycle as learn).
+- New `Kind::Reflect` Cultivation Job in plant: Claude `opus[1m]`,
+  dispatches `/Vault reflect` into a Herdr pane every 2 hours (same lifecycle as learn).
 - Skips when no new learnings landed since the last reflect attempt
   (learnings ledger mtime vs the job's last record ts).
 - The `/Vault reflect` workflow itself lives in the dotfiles Vault skill

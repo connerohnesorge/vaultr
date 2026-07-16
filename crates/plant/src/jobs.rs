@@ -149,7 +149,7 @@ pub fn load_jobs() -> Vec<Job> {
             cli: Some("claude".into()),
             model: Some("opus[1m]".into()),
             cleanup: WorkspaceCleanup::OnSuccess,
-            ..Job::new("reflect", Kind::Reflect, Duration::from_secs(86400))
+            ..Job::new("reflect", Kind::Reflect, Duration::from_secs(2 * 3600))
         },
         Job::new("validate", Kind::Validate, Duration::from_secs(3600)),
         Job {
@@ -474,7 +474,7 @@ mod tests {
         assert_eq!(reflect.kind, Kind::Reflect);
         assert_eq!(reflect.cli.as_deref(), Some("claude"));
         assert_eq!(reflect.model.as_deref(), Some("opus[1m]"));
-        assert_eq!(reflect.every, Duration::from_secs(86400));
+        assert_eq!(reflect.every, Duration::from_secs(2 * 3600));
         assert_eq!(reflect.cleanup, WorkspaceCleanup::OnSuccess);
         assert_eq!(by_name("validate").kind, Kind::Validate);
         let repair = by_name("validate-repair");
