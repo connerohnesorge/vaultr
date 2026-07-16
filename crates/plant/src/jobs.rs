@@ -51,6 +51,7 @@ pub enum Kind {
     Learn,
     LearnCodex,
     Reconcile,
+    Reflect,
     Validate,
     ValidateRepair,
 }
@@ -144,6 +145,12 @@ pub fn load_jobs() -> Vec<Job> {
             args: Some("-c model_reasoning_effort=xhigh".into()),
             ..Job::new("reconcile", Kind::Reconcile, Duration::from_secs(3600))
         },
+        Job {
+            cli: Some("claude".into()),
+            model: Some("opus[1m]".into()),
+            cleanup: WorkspaceCleanup::OnSuccess,
+            ..Job::new("reflect", Kind::Reflect, Duration::from_secs(86400))
+        },
         Job::new("validate", Kind::Validate, Duration::from_secs(3600)),
         Job {
             cli: Some("codex".into()),
@@ -229,6 +236,8 @@ fn prompt(job: &Job) -> Option<String> {
             )
         }),
         Kind::Reconcile => Some("$Vault reconcile".to_string()),
+        Kind::Reflect => learnings_updated_since(last_record_ts(&job.name))
+            .then(|| "/Vault reflect".to_string()),
         Kind::Validate => None,
         Kind::ValidateRepair => {
             let report = vault_validate()?;
@@ -257,6 +266,22 @@ fn prompt(job: &Job) -> Option<String> {
             ))
         }
     }
+}
+
+/// New learnings since `ts`? Ledger mtime is the signal — every Learn pass appends to it.
+/// ponytail: skipped/failed reflect records also bump ts, which just means "only re-reflect
+/// once learnings newer than the last attempt exist" — the intended semantics.
+fn learnings_updated_since(ts: Option<u64>) -> bool {
+    let ledger = crate::vault_path().join("../learnings/.ledger.jsonl");
+    let Some(mtime) = std::fs::metadata(&ledger)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+    else {
+        return false; // no ledger => nothing learned yet
+    };
+    ts.is_none_or(|t| mtime > t)
 }
 
 /// Run the vault content validator; None on scan failure (skip this tick).
@@ -444,7 +469,13 @@ mod tests {
     #[test]
     fn built_in_jobs_have_expected_shape() {
         let jobs = load_jobs();
-        assert_eq!(jobs.len(), 6);
+        assert_eq!(jobs.len(), 7);
+        let reflect = by_name("reflect");
+        assert_eq!(reflect.kind, Kind::Reflect);
+        assert_eq!(reflect.cli.as_deref(), Some("claude"));
+        assert_eq!(reflect.model.as_deref(), Some("opus[1m]"));
+        assert_eq!(reflect.every, Duration::from_secs(86400));
+        assert_eq!(reflect.cleanup, WorkspaceCleanup::OnSuccess);
         assert_eq!(by_name("validate").kind, Kind::Validate);
         let repair = by_name("validate-repair");
         assert_eq!(repair.cli.as_deref(), Some("codex"));
