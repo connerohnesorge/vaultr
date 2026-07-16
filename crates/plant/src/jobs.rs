@@ -1,7 +1,7 @@
 //! Built-in jobs, defined as Rust code in load_jobs()/run_job() below. Compress calls
 //! the sweep directly in-process; learn/learn-codex/reconcile compute a prompt in Rust
 //! and type it into a fresh Herdr pane.
-//! `close_pane` (Always|OnSuccess) controls whether the job's Herdr workspace is
+//! The cleanup policy controls whether the job's Herdr workspace is
 //! closed when the run ends; kept workspaces are reclaimed by the next run of the same job.
 //! Outcomes append to ~/.local/state/plant/jobs/<name>.jsonl; the tail line is the
 //! scheduling state (due when now - last.ts >= every). Never `claude -p`.
@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::sweep::{run, run30};
+use crate::herdr::{self, AgentRun, AgentRunOutcome, WorkspaceCleanup};
 
 pub fn state_dir() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/state/plant")
@@ -46,12 +46,6 @@ impl Cfg {
 }
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub enum ClosePane {
-    Always,
-    OnSuccess,
-}
-
-#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Kind {
     Compress,
     Learn,
@@ -71,7 +65,7 @@ pub struct Job {
     pub model: Option<String>,
     pub args: Option<String>,
     pub cwd: String,
-    pub close_pane: ClosePane,
+    pub cleanup: WorkspaceCleanup,
 }
 
 /// "90s" / "15m" / "2h" / "30d" — single number + unit.
@@ -114,7 +108,7 @@ impl Job {
             model: None,
             args: None,
             cwd: expand_home("~/.dotfiles"),
-            close_pane: ClosePane::Always,
+            cleanup: WorkspaceCleanup::Always,
         }
     }
 }
@@ -130,14 +124,14 @@ pub fn load_jobs() -> Vec<Job> {
         Job {
             cli: Some("claude".into()),
             model: Some("opus[1m]".into()),
-            close_pane: ClosePane::OnSuccess,
+            cleanup: WorkspaceCleanup::OnSuccess,
             ..Job::new("learn", Kind::Learn, Duration::from_secs(15 * MIN))
         },
         Job {
             cli: Some("codex".into()),
             model: Some("gpt-5.6-sol".into()),
             args: Some("-c model_reasoning_effort=xhigh".into()),
-            close_pane: ClosePane::OnSuccess,
+            cleanup: WorkspaceCleanup::OnSuccess,
             ..Job::new(
                 "learn-codex",
                 Kind::LearnCodex,
@@ -145,8 +139,9 @@ pub fn load_jobs() -> Vec<Job> {
             )
         },
         Job {
-            cli: Some("claude".into()),
-            model: Some("opus[1m]".into()),
+            cli: Some("codex".into()),
+            model: Some("gpt-5.6-sol".into()),
+            args: Some("-c model_reasoning_effort=xhigh".into()),
             ..Job::new("reconcile", Kind::Reconcile, Duration::from_secs(3600))
         },
         Job::new("validate", Kind::Validate, Duration::from_secs(3600)),
@@ -160,7 +155,7 @@ pub fn load_jobs() -> Vec<Job> {
                  -c 'hooks.Stop=[{{hooks=[{{type=\"command\",command=\"{}\",timeout=120}}]}}]'",
                 stop_hook_path().display()
             )),
-            close_pane: ClosePane::OnSuccess,
+            cleanup: WorkspaceCleanup::OnSuccess,
             ..Job::new(
                 "validate-repair",
                 Kind::ValidateRepair,
@@ -233,7 +228,7 @@ fn prompt(job: &Job) -> Option<String> {
                 "$Vault Learn with `--learner codex` and these session directories as input: {dirs}"
             )
         }),
-        Kind::Reconcile => Some("/Vault reconcile".to_string()),
+        Kind::Reconcile => Some("$Vault reconcile".to_string()),
         Kind::Validate => None,
         Kind::ValidateRepair => {
             let report = vault_validate()?;
@@ -332,245 +327,12 @@ fn launch_line(job: &Job) -> String {
     s
 }
 
-/// herdr's agent-status reports "idle" for a bare shell too — a failed CLI launch drops
-/// the pane back to zsh and typing a prompt there executes it as shell commands. Only
-/// trust a pane that herdr has actually recognized as running an agent.
-async fn pane_has_agent(pane: &str) -> bool {
-    let list = run30(&["herdr", "pane", "list"]).await;
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&list.out) else {
-        return false;
-    };
-    v.pointer("/result/panes")
-        .and_then(|p| p.as_array())
-        .into_iter()
-        .flatten()
-        .any(|p| {
-            p.get("pane_id").and_then(|i| i.as_str()) == Some(pane)
-                && p.get("agent").and_then(|a| a.as_str()).is_some()
-        })
-}
-
-async fn focused_workspace() -> Option<String> {
-    let list = run30(&["herdr", "workspace", "list"]).await;
-    let v: serde_json::Value = serde_json::from_str(&list.out).ok()?;
-    v.pointer("/result/workspaces")?
-        .as_array()?
-        .iter()
-        .find(|w| w.get("focused").and_then(|f| f.as_bool()).unwrap_or(false))?
-        .get("workspace_id")?
-        .as_str()
-        .map(String::from)
-}
-
-/// herdr `workspace close` refocuses the newest remaining workspace even when the
-/// closed one wasn't focused (upstream bug) — put the user's focus back if it moved.
-async fn close_workspace(id: &str) {
-    let before = focused_workspace().await;
-    run30(&["herdr", "workspace", "close", id]).await;
-    if let Some(prev) = before {
-        if prev != id && focused_workspace().await.as_deref() != Some(prev.as_str()) {
-            run30(&["herdr", "workspace", "focus", &prev]).await;
-        }
+fn cleanup_policy(job: &Job) -> WorkspaceCleanup {
+    if std::env::var("PLANT_KEEP_PANES").as_deref() == Ok("0") {
+        job.cleanup
+    } else {
+        WorkspaceCleanup::Never
     }
-}
-
-/// Close any workspace labeled `job-<name>` — recovery for the case where workspace
-/// create returned unparseable output but did create one. Returns how many it closed;
-/// >0 means the create "failure" actually leaked a live workspace.
-async fn close_by_label(label: &str) -> u32 {
-    let list = run30(&["herdr", "workspace", "list"]).await;
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&list.out) else {
-        return 0;
-    };
-    let mut closed = 0;
-    for ws in v
-        .pointer("/result/workspaces")
-        .and_then(|w| w.as_array())
-        .into_iter()
-        .flatten()
-    {
-        if ws.get("label").and_then(|l| l.as_str()) == Some(label) {
-            // a kept pane from a falsely-"failed" run can still hold a working agent —
-            // never close those out from under it
-            if ws.get("agent_status").and_then(|s| s.as_str()) == Some("working") {
-                continue;
-            }
-            if let Some(id) = ws.get("workspace_id").and_then(|i| i.as_str()) {
-                close_workspace(id).await;
-                closed += 1;
-            }
-        }
-    }
-    closed
-}
-
-/// Fresh Herdr workspace -> launch CLI -> wait idle -> type rendered body -> wait done.
-/// None => herdr down (records nothing; next tick retries). Some((ok, detail)) => real attempt.
-async fn run_agent(job: &Job, rendered: &str) -> Option<(bool, String)> {
-    if !run30(&["herdr", "workspace", "list"]).await.ok {
-        return None;
-    }
-    let label = format!("job-{}", job.name);
-    // reclaim workspaces from prior runs: SIGTERM'd mid-run leaks, or close-pane kept ones
-    let stale = close_by_label(&label).await;
-    if stale > 0 {
-        println!("[job:{}] reclaimed {stale} stale workspace(s)", job.name);
-    }
-    let ws = run30(&[
-        "herdr",
-        "workspace",
-        "create",
-        "--cwd",
-        &job.cwd,
-        "--label",
-        &label,
-        "--no-focus",
-    ])
-    .await;
-    let (mut ws_id, mut pane) = (None::<String>, None::<String>);
-    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&ws.out) {
-        ws_id = v
-            .pointer("/result/workspace/workspace_id")
-            .and_then(|s| s.as_str())
-            .map(String::from);
-        pane = v
-            .pointer("/result/root_pane/pane_id")
-            .and_then(|s| s.as_str())
-            .map(String::from);
-    }
-    let result = async {
-        let (Some(pane), Some(_)) = (&pane, &ws_id) else {
-            eprintln!(
-                "[job:{}] workspace create failed: {}",
-                job.name,
-                ws.out.chars().take(200).collect::<String>()
-            );
-            let orphans = close_by_label(&label).await;
-            let detail = if orphans > 0 {
-                format!("workspace create unparseable, {orphans} orphan(s) closed by label")
-            } else {
-                "workspace create failed".to_string()
-            };
-            return Some((false, detail));
-        };
-        if !run30(&["herdr", "pane", "run", pane, &launch_line(job)])
-            .await
-            .ok
-        {
-            return Some((false, "pane run failed".to_string()));
-        }
-        if !run(
-            &[
-                "herdr",
-                "wait",
-                "agent-status",
-                pane,
-                "--status",
-                "idle",
-                "--timeout",
-                "60000",
-            ],
-            Duration::from_secs(70),
-        )
-        .await
-        .ok
-        {
-            eprintln!(
-                "[job:{}] agent did not become ready in pane {pane}",
-                job.name
-            );
-            return Some((false, "agent never became ready".to_string()));
-        }
-        // agent-status flips idle on process detection, ~1-2s BEFORE the TUI reads input —
-        // a paste sent in that window is swallowed whole. Wait out startup, then verify
-        // the text actually landed in the pane before submitting; retype if it didn't.
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        if !pane_has_agent(pane).await {
-            return Some((false, "CLI never launched (pane has no agent)".to_string()));
-        }
-        let needle: String = rendered.chars().take(30).collect();
-        let mut landed = false;
-        for _ in 0..3 {
-            run30(&["herdr", "pane", "run", pane, rendered]).await;
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            let read = run30(&[
-                "herdr",
-                "pane",
-                "read",
-                pane,
-                "--source",
-                "recent-unwrapped",
-                "--lines",
-                "80",
-            ])
-            .await;
-            if !read.ok {
-                break; // can't verify — don't blind-retype; fail and retry next tick
-            }
-            // claude's TUI collapses large pastes to "[Pasted text #N]" — that placeholder
-            // IS the prompt having landed; retyping on it queues duplicate prompts
-            if read.out.contains(&needle) || read.out.contains("[Pasted text") {
-                landed = true;
-                break;
-            }
-        }
-        if !landed {
-            return Some((false, "prompt never landed in pane".to_string()));
-        }
-        run30(&["herdr", "pane", "send-keys", pane, "Enter"]).await;
-        run30(&["herdr", "pane", "send-keys", pane, "Enter"]).await;
-        let timeout_ms = job.timeout.as_millis().to_string();
-        let done = run(
-            &[
-                "herdr",
-                "wait",
-                "agent-status",
-                pane,
-                "--status",
-                "done",
-                "--timeout",
-                &timeout_ms,
-            ],
-            job.timeout + Duration::from_secs(60),
-        )
-        .await;
-        let tail = run30(&[
-            "herdr", "pane", "read", pane, "--source", "recent", "--lines", "15",
-        ])
-        .await;
-        println!(
-            "[job:{}] agent {}; tail:\n{}",
-            job.name,
-            if done.ok { "done" } else { "TIMED OUT" },
-            tail.out.trim()
-        );
-        Some((
-            done.ok,
-            if done.ok {
-                "agent done".to_string()
-            } else {
-                "agent timeout".to_string()
-            },
-        ))
-    }
-    .await;
-    // Keep panes by default; PLANT_KEEP_PANES=0 opts back into per-job auto-close.
-    let close = std::env::var("PLANT_KEEP_PANES").as_deref() == Ok("0")
-        && match job.close_pane {
-            ClosePane::Always => true,
-            ClosePane::OnSuccess => matches!(result, Some((true, _))),
-        };
-    if close {
-        if let Some(ref id) = ws_id {
-            close_workspace(id).await;
-        }
-    } else if ws_id.is_some() {
-        println!(
-            "[job:{}] pane kept open (close-pane: {:?})",
-            job.name, job.close_pane
-        );
-    }
-    result
 }
 
 pub async fn run_job(job: &Job) {
@@ -602,10 +364,20 @@ pub async fn run_job(job: &Job) {
             return;
         }
     }
-    match run_agent(job, &prompt).await {
-        None => println!("[job:{}] herdr down, retry next tick", job.name),
-        Some((true, detail)) => record(&job.name, "success", started, &detail),
-        Some((false, detail)) => record(&job.name, "failed", started, &detail),
+    let agent_run = AgentRun {
+        label: format!("job-{}", job.name),
+        cwd: job.cwd.clone(),
+        launch: launch_line(job),
+        prompt,
+        timeout: job.timeout,
+        cleanup: cleanup_policy(job),
+    };
+    match herdr::run_agent(agent_run).await {
+        AgentRunOutcome::Unavailable => {
+            println!("[job:{}] herdr down, retry next tick", job.name)
+        }
+        AgentRunOutcome::Succeeded(detail) => record(&job.name, "success", started, &detail),
+        AgentRunOutcome::Failed(detail) => record(&job.name, "failed", started, &detail),
     }
 }
 
@@ -666,7 +438,7 @@ mod tests {
         assert_eq!(job.cli.as_deref(), Some("codex"));
         assert_eq!(job.model.as_deref(), Some("gpt-5.6-sol"));
         assert_eq!(job.args.as_deref(), Some("-c model_reasoning_effort=xhigh"));
-        assert_eq!(job.close_pane, ClosePane::OnSuccess);
+        assert_eq!(job.cleanup, WorkspaceCleanup::OnSuccess);
     }
 
     #[test]
@@ -681,8 +453,8 @@ mod tests {
         assert!(args.contains("hooks.Stop="));
         assert!(args.contains("stop_until_valid.sh"));
         assert_eq!(by_name("compress").kind, Kind::Compress);
-        assert_eq!(by_name("learn").close_pane, ClosePane::OnSuccess);
-        assert_eq!(by_name("reconcile").close_pane, ClosePane::Always);
+        assert_eq!(by_name("learn").cleanup, WorkspaceCleanup::OnSuccess);
+        assert_eq!(by_name("reconcile").cleanup, WorkspaceCleanup::Always);
         assert_eq!(by_name("reconcile").every, Duration::from_secs(3600));
     }
 
@@ -696,7 +468,7 @@ mod tests {
     fn reconcile_prompt_is_static_and_compress_has_none() {
         let reconcile = Job::new("reconcile", Kind::Reconcile, Duration::from_secs(3600));
         let compress = Job::new("compress", Kind::Compress, Duration::from_secs(3600));
-        assert_eq!(prompt(&reconcile).as_deref(), Some("/Vault reconcile"));
+        assert_eq!(prompt(&reconcile).as_deref(), Some("$Vault reconcile"));
         assert_eq!(prompt(&compress), None);
     }
 }

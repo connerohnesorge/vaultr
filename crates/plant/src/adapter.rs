@@ -240,12 +240,3 @@ fn count(value: Option<&Value>) -> u64 {
         _ => 0,
     }
 }
-
-pub fn parse_sse(sse: &str) -> Vec<Value> {
-    sse.lines()
-        .filter_map(|line| line.strip_prefix("data:"))
-        .map(str::trim)
-        .filter(|d| !d.is_empty() && *d != "[DONE]")
-        .filter_map(|d| serde_json::from_str(d).ok())
-        .collect()
-}

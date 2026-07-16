@@ -2,3 +2,5 @@ target/
 *.log
 result
 .direnv
+# added by cnb init
+.rocks/changes/**/*.jsonc

@@ -1,4 +1,5 @@
 use crate::capture::{cached_session_ids, iso_now, session_dir};
+use crate::sweep::{run, run30};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -30,13 +31,55 @@ struct AgentSession {
 }
 
 #[derive(Deserialize)]
-struct Reply {
-    result: ResultBody,
+struct PaneListReply {
+    result: PaneListResult,
 }
 
 #[derive(Deserialize)]
-struct ResultBody {
+struct PaneListResult {
     panes: Vec<Pane>,
+}
+
+#[derive(Deserialize)]
+struct WorkspaceListReply {
+    result: WorkspaceListResult,
+}
+
+#[derive(Deserialize)]
+struct WorkspaceListResult {
+    workspaces: Vec<Workspace>,
+}
+
+#[derive(Deserialize)]
+struct Workspace {
+    workspace_id: String,
+    #[serde(default)]
+    label: Option<String>,
+    #[serde(default)]
+    focused: bool,
+    #[serde(default)]
+    agent_status: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WorkspaceCreateReply {
+    result: WorkspaceCreateResult,
+}
+
+#[derive(Deserialize)]
+struct WorkspaceCreateResult {
+    workspace: CreatedWorkspace,
+    root_pane: CreatedPane,
+}
+
+#[derive(Deserialize)]
+struct CreatedWorkspace {
+    workspace_id: String,
+}
+
+#[derive(Deserialize)]
+struct CreatedPane {
+    pane_id: String,
 }
 
 #[derive(Serialize)]
@@ -76,6 +119,29 @@ struct TimestampedSnapshot<'a> {
 
 static SNAPSHOTS: Mutex<Option<HashMap<String, (Instant, String)>>> = Mutex::new(None);
 
+pub struct AgentRun {
+    pub label: String,
+    pub cwd: String,
+    pub launch: String,
+    pub prompt: String,
+    pub timeout: Duration,
+    pub cleanup: WorkspaceCleanup,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum WorkspaceCleanup {
+    Never,
+    Always,
+    OnSuccess,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum AgentRunOutcome {
+    Unavailable,
+    Succeeded(String),
+    Failed(String),
+}
+
 fn socket_path() -> PathBuf {
     std::env::var("HERDR_SOCKET_PATH")
         .map(PathBuf::from)
@@ -94,13 +160,234 @@ pub(crate) async fn pane_list() -> Option<Vec<Pane>> {
             .ok()?;
         let mut line = String::new();
         BufReader::new(stream).read_line(&mut line).await.ok()?;
-        serde_json::from_str::<Reply>(&line)
+        serde_json::from_str::<PaneListReply>(&line)
             .ok()
             .map(|r| r.result.panes)
     })
     .await
     .ok()
     .flatten()
+}
+
+/// Herdr reports `idle` for a bare shell too. Trust only panes where it has
+/// recognized a running agent, or a failed CLI launch could receive shell input.
+async fn pane_has_agent(pane: &str) -> bool {
+    serde_json::from_str::<PaneListReply>(&run30(&["herdr", "pane", "list"]).await.out)
+        .ok()
+        .is_some_and(|reply| {
+            reply
+                .result
+                .panes
+                .iter()
+                .any(|p| p.pane_id == pane && p.agent.is_some())
+        })
+}
+
+async fn workspaces() -> Option<Vec<Workspace>> {
+    serde_json::from_str::<WorkspaceListReply>(&run30(&["herdr", "workspace", "list"]).await.out)
+        .ok()
+        .map(|reply| reply.result.workspaces)
+}
+
+async fn focused_workspace() -> Option<String> {
+    workspaces()
+        .await?
+        .into_iter()
+        .find(|workspace| workspace.focused)
+        .map(|workspace| workspace.workspace_id)
+}
+
+/// `workspace close` may refocus another workspace even when the closed one was
+/// unfocused. Restore the user's prior focus when that happens.
+async fn close_workspace(id: &str) {
+    let before = focused_workspace().await;
+    run30(&["herdr", "workspace", "close", id]).await;
+    if let Some(previous) = before {
+        if previous != id && focused_workspace().await.as_deref() != Some(previous.as_str()) {
+            run30(&["herdr", "workspace", "focus", &previous]).await;
+        }
+    }
+}
+
+/// Reclaim inactive workspaces left by interrupted or intentionally retained runs.
+async fn close_by_label(label: &str) -> u32 {
+    let Some(workspaces) = workspaces().await else {
+        return 0;
+    };
+    let mut closed = 0;
+    for workspace in workspaces {
+        if workspace.label.as_deref() != Some(label)
+            || workspace.agent_status.as_deref() == Some("working")
+        {
+            continue;
+        }
+        close_workspace(&workspace.workspace_id).await;
+        closed += 1;
+    }
+    closed
+}
+
+fn should_cleanup(cleanup: WorkspaceCleanup, outcome: &AgentRunOutcome) -> bool {
+    match cleanup {
+        WorkspaceCleanup::Never => false,
+        WorkspaceCleanup::Always => !matches!(outcome, AgentRunOutcome::Unavailable),
+        WorkspaceCleanup::OnSuccess => matches!(outcome, AgentRunOutcome::Succeeded(_)),
+    }
+}
+
+/// Create an unfocused Herdr workspace, run and verify an agent, deliver one
+/// prompt, wait for completion, and apply the requested best-effort cleanup.
+pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
+    if !run30(&["herdr", "workspace", "list"]).await.ok {
+        return AgentRunOutcome::Unavailable;
+    }
+    let stale = close_by_label(&agent_run.label).await;
+    if stale > 0 {
+        println!(
+            "[herdr:{}] reclaimed {stale} stale workspace(s)",
+            agent_run.label
+        );
+    }
+    let created = run30(&[
+        "herdr",
+        "workspace",
+        "create",
+        "--cwd",
+        &agent_run.cwd,
+        "--label",
+        &agent_run.label,
+        "--no-focus",
+    ])
+    .await;
+    let parsed = serde_json::from_str::<WorkspaceCreateReply>(&created.out).ok();
+    let workspace_id = parsed
+        .as_ref()
+        .map(|reply| reply.result.workspace.workspace_id.clone());
+    let pane_id = parsed
+        .as_ref()
+        .map(|reply| reply.result.root_pane.pane_id.clone());
+
+    let outcome = async {
+        let (Some(pane), Some(_)) = (&pane_id, &workspace_id) else {
+            eprintln!(
+                "[herdr:{}] workspace create failed: {}",
+                agent_run.label,
+                created.out.chars().take(200).collect::<String>()
+            );
+            let orphans = close_by_label(&agent_run.label).await;
+            return AgentRunOutcome::Failed(if orphans > 0 {
+                format!("workspace create unparseable, {orphans} orphan(s) closed by label")
+            } else {
+                "workspace create failed".to_string()
+            });
+        };
+        if !run30(&["herdr", "pane", "run", pane, &agent_run.launch])
+            .await
+            .ok
+        {
+            return AgentRunOutcome::Failed("pane run failed".to_string());
+        }
+        if !run(
+            &[
+                "herdr",
+                "wait",
+                "agent-status",
+                pane,
+                "--status",
+                "idle",
+                "--timeout",
+                "60000",
+            ],
+            Duration::from_secs(70),
+        )
+        .await
+        .ok
+        {
+            eprintln!(
+                "[herdr:{}] agent did not become ready in pane {pane}",
+                agent_run.label
+            );
+            return AgentRunOutcome::Failed("agent never became ready".to_string());
+        }
+        // Agent detection precedes TUI input readiness by ~1-2 seconds.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        if !pane_has_agent(pane).await {
+            return AgentRunOutcome::Failed("CLI never launched (pane has no agent)".to_string());
+        }
+        let needle: String = agent_run.prompt.chars().take(30).collect();
+        let mut landed = false;
+        for _ in 0..3 {
+            run30(&["herdr", "pane", "run", pane, &agent_run.prompt]).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let read = run30(&[
+                "herdr",
+                "pane",
+                "read",
+                pane,
+                "--source",
+                "recent-unwrapped",
+                "--lines",
+                "80",
+            ])
+            .await;
+            if !read.ok {
+                break;
+            }
+            // Claude collapses large pastes to this placeholder; it proves delivery.
+            if read.out.contains(&needle) || read.out.contains("[Pasted text") {
+                landed = true;
+                break;
+            }
+        }
+        if !landed {
+            return AgentRunOutcome::Failed("prompt never landed in pane".to_string());
+        }
+        run30(&["herdr", "pane", "send-keys", pane, "Enter"]).await;
+        run30(&["herdr", "pane", "send-keys", pane, "Enter"]).await;
+        let timeout_ms = agent_run.timeout.as_millis().to_string();
+        let done = run(
+            &[
+                "herdr",
+                "wait",
+                "agent-status",
+                pane,
+                "--status",
+                "done",
+                "--timeout",
+                &timeout_ms,
+            ],
+            agent_run.timeout + Duration::from_secs(60),
+        )
+        .await;
+        let tail = run30(&[
+            "herdr", "pane", "read", pane, "--source", "recent", "--lines", "15",
+        ])
+        .await;
+        println!(
+            "[herdr:{}] agent {}; tail:\n{}",
+            agent_run.label,
+            if done.ok { "done" } else { "TIMED OUT" },
+            tail.out.trim()
+        );
+        if done.ok {
+            AgentRunOutcome::Succeeded("agent done".to_string())
+        } else {
+            AgentRunOutcome::Failed("agent timeout".to_string())
+        }
+    }
+    .await;
+
+    if should_cleanup(agent_run.cleanup, &outcome) {
+        if let Some(id) = &workspace_id {
+            close_workspace(id).await;
+        }
+    } else if workspace_id.is_some() {
+        println!(
+            "[herdr:{}] pane kept open (cleanup: {:?})",
+            agent_run.label, agent_run.cleanup
+        );
+    }
+    outcome
 }
 
 fn interval() -> Duration {
@@ -229,4 +516,82 @@ pub fn maybe_snapshot(vault: &Path) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_typed_panes_and_workspaces() {
+        let panes: PaneListReply = serde_json::from_str(
+            r#"{"result":{"panes":[{"workspace_id":"w1","tab_id":"w1:t1","pane_id":"w1:p1","terminal_id":"t1","cwd":"/tmp","focused":true,"agent_status":"idle","agent":"codex","agent_session":{"value":"session-1"}}]}}"#,
+        )
+        .unwrap();
+        let pane = &panes.result.panes[0];
+        assert_eq!(pane.pane_id, "w1:p1");
+        assert_eq!(pane.agent.as_deref(), Some("codex"));
+
+        let workspaces: WorkspaceListReply = serde_json::from_str(
+            r#"{"result":{"workspaces":[{"workspace_id":"w1","label":"job-smoke","focused":false,"agent_status":"idle"}]}}"#,
+        )
+        .unwrap();
+        let workspace = &workspaces.result.workspaces[0];
+        assert_eq!(workspace.label.as_deref(), Some("job-smoke"));
+        assert!(!workspace.focused);
+
+        let created: WorkspaceCreateReply = serde_json::from_str(
+            r#"{"result":{"workspace":{"workspace_id":"w2"},"root_pane":{"pane_id":"w2:p1"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(created.result.workspace.workspace_id, "w2");
+        assert_eq!(created.result.root_pane.pane_id, "w2:p1");
+    }
+
+    #[test]
+    fn cleanup_follows_policy_and_outcome() {
+        let succeeded = AgentRunOutcome::Succeeded("done".into());
+        let failed = AgentRunOutcome::Failed("timeout".into());
+        assert!(!should_cleanup(WorkspaceCleanup::Never, &succeeded));
+        assert!(should_cleanup(WorkspaceCleanup::Always, &failed));
+        assert!(should_cleanup(WorkspaceCleanup::OnSuccess, &succeeded));
+        assert!(!should_cleanup(WorkspaceCleanup::OnSuccess, &failed));
+        assert!(!should_cleanup(
+            WorkspaceCleanup::Always,
+            &AgentRunOutcome::Unavailable
+        ));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a live Herdr session and signed-in Codex CLI"]
+    async fn live_agent_lifecycle_preserves_focus_and_cleans_up() {
+        let focused_before = focused_workspace().await.expect("focused Herdr workspace");
+        let label = format!("plant-lifecycle-smoke-{}", std::process::id());
+        let outcome = run_agent(AgentRun {
+            label: label.clone(),
+            cwd: std::env::current_dir().unwrap().display().to_string(),
+            launch: "command codex --dangerously-bypass-approvals-and-sandbox -c model_reasoning_effort=low".into(),
+            prompt: "Reply with exactly HERDR_LIFECYCLE_SMOKE_OK and do not use tools.".into(),
+            timeout: Duration::from_secs(120),
+            cleanup: WorkspaceCleanup::Always,
+        })
+        .await;
+
+        assert!(
+            matches!(outcome, AgentRunOutcome::Succeeded(_)),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            focused_workspace().await.as_deref(),
+            Some(focused_before.as_str())
+        );
+        assert!(
+            workspaces()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .all(|workspace| workspace.label.as_deref() != Some(&label)),
+            "smoke workspace was not cleaned up"
+        );
+    }
 }

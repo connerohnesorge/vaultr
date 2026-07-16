@@ -1,6 +1,6 @@
 //! OTLP telemetry — ports wireproxy.ts:184-355. Same metric names, bounds, shapes.
 
-use crate::adapter::{parse_sse, Adapter};
+use crate::adapter::Adapter;
 use crate::capture::{CapturedRequest, CapturedResponse};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
@@ -116,7 +116,7 @@ impl Otel {
             return;
         }
         let model = model.unwrap_or("unknown").to_string();
-        let usage = adapter.usage(&parse_sse(&resp.sse));
+        let usage = adapter.usage(&vaultr::recon::parse_sse(&resp.sse));
         let duration_ms = req
             .started_at
             .elapsed()

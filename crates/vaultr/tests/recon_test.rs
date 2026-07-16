@@ -73,6 +73,20 @@ fn raw_and_zst_parity() {
 }
 
 #[test]
+fn permissive_sse_parser_keeps_only_valid_data_json() {
+    let events = recon::parse_sse(
+        "event: message\n\
+         data: {\"n\":1}\n\
+         data:   {\"n\":2}  \n\
+         data: \n\
+         data: [DONE]\n\
+         ignored\n\
+         data: not-json\n",
+    );
+    assert_eq!(events, vec![json!({"n": 1}), json!({"n": 2})]);
+}
+
+#[test]
 fn incomplete_live_tail_ignored() {
     let full = fs::read_to_string(fixture("claude_append.jsonl")).unwrap();
     let complete_lines: Vec<&str> = full.lines().collect();

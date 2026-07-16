@@ -248,7 +248,7 @@ fn append_str(block: &mut Value, field: &str, addition: Option<&Value>) {
     block[field] = Value::String(format!("{existing}{add}"));
 }
 
-/// Parse SSE text into data events (mirrors plant's parse_sse).
+/// Parse SSE text into JSON data events, ignoring terminal and malformed lines.
 pub fn parse_sse(sse: &str) -> Vec<Value> {
     sse.lines()
         .filter_map(|line| line.strip_prefix("data:"))
