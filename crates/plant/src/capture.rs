@@ -1,5 +1,6 @@
-//! Vault capture — envelope writer, delta encoding, state.json, meta merge.
-//! Ports capture/commonPrefix/sessionDir/updateMeta (wireproxy.ts:122-422).
+//! Vault capture — envelope writer, state.json, meta merge. Delta encoding
+//! lives in vaultr::recon next to its inverse.
+//! Ports capture/sessionDir/updateMeta (wireproxy.ts:122-422).
 
 use crate::adapter::{Adapter, Identity};
 use serde_json::{json, Map, Value};
@@ -10,6 +11,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
+use vaultr::recon;
 use vaultr::vault::{dated_session_dir, Meta};
 
 pub struct CapturedRequest {
@@ -40,6 +42,8 @@ pub struct CapturedResponse {
 
 static SESSION_DIRS: Mutex<Option<HashMap<String, PathBuf>>> = Mutex::new(None);
 
+/// Session ids this process is actively capturing since startup — i.e. every
+/// session that hit `session_dir` for `vault`, not everything on disk.
 pub(crate) fn cached_session_ids(vault: &Path) -> Vec<String> {
     let prefix = format!("{}\0", vault.display());
     SESSION_DIRS
@@ -161,11 +165,6 @@ pub fn update_meta(
     fs::write(&path, to_string_pretty_1(&json!(meta)) + "\n")
 }
 
-/// commonPrefix: element-wise JSON equality.
-pub fn common_prefix(a: &[Value], b: &[Value]) -> usize {
-    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
-}
-
 /// Request-time half: compute delta, write state.json, drop the body Value.
 pub fn prepare_capture(
     vault: &Path,
@@ -178,47 +177,15 @@ pub fn prepare_capture(
         .session_id
         .clone()
         .ok_or_else(|| format!("{} request has no session identity", adapter.harness))?;
-    let empty = vec![];
-    let history = body
-        .get(adapter.history_key)
-        .and_then(Value::as_array)
-        .unwrap_or(&empty);
     let dir = session_dir(vault, &sid).map_err(|e| e.to_string())?;
 
     let prior: Value = fs::read_to_string(dir.join("state.json"))
         .ok()
         .and_then(|t| serde_json::from_str::<Value>(&t).ok())
-        .and_then(|v| v.get("request_body").cloned())
+        // take, not clone — the prior body is the full history, often MBs.
+        .and_then(|mut v| v.get_mut("request_body").map(Value::take))
         .unwrap_or(Value::Null);
-    let prior_history = prior
-        .get(adapter.history_key)
-        .and_then(Value::as_array)
-        .unwrap_or(&empty);
-    let prefix = common_prefix(prior_history, history);
-
-    let mut set = Map::new();
-    let mut remove: Vec<String> = vec![];
-    if let Some(obj) = body.as_object() {
-        for (k, v) in obj {
-            if k == adapter.history_key {
-                continue;
-            }
-            if adapter.big_fields.contains(&k.as_str()) {
-                if prior.get(k) != Some(v) {
-                    set.insert(k.clone(), v.clone());
-                }
-            } else {
-                set.insert(k.clone(), v.clone());
-            }
-        }
-        if let Some(pobj) = prior.as_object() {
-            for k in pobj.keys() {
-                if !obj.contains_key(k) && k != adapter.history_key {
-                    remove.push(k.clone());
-                }
-            }
-        }
-    }
+    let body_delta = recon::encode_delta(&prior, &body, adapter.history_key, adapter.big_fields);
 
     let request_part = json!({
         "schema_version": 1,
@@ -233,11 +200,7 @@ pub fn prepare_capture(
             "path": req.path,
             "content_encoding": req.content_encoding,
             "body_sha256": req.body_sha256,
-            "body_delta": {
-                "set": set,
-                "remove": remove,
-                "history": { "key": adapter.history_key, "prefix_length": prefix, "append": history[prefix..] },
-            },
+            "body_delta": body_delta,
         },
     });
 
@@ -329,9 +292,188 @@ pub fn to_string_pretty_1(value: &Value) -> String {
 mod tests {
     use super::*;
 
+    fn temp_vault(label: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("plant-{label}-{}", uuid::Uuid::new_v4()))
+    }
+
+    fn claude_adapter() -> Adapter {
+        crate::adapter::adapters().remove(0)
+    }
+
+    fn captured(session_id: Option<&str>) -> CapturedRequest {
+        CapturedRequest {
+            method: "POST".into(),
+            path: "/v1/messages".into(),
+            content_encoding: None,
+            body_sha256: "deadbeef".into(),
+            ids: Identity {
+                session_id: session_id.map(String::from),
+                ..Default::default()
+            },
+            started_at: SystemTime::now(),
+        }
+    }
+
+    fn delta(pending: &PendingCapture) -> &Value {
+        &pending.request_part["request"]["body_delta"]
+    }
+
+    #[test]
+    fn prepare_capture_delta_lifecycle() {
+        let vault = temp_vault("prep");
+        let adapter = claude_adapter();
+        let sid = uuid::Uuid::new_v4().to_string();
+
+        // First turn: no state.json — everything is new.
+        let body1 = json!({
+            "model": "m",
+            "system": "sys",
+            "tools": [{ "name": "t" }],
+            "messages": [{ "role": "user", "content": "a" }],
+        });
+        let p1 = prepare_capture(&vault, &adapter, captured(Some(&sid)), body1.clone()).unwrap();
+        assert_eq!(p1.request_part["schema_version"], 1);
+        assert_eq!(p1.request_part["harness"], "claude-code");
+        assert_eq!(p1.request_part["session_id"], sid.as_str());
+        assert_eq!(p1.model.as_deref(), Some("m"));
+        let d1 = delta(&p1);
+        assert_eq!(d1["history"]["key"], "messages");
+        assert_eq!(d1["history"]["prefix_length"], 0);
+        assert_eq!(d1["history"]["append"].as_array().unwrap().len(), 1);
+        assert!(
+            d1["set"].get("tools").is_some(),
+            "big field stored on first turn"
+        );
+        assert!(d1["set"].get("system").is_some());
+        assert_eq!(d1["set"]["model"], "m");
+        assert_eq!(d1["remove"], json!([]));
+        let state: Value =
+            serde_json::from_str(&fs::read_to_string(p1.dir.join("state.json")).unwrap()).unwrap();
+        assert_eq!(state["request_body"], body1);
+
+        // Append-only growth: unchanged big fields dedup, small fields verbatim.
+        let body2 = json!({
+            "model": "m",
+            "system": "sys",
+            "tools": [{ "name": "t" }],
+            "messages": [
+                { "role": "user", "content": "a" },
+                { "role": "assistant", "content": "b" },
+                { "role": "user", "content": "c" },
+            ],
+        });
+        let p2 = prepare_capture(&vault, &adapter, captured(Some(&sid)), body2).unwrap();
+        let d2 = delta(&p2);
+        assert_eq!(d2["history"]["prefix_length"], 1);
+        assert_eq!(d2["history"]["append"].as_array().unwrap().len(), 2);
+        assert!(
+            d2["set"].get("tools").is_none(),
+            "unchanged big field omitted"
+        );
+        assert!(d2["set"].get("system").is_none());
+        assert_eq!(d2["set"]["model"], "m", "small field verbatim every turn");
+
+        // Compaction: shorter, diverging history plus a changed big field.
+        let body3 = json!({
+            "model": "m",
+            "system": "sys2",
+            "tools": [{ "name": "t" }],
+            "messages": [{ "role": "user", "content": "SUMMARY" }],
+        });
+        let p3 = prepare_capture(&vault, &adapter, captured(Some(&sid)), body3).unwrap();
+        let d3 = delta(&p3);
+        assert_eq!(
+            d3["history"]["prefix_length"], 0,
+            "compaction detected via LCP"
+        );
+        assert_eq!(d3["history"]["append"].as_array().unwrap().len(), 1);
+        assert!(d3["set"].get("tools").is_none());
+        assert_eq!(d3["set"]["system"], "sys2", "changed big field re-stored");
+
+        fs::remove_dir_all(vault).unwrap();
+    }
+
+    #[test]
+    fn prepare_capture_remove_list_tracks_dropped_keys() {
+        let vault = temp_vault("prep-remove");
+        let adapter = claude_adapter();
+        let sid = uuid::Uuid::new_v4().to_string();
+
+        let body1 = json!({
+            "model": "m",
+            "temperature": 0.5,
+            "messages": [{ "role": "user", "content": "a" }],
+        });
+        prepare_capture(&vault, &adapter, captured(Some(&sid)), body1).unwrap();
+
+        // Second turn drops both `temperature` and the history key itself:
+        // only the former lands in `remove` — history is never a removable key.
+        let body2 = json!({ "model": "m" });
+        let p2 = prepare_capture(&vault, &adapter, captured(Some(&sid)), body2).unwrap();
+        let d2 = delta(&p2);
+        assert_eq!(d2["remove"], json!(["temperature"]));
+        assert_eq!(d2["history"]["prefix_length"], 0);
+        assert_eq!(d2["history"]["append"], json!([]));
+
+        fs::remove_dir_all(vault).unwrap();
+    }
+
+    #[test]
+    fn prepare_capture_degenerate_inputs() {
+        let vault = temp_vault("prep-degenerate");
+        let adapter = claude_adapter();
+
+        // Missing session identity is the only error path.
+        let err = match prepare_capture(&vault, &adapter, captured(None), json!({})) {
+            Ok(_) => panic!("missing session identity must be an error"),
+            Err(e) => e,
+        };
+        assert!(err.contains("no session identity"), "unexpected error: {err}");
+
+        // Missing history key: empty append, prefix 0.
+        let sid = uuid::Uuid::new_v4().to_string();
+        let p = prepare_capture(&vault, &adapter, captured(Some(&sid)), json!({ "model": "m" }))
+            .unwrap();
+        let d = delta(&p);
+        assert_eq!(d["history"]["prefix_length"], 0);
+        assert_eq!(d["history"]["append"], json!([]));
+        assert_eq!(d["set"]["model"], "m");
+
+        // Non-object body: empty set/remove, state.json still written verbatim.
+        let sid2 = uuid::Uuid::new_v4().to_string();
+        let p2 = prepare_capture(&vault, &adapter, captured(Some(&sid2)), json!("nope")).unwrap();
+        let d2 = delta(&p2);
+        assert_eq!(d2["set"], json!({}));
+        assert_eq!(d2["remove"], json!([]));
+        assert_eq!(d2["history"]["append"], json!([]));
+        let state: Value =
+            serde_json::from_str(&fs::read_to_string(p2.dir.join("state.json")).unwrap()).unwrap();
+        assert_eq!(state["request_body"], json!("nope"));
+
+        // Corrupt state.json: treated as no prior — never fatal.
+        let sid3 = uuid::Uuid::new_v4().to_string();
+        let dir = session_dir(&vault, &sid3).unwrap();
+        fs::write(dir.join("state.json"), "{corrupt").unwrap();
+        let body = json!({
+            "model": "m",
+            "tools": [{ "name": "t" }],
+            "messages": [{ "role": "user", "content": "a" }],
+        });
+        let p3 = prepare_capture(&vault, &adapter, captured(Some(&sid3)), body).unwrap();
+        let d3 = delta(&p3);
+        assert_eq!(d3["history"]["prefix_length"], 0);
+        assert_eq!(d3["history"]["append"].as_array().unwrap().len(), 1);
+        assert!(
+            d3["set"].get("tools").is_some(),
+            "big field stored when prior unreadable"
+        );
+
+        fs::remove_dir_all(vault).unwrap();
+    }
+
     #[test]
     fn session_dir_creates_from_meta_without_scanning_and_caches() {
-        let vault = std::env::temp_dir().join(format!("plant-capture-{}", uuid::Uuid::new_v4()));
+        let vault = temp_vault("capture");
         let session_id = uuid::Uuid::new_v4().to_string();
         let meta_dir = vault.join(".meta");
         fs::create_dir_all(&meta_dir).unwrap();
@@ -354,7 +496,7 @@ mod tests {
 
     #[test]
     fn update_meta_emits_complete_shape_and_preserves_writer_policy() {
-        let vault = std::env::temp_dir().join(format!("plant-meta-{}", uuid::Uuid::new_v4()));
+        let vault = temp_vault("meta");
         let session_id = uuid::Uuid::new_v4().to_string();
         let path = vault.join(".meta").join(format!("{session_id}.json"));
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -367,7 +509,7 @@ mod tests {
             session_id: Some(session_id.clone()),
             ..Default::default()
         };
-        let adapter = crate::adapter::adapters().remove(0);
+        let adapter = claude_adapter();
 
         update_meta(&vault, &adapter, &ids, Some("new")).unwrap();
         let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
