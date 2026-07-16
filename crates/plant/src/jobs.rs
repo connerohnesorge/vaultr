@@ -148,7 +148,7 @@ pub fn load_jobs() -> Vec<Job> {
             ..Job::new(
                 "reconcile",
                 Kind::Reconcile,
-                Duration::from_secs(30 * 86400),
+                Duration::from_secs(2 * 3600),
             )
         },
     ]
@@ -466,8 +466,8 @@ async fn run_agent(job: &Job, rendered: &str) -> Option<(bool, String)> {
         ))
     }
     .await;
-    // PLANT_KEEP_PANES=1: manual-verification override, leave the workspace open
-    let close = std::env::var("PLANT_KEEP_PANES").as_deref() != Ok("1")
+    // Keep panes by default; PLANT_KEEP_PANES=0 opts back into per-job auto-close.
+    let close = std::env::var("PLANT_KEEP_PANES").as_deref() == Ok("0")
         && match job.close_pane {
             ClosePane::Always => true,
             ClosePane::OnSuccess => matches!(result, Some((true, _))),
@@ -572,7 +572,7 @@ mod tests {
         assert_eq!(by_name("compress").kind, Kind::Compress);
         assert_eq!(by_name("learn").close_pane, ClosePane::OnSuccess);
         assert_eq!(by_name("reconcile").close_pane, ClosePane::Always);
-        assert_eq!(by_name("reconcile").every, Duration::from_secs(30 * 86400));
+        assert_eq!(by_name("reconcile").every, Duration::from_secs(2 * 3600));
     }
 
     #[test]
