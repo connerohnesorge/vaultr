@@ -335,3 +335,34 @@ the DB, provided filename and `session_meta.id` agree. Recent rollouts all repor
   `event_msg/user_message` yields an empty preview/title (`has_user_event:0`) but sessions still
   appear (real rows with 0 exist).
 - Both CLIs move fast; re-verify against the exact installed version before shipping the writer.
+
+---
+
+## 4. Injected-scaffolding inventory
+
+**Injected scaffolding** = text the harness/hooks add to requests at wire time — claudeMd context,
+`<system-reminder>` blocks, agent/skill/hook listings, AGENTS.md, `<permissions>` /
+`<environment_context>` blocks, Codex base-instructions/`additional_tools` — as opposed to content
+the user actually typed. The rules for handling it are direction-dependent and deliberately live
+next to the record format each one inverts.
+
+**Direction rule:** native-session **writers preserve scaffolding byte-for-byte** (resume fidelity;
+same-harness forks are prompt-cache-verified byte-identical) — they drop only what the harness
+regenerates per request, so storing it would double it on resume. **Normalization drops it** —
+display and cross-harness translation are intentionally lossy and carry no byte-identity guarantee.
+
+| Rule | Home | What it does | Feeds |
+|---|---|---|---|
+| `strip_system_reminders` (`:156`) + role handling (doc `:33-34`, `reasoning` reject `:86`, system/developer reject `:94`) | `crates/vaultr/src/normalize.rs` | Removes `<system-reminder>…</system-reminder>` spans from user text; drops system/developer/reasoning items entirely | Rendering + best-effort cross-harness fork — NOT byte-identity |
+| `INJECTED_CONTEXT_MARKER` (`:176`) + `strip_injected_context` (`:286`, applied `:65`) | `crates/vaultr/src/claude_writer.rs` | Scrubs the leading claudeMd `<system-reminder>` block from the first user message (resume re-injects it; storing it would send it twice) | Byte-identical Claude resume |
+| `parse_system_blob` (`:192`) | `crates/vaultr/src/claude_writer.rs` | Inverts a rendered system message (hook success, agent listing, skill listing) back into attachment records, byte-for-byte, so resume-time hook dedup works | Byte-identical Claude resume |
+| `find_agents_md` (`:235`) | `crates/vaultr/src/codex_writer.rs` | Recovers AGENTS.md text from the injected history block into a stored `world_state`, so resume doesn't inject a duplicate | Byte-identical Codex resume |
+| `INJECTED` prefix list in `typed_user_text` (`:273-281`: `# AGENTS.md`, `<permissions`, `<environment_context`, …) | `crates/vaultr/src/codex_writer.rs` | Gates only the cosmetic `event_msg/user_message` resume-picker preview events — never touches `response_item` history | Picker preview only |
+| `prepare_codex_passthrough` (`:186`) | `crates/vaultr/src/fork.rs` | Same-harness Codex fork: drops `additional_tools`, lifts the leading developer message into `session_meta.base_instructions` (Codex regenerates both per request); everything else passes through opaquely | Byte-identical Codex resume |
+
+One shared predicate exists: `strip_system_reminders` lives in `normalize.rs` and is also imported
+by `claude_writer.rs` (`visible_user_text`, `:321`) — there only for picker-title text, never for
+stored history.
+
+Consolidating these into a shared "scaffolding" module was considered and rejected: writers must
+**preserve** what normalize **drops**, and a shared predicate would invite exactly the wrong reuse.
