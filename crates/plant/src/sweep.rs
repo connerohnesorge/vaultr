@@ -101,9 +101,10 @@ fn which(bin: &str) -> bool {
 
 fn ledger_sessions(vault: &Path, learner: &str) -> HashSet<String> {
     let mut processed = HashSet::new();
-    if let Ok(text) =
-        std::fs::read_to_string(vault.join("..").join("learnings").join(".ledger.jsonl"))
-    {
+    let Ok(root) = vaultr::validate::content_root(vault) else {
+        return processed; // rootless sessions path => nothing ledgered; non-fatal
+    };
+    if let Ok(text) = std::fs::read_to_string(vaultr::validate::ledger_path(&root)) {
         for line in text.lines() {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
                 let recorded = v.get("learner").and_then(|s| s.as_str());
@@ -125,11 +126,9 @@ fn epoch_now() -> u64 {
         .unwrap_or(0)
 }
 
-fn inflight_path(vault: &Path, learner: &str) -> PathBuf {
-    vault
-        .join("..")
-        .join("learnings")
-        .join(format!(".inflight-{learner}.json"))
+fn inflight_path(vault: &Path, learner: &str) -> Option<PathBuf> {
+    let root = vaultr::validate::content_root(vault).ok()?;
+    Some(root.join("learnings").join(format!(".inflight-{learner}.json")))
 }
 
 /// Sessions a still-running learn pass has claimed for `learner`, if the lease hasn't
@@ -138,7 +137,10 @@ fn inflight_path(vault: &Path, learner: &str) -> PathBuf {
 /// duplicate-prompt bug). ponytail: one file per learner, expiry self-heals a crashed or
 /// timed-out pass — no explicit release path to leak.
 fn inflight_sessions(vault: &Path, learner: &str) -> HashSet<String> {
-    let Ok(text) = std::fs::read_to_string(inflight_path(vault, learner)) else {
+    let Some(path) = inflight_path(vault, learner) else {
+        return HashSet::new();
+    };
+    let Ok(text) = std::fs::read_to_string(path) else {
         return HashSet::new();
     };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
@@ -158,7 +160,10 @@ fn inflight_sessions(vault: &Path, learner: &str) -> HashSet<String> {
 /// prompt, so a slow pass can't be re-dispatched underneath it.
 pub fn claim_inflight(vault: &Path, learner: &str, sids: &[String], expires_at: u64) {
     let body = serde_json::json!({ "sids": sids, "expires_at": expires_at });
-    let _ = std::fs::write(inflight_path(vault, learner), body.to_string());
+    let Some(path) = inflight_path(vault, learner) else {
+        return; // rootless sessions path: skip the lease rather than write astray
+    };
+    let _ = std::fs::write(path, body.to_string());
 }
 
 fn capture_files(vault: &Path) -> Vec<(String, PathBuf)> {
@@ -398,8 +403,16 @@ pub async fn compress_sweep(vault: &Path, idle: Duration) -> bool {
         }
     }
     if sealed > 0 {
-        let repo = vault.join("..");
-        let repo = repo.to_str().unwrap_or(".").to_string();
+        // A bare relative sessions root has an empty parent — the repo is the cwd.
+        // A rootless path (no parent at all) has no repo: skip the commit, keep sealing.
+        let repo = match vaultr::validate::content_root(vault) {
+            Ok(p) if p.as_os_str().is_empty() => ".".to_string(),
+            Ok(p) => p.to_str().unwrap_or(".").to_string(),
+            Err(_) => {
+                println!("[compress] sealed {sealed}, commit skipped: sessions root has no parent");
+                return true;
+            }
+        };
         run30(&["git", "-C", &repo, "add", "-A", "sessions"]).await;
         let msg = format!("chore: seal {sealed} session(s) (scrubbed + zstd)");
         run30(&["git", "-C", &repo, "commit", "-m", &msg]).await;

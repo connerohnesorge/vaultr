@@ -205,7 +205,7 @@ echo '{"decision":"block","reason":"The vault is still invalid. Run `vaultr vali
 /// Claims the batch as in-flight (lease expiring `timeout` + slack from now) before
 /// returning, so the next tick can't re-dispatch the same not-yet-ledgered sessions.
 fn eligible(learner: &str, timeout: Duration) -> Option<String> {
-    let vault = crate::vault_path();
+    let vault = crate::vault_root();
     let list = crate::sweep::eligible_sessions(&vault, Duration::from_secs(3600), 10, learner);
     let (total, ledgered) = crate::sweep::eligibility_stats(&vault, learner);
     println!(
@@ -277,7 +277,10 @@ fn prompt(job: &Job) -> Option<String> {
 /// ponytail: skipped/failed reflect records also bump ts, which just means "only re-reflect
 /// once learnings newer than the last attempt exist" — the intended semantics.
 fn learnings_updated_since(ts: Option<u64>) -> bool {
-    let ledger = crate::vault_path().join("../learnings/.ledger.jsonl");
+    let Ok(root) = vaultr::validate::content_root(&crate::vault_root()) else {
+        return false; // rootless sessions path => no ledger to compare against
+    };
+    let ledger = vaultr::validate::ledger_path(&root);
     let Some(mtime) = std::fs::metadata(&ledger)
         .and_then(|m| m.modified())
         .ok()
@@ -291,7 +294,7 @@ fn learnings_updated_since(ts: Option<u64>) -> bool {
 
 /// Run the vault content validator; None on scan failure (skip this tick).
 fn vault_validate() -> Option<vaultr::validate::Report> {
-    let root = vaultr::validate::content_root(&crate::vault_path()).ok()?;
+    let root = vaultr::validate::content_root(&crate::vault_root()).ok()?;
     vaultr::validate::scan(&root).ok()
 }
 
@@ -372,7 +375,7 @@ pub async fn run_job(job: &Job, cfg: &Cfg) {
     let started = SystemTime::now();
     if job.kind == Kind::Compress {
         let ok =
-            crate::sweep::compress_sweep(&crate::vault_path(), Duration::from_secs(3600)).await;
+            crate::sweep::compress_sweep(&crate::vault_root(), Duration::from_secs(3600)).await;
         let outcome = if ok { "success" } else { "failed" };
         record(&job.name, outcome, started, "compress sweep");
         return;
