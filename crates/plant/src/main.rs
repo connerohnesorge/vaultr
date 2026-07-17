@@ -33,9 +33,10 @@ fn vault_root() -> PathBuf {
 }
 
 /// `plant sessions eligible [--learner claude|codex] [--idle 60m] [--max 10]`,
-/// `plant compress once [--idle 60m]`, and `plant jobs run <name>` (manual trigger of a
-/// built-in job; the Herdr workspace stays open after the run unless PLANT_KEEP_PANES=0
-/// opts into the per-job cleanup policy — see jobs::cleanup_policy).
+/// `plant sessions stuck [--age 24h]` (stuck-capture report; exit 1 on actionable
+/// findings), `plant compress once [--idle 60m]`, and `plant jobs run <name>` (manual
+/// trigger of a built-in job; the Herdr workspace stays open after the run unless
+/// PLANT_KEEP_PANES=0 opts into the per-job cleanup policy — see jobs::cleanup_policy).
 async fn subcommand(argv: &[String]) -> Option<i32> {
     let flag = |name: &str| {
         argv.iter()
@@ -63,6 +64,20 @@ async fn subcommand(argv: &[String]) -> Option<i32> {
             }
             println!("{}", list.join(" "));
             Some(0)
+        }
+        (Some("sessions"), Some("stuck")) => {
+            let age = flag("--age")
+                .and_then(|v| jobs::parse_duration(&v))
+                .unwrap_or(Duration::from_secs(24 * 3600));
+            let stuck = sweep::stuck_captures(&vault_root(), age);
+            for s in &stuck {
+                println!("{} {} idle={}h", s.state, s.sid, s.idle_secs / 3600);
+            }
+            Some(if stuck.iter().any(|s| s.state != "sub-threshold") {
+                1
+            } else {
+                0
+            })
         }
         (Some("compress"), Some("once")) => {
             Some(if sweep::compress_sweep(&vault_root(), idle).await {
