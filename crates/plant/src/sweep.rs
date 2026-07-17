@@ -188,13 +188,65 @@ fn turns_files(vault: &Path, include_compressed: bool) -> Vec<(String, PathBuf)>
     out
 }
 
-fn idle_for(path: &Path, idle: Duration) -> bool {
+fn idle_secs(path: &Path) -> Option<u64> {
     std::fs::metadata(path)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| SystemTime::now().duration_since(t).ok())
-        .map(|d| d >= idle)
-        .unwrap_or(false)
+        .map(|d| d.as_secs())
+}
+
+fn idle_for(path: &Path, idle: Duration) -> bool {
+    idle_secs(path).map(|s| s >= idle.as_secs()).unwrap_or(false)
+}
+
+/// Learn substance gate: >20KB, or >5 turns (only read small files to count).
+/// Compressed captures already cleared the legacy Claude pass before sealing.
+fn substantive(path: &Path) -> bool {
+    let compressed = path.extension().and_then(|e| e.to_str()) == Some("zst");
+    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    compressed
+        || size > 20_480
+        || std::fs::read_to_string(path)
+            .map(|t| t.trim_end().lines().count() > 5)
+            .unwrap_or(false)
+}
+
+/// One raw Session Capture the cultivation pipeline should have sealed by now.
+pub struct StuckCapture {
+    pub sid: String,
+    /// seal-blocked | half-learned:<missing learner> | unlearned | sub-threshold
+    pub state: String,
+    pub idle_secs: u64,
+}
+
+/// Classify raw captures idle >= `age` by learn-ledger state. Read-only; the watchdog
+/// job and `plant sessions stuck` both call this. sub-threshold captures can never seal
+/// under current rules (learn skips them, sealing needs both ledgers) — reported so the
+/// gap stays visible, but callers treat them as informational, not actionable.
+pub fn stuck_captures(vault: &Path, age: Duration) -> Vec<StuckCapture> {
+    let claude = ledger_sessions(vault, "claude");
+    let codex = ledger_sessions(vault, "codex");
+    let mut out = vec![];
+    for (sid, path) in turns_files(vault, false) {
+        let Some(idle) = idle_secs(&path) else { continue };
+        if idle < age.as_secs() {
+            continue;
+        }
+        let state = match (claude.contains(&sid), codex.contains(&sid)) {
+            (true, true) => "seal-blocked".to_string(),
+            (true, false) => "half-learned:codex".to_string(),
+            (false, true) => "half-learned:claude".to_string(),
+            (false, false) if substantive(&path) => "unlearned".to_string(),
+            (false, false) => "sub-threshold".to_string(),
+        };
+        out.push(StuckCapture {
+            sid,
+            state,
+            idle_secs: idle,
+        });
+    }
+    out
 }
 
 pub fn eligible_sessions(vault: &Path, idle: Duration, max: usize, learner: &str) -> Vec<String> {
@@ -205,16 +257,7 @@ pub fn eligible_sessions(vault: &Path, idle: Duration, max: usize, learner: &str
         if processed.contains(&sid) || inflight.contains(&sid) || !idle_for(&path, idle) {
             continue;
         }
-        let compressed = path.extension().and_then(|e| e.to_str()) == Some("zst");
-        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        // substance gate: >20KB, or >5 turns (only read small files to count)
-        // Compressed sessions already cleared the legacy Claude pass before sealing.
-        let substantive = compressed
-            || size > 20_480
-            || std::fs::read_to_string(&path)
-                .map(|t| t.trim_end().lines().count() > 5)
-                .unwrap_or(false);
-        if substantive {
+        if substantive(&path) {
             if let Some(dir) = path.parent() {
                 out.push(dir.display().to_string());
             }
@@ -496,6 +539,60 @@ mod tests {
         let all = turns_files(&sessions, true);
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].1, dated.join("turns.jsonl.zst"));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn stuck_classification_covers_every_ledger_state() {
+        let root = std::env::temp_dir().join(format!("plant-stuck-test-{}", std::process::id()));
+        let sessions = root.join("sessions");
+        let day = sessions.join("2026/07/16");
+        let _ = std::fs::remove_dir_all(&root);
+        for (sid, body) in [
+            ("both-ledgered", "{}\n".repeat(6)),   // seal-blocked
+            ("claude-only", "{}\n".repeat(6)),     // half-learned:codex
+            ("codex-only", "{}\n".repeat(6)),      // half-learned:claude
+            ("nobody-big", "{}\n".repeat(6)),      // unlearned (>5 turns => substantive)
+            ("nobody-small", "{}\n".to_string()),  // sub-threshold
+        ] {
+            let d = day.join(sid);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("turns.jsonl"), body).unwrap();
+        }
+        // sealed capture: never reported regardless of ledger state
+        let sealed = day.join("already-sealed");
+        std::fs::create_dir_all(&sealed).unwrap();
+        std::fs::write(sealed.join("turns.jsonl.zst"), "sealed").unwrap();
+        std::fs::create_dir_all(root.join("learnings")).unwrap();
+        std::fs::write(
+            root.join("learnings/.ledger.jsonl"),
+            concat!(
+                "{\"session_id\":\"both-ledgered\"}\n",
+                "{\"session_id\":\"both-ledgered\",\"learner\":\"codex\"}\n",
+                "{\"session_id\":\"claude-only\",\"learner\":\"claude\"}\n",
+                "{\"session_id\":\"codex-only\",\"learner\":\"codex\"}\n",
+            ),
+        )
+        .unwrap();
+
+        let stuck = stuck_captures(&sessions, Duration::ZERO);
+        let state = |sid: &str| {
+            stuck
+                .iter()
+                .find(|s| s.sid == sid)
+                .map(|s| s.state.clone())
+                .unwrap_or_else(|| panic!("{sid} missing from {:?}", stuck.iter().map(|s| &s.sid).collect::<Vec<_>>()))
+        };
+        assert_eq!(state("both-ledgered"), "seal-blocked");
+        assert_eq!(state("claude-only"), "half-learned:codex");
+        assert_eq!(state("codex-only"), "half-learned:claude");
+        assert_eq!(state("nobody-big"), "unlearned");
+        assert_eq!(state("nobody-small"), "sub-threshold");
+        assert!(!stuck.iter().any(|s| s.sid == "already-sealed"));
+
+        // freshly written files are idle ~0s: an age gate must exempt them all
+        assert!(stuck_captures(&sessions, Duration::from_secs(3600)).is_empty());
 
         let _ = std::fs::remove_dir_all(root);
     }

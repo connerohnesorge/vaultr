@@ -1,6 +1,6 @@
-//! Built-in jobs, defined as Rust code in load_jobs()/run_job() below. Compress calls
-//! the sweep directly in-process; learn/learn-codex/reconcile compute a prompt in Rust
-//! and type it into a fresh Herdr pane.
+//! Built-in jobs, defined as Rust code in load_jobs()/run_job() below. Compress,
+//! validate, and watchdog run directly in-process; learn/learn-codex/reconcile compute
+//! a prompt in Rust and type it into a fresh Herdr pane.
 //! The cleanup policy controls whether the job's Herdr workspace is
 //! closed when the run ends; kept workspaces are reclaimed by the next run of the same job.
 //! Outcomes append to ~/.local/state/plant/jobs/<name>.jsonl; the tail line is the
@@ -59,6 +59,7 @@ pub enum Kind {
     Reflect,
     Validate,
     ValidateRepair,
+    Watchdog,
 }
 
 #[derive(Clone)]
@@ -157,6 +158,7 @@ pub fn load_jobs() -> Vec<Job> {
             ..Job::new("reflect", Kind::Reflect, Duration::from_secs(2 * 3600))
         },
         Job::new("validate", Kind::Validate, Duration::from_secs(3600)),
+        Job::new("watchdog", Kind::Watchdog, Duration::from_secs(6 * 3600)),
         Job {
             cli: Some("codex".into()),
             model: Some("gpt-5.6-sol".into()),
@@ -244,6 +246,7 @@ fn prompt(job: &Job) -> Option<String> {
         Kind::Reflect => learnings_updated_since(last_record_ts(&job.name))
             .then(|| "/Vault reflect".to_string()),
         Kind::Validate => None,
+        Kind::Watchdog => None,
         Kind::ValidateRepair => {
             let report = vault_validate()?;
             if report.errors() == 0 {
@@ -296,6 +299,25 @@ fn learnings_updated_since(ts: Option<u64>) -> bool {
 fn vault_validate() -> Option<vaultr::validate::Report> {
     let root = vaultr::validate::content_root(&crate::vault_root()).ok()?;
     vaultr::validate::scan(&root).ok()
+}
+
+/// Outcome + detail for a watchdog run. `failed` means the pipeline owes work it
+/// hasn't done; sub-threshold captures can never seal by design (below learn's
+/// substance gate), so they inform the detail but never fail the job.
+fn watchdog_summary(stuck: &[crate::sweep::StuckCapture]) -> (&'static str, String) {
+    if stuck.is_empty() {
+        return ("success", "no stuck captures".to_string());
+    }
+    let mut counts = std::collections::BTreeMap::new();
+    for s in stuck {
+        *counts.entry(s.state.as_str()).or_insert(0u32) += 1;
+    }
+    let detail: Vec<String> = counts.iter().map(|(k, v)| format!("{v} {k}")).collect();
+    let actionable = stuck.iter().any(|s| s.state != "sub-threshold");
+    (
+        if actionable { "failed" } else { "success" },
+        detail.join(", "),
+    )
 }
 
 fn epoch_now() -> u64 {
@@ -390,6 +412,16 @@ pub async fn run_job(job: &Job, cfg: &Cfg) {
         }
         return;
     }
+    if job.kind == Kind::Watchdog {
+        let stuck =
+            crate::sweep::stuck_captures(&crate::vault_root(), Duration::from_secs(24 * 3600));
+        for s in &stuck {
+            println!("[watchdog] {}: {} (idle {}h)", s.sid, s.state, s.idle_secs / 3600);
+        }
+        let (outcome, detail) = watchdog_summary(&stuck);
+        record(&job.name, outcome, started, &detail);
+        return;
+    }
     let Some(prompt) = prompt(job) else {
         record(&job.name, "skipped", started, "nothing eligible");
         return;
@@ -481,7 +513,11 @@ mod tests {
     #[test]
     fn built_in_jobs_have_expected_shape() {
         let jobs = load_jobs();
-        assert_eq!(jobs.len(), 7);
+        assert_eq!(jobs.len(), 8);
+        let watchdog = by_name("watchdog");
+        assert_eq!(watchdog.kind, Kind::Watchdog);
+        assert!(watchdog.cli.is_none(), "watchdog is in-process, no agent pane");
+        assert_eq!(watchdog.every, Duration::from_secs(6 * 3600));
         let reflect = by_name("reflect");
         assert_eq!(reflect.kind, Kind::Reflect);
         assert_eq!(reflect.cli.as_deref(), Some("claude"));
@@ -522,6 +558,31 @@ mod tests {
             "0".to_string(),
         )]));
         assert_eq!(cleanup_policy(&job, &opt_out), job.cleanup);
+    }
+
+    #[test]
+    fn watchdog_outcome_fails_only_on_actionable_states() {
+        use crate::sweep::StuckCapture;
+        let cap = |state: &str| StuckCapture {
+            sid: format!("sid-{state}"),
+            state: state.to_string(),
+            idle_secs: 90_000,
+        };
+        assert_eq!(watchdog_summary(&[]), ("success", "no stuck captures".to_string()));
+        // sub-threshold alone is informational: counted, but not a failure
+        assert_eq!(
+            watchdog_summary(&[cap("sub-threshold"), cap("sub-threshold")]),
+            ("success", "2 sub-threshold".to_string())
+        );
+        // any actionable state fails, with stable per-state counts in the detail
+        let (outcome, detail) = watchdog_summary(&[
+            cap("seal-blocked"),
+            cap("sub-threshold"),
+            cap("half-learned:codex"),
+            cap("seal-blocked"),
+        ]);
+        assert_eq!(outcome, "failed");
+        assert_eq!(detail, "1 half-learned:codex, 2 seal-blocked, 1 sub-threshold");
     }
 
     #[test]
