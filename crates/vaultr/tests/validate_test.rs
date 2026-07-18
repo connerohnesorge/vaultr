@@ -62,8 +62,12 @@ fn validate_fixture_vault() {
     assert!(errs
         .iter()
         .any(|f| f.kind == "duplicate-slug" && f.detail.contains("good-note")));
-    assert!(errs.iter().any(|f| f.kind == "wikilink" && f.detail.contains("does-not-exist")));
-    assert!(errs.iter().any(|f| f.kind == "mdpath" && f.detail.contains("/learnings/nope.md")));
+    assert!(errs
+        .iter()
+        .any(|f| f.kind == "wikilink" && f.detail.contains("does-not-exist")));
+    assert!(errs
+        .iter()
+        .any(|f| f.kind == "mdpath" && f.detail.contains("/learnings/nope.md")));
     assert!(errs.iter().any(|f| f.kind == "ledger" && f.line == 2));
     assert!(!report.findings.iter().any(|f| {
         f.detail.contains("bin")
@@ -92,7 +96,10 @@ fn preference_pool_cap() {
     let report = validate::scan(root).unwrap();
     assert!(!report.findings.iter().any(|f| f.kind == "preference-pool"));
     // push the pool over 5120 bytes: error
-    let big = format!("---\nname: big\ndescription: d\n---\n{}\n", "x".repeat(5200));
+    let big = format!(
+        "---\nname: big\ndescription: d\n---\n{}\n",
+        "x".repeat(5200)
+    );
     write(root, "preferences/big.md", &big);
     let report = validate::scan(root).unwrap();
     let f = report

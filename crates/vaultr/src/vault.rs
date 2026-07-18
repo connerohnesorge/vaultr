@@ -170,10 +170,12 @@ pub fn walk_session_dirs(root: &Path) -> impl Iterator<Item = (String, PathBuf)>
         read_dirs(&y).into_iter().flat_map(|m| {
             read_dirs(&m).into_iter().flat_map(|d| {
                 // Session ids are UUID-like, so the leaf level takes any dir name.
-                read_dirs_where(&d, |_| true).into_iter().filter_map(|sess| {
-                    let sid = sess.file_name()?.to_str()?.to_string();
-                    Some((sid, sess))
-                })
+                read_dirs_where(&d, |_| true)
+                    .into_iter()
+                    .filter_map(|sess| {
+                        let sid = sess.file_name()?.to_str()?.to_string();
+                        Some((sid, sess))
+                    })
             })
         })
     })
@@ -185,9 +187,7 @@ fn read_dirs_where(path: &Path, keep: fn(&str) -> bool) -> Vec<PathBuf> {
         .map(|rd| {
             rd.flatten()
                 .map(|e| e.path())
-                .filter(|p| {
-                    p.is_dir() && p.file_name().and_then(|n| n.to_str()).is_some_and(keep)
-                })
+                .filter(|p| p.is_dir() && p.file_name().and_then(|n| n.to_str()).is_some_and(keep))
                 .collect()
         })
         .unwrap_or_default();

@@ -428,12 +428,20 @@ mod tests {
             Ok(_) => panic!("missing session identity must be an error"),
             Err(e) => e,
         };
-        assert!(err.contains("no session identity"), "unexpected error: {err}");
+        assert!(
+            err.contains("no session identity"),
+            "unexpected error: {err}"
+        );
 
         // Missing history key: empty append, prefix 0.
         let sid = uuid::Uuid::new_v4().to_string();
-        let p = prepare_capture(&vault, &adapter, captured(Some(&sid)), json!({ "model": "m" }))
-            .unwrap();
+        let p = prepare_capture(
+            &vault,
+            &adapter,
+            captured(Some(&sid)),
+            json!({ "model": "m" }),
+        )
+        .unwrap();
         let d = delta(&p);
         assert_eq!(d["history"]["prefix_length"], 0);
         assert_eq!(d["history"]["append"], json!([]));

@@ -171,7 +171,10 @@ fn common_prefix(a: &[Value], b: &[Value]) -> usize {
 /// everything else is verbatim.
 pub fn encode_delta(prior: &Value, body: &Value, history_key: &str, big_fields: &[&str]) -> Value {
     let empty = vec![];
-    let history = body.get(history_key).and_then(Value::as_array).unwrap_or(&empty);
+    let history = body
+        .get(history_key)
+        .and_then(Value::as_array)
+        .unwrap_or(&empty);
     let prior_history = prior
         .get(history_key)
         .and_then(Value::as_array)
@@ -382,7 +385,7 @@ mod tests {
     }
 
     fn msg(i: u64) -> Value {
-        json!({ "role": if i % 2 == 0 { "user" } else { "assistant" }, "content": format!("m{i}") })
+        json!({ "role": if i.is_multiple_of(2) { "user" } else { "assistant" }, "content": format!("m{i}") })
     }
 
     #[test]
@@ -392,7 +395,9 @@ mod tests {
         // grow, compact, and diverge; big/small fields that change or vanish.
         let mut seed: u64 = 0x9e3779b97f4a7c15;
         let mut rand = move |n: u64| {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (seed >> 33) % n
         };
         let mut prior = json!({});
@@ -422,7 +427,11 @@ mod tests {
             let body = Value::Object(body);
 
             let delta = encode_delta(&prior, &body, "messages", BIG);
-            assert_eq!(apply_body(&prior, &delta, "messages"), body, "prior={prior} body={body} delta={delta}");
+            assert_eq!(
+                apply_body(&prior, &delta, "messages"),
+                body,
+                "prior={prior} body={body} delta={delta}"
+            );
             prior = body;
         }
     }
