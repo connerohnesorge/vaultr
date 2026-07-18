@@ -293,6 +293,7 @@ pub fn stuck_captures(vault: &Path, age: Duration) -> Vec<StuckCapture> {
     let claude = ledger_latest(vault, "claude");
     let codex = ledger_latest(vault, "codex");
     let mut out = vec![];
+    let jobs = job_sids();
     for (sid, path) in turns_files(vault, false) {
         let Some(idle) = idle_secs(&path) else {
             continue;
@@ -300,15 +301,19 @@ pub fn stuck_captures(vault: &Path, age: Duration) -> Vec<StuckCapture> {
         if idle < age.as_secs() {
             continue;
         }
-        let state = match (
-            learned_current(&claude, &sid, &path),
-            learned_current(&codex, &sid, &path),
-        ) {
-            (true, true) => "seal-blocked".to_string(),
-            (true, false) => "half-learned:codex".to_string(),
-            (false, true) => "half-learned:claude".to_string(),
-            (false, false) if substantive(&path) => "unlearned".to_string(),
-            (false, false) => "sub-threshold".to_string(),
+        let state = if jobs.contains(&sid) {
+            "job-capture".to_string() // plant's own agent pane; informational like sub-threshold
+        } else {
+            match (
+                learned_current(&claude, &sid, &path),
+                learned_current(&codex, &sid, &path),
+            ) {
+                (true, true) => "seal-blocked".to_string(),
+                (true, false) => "half-learned:codex".to_string(),
+                (false, true) => "half-learned:claude".to_string(),
+                (false, false) if substantive(&path) => "unlearned".to_string(),
+                (false, false) => "sub-threshold".to_string(),
+            }
         };
         out.push(StuckCapture {
             sid,
@@ -319,12 +324,53 @@ pub fn stuck_captures(vault: &Path, age: Duration) -> Vec<StuckCapture> {
     out
 }
 
+/// Sids of agent panes plant itself launched for scheduled jobs. Learn passes must not
+/// dispatch on these self-captures — a learn pane's own capture fed back into the next
+/// learn run cost a full agent run per learner just to be ledgered "skipped".
+/// `plant agent run` registers the --session-id it hands the claude CLI before launch
+/// (codex assigns conversation ids server-side, so codex self-captures still take the
+/// skill-side skip path — ponytail: revisit if codex ever grows a preset-session flag).
+pub fn job_sids_path() -> PathBuf {
+    crate::jobs::state_dir().join("job-sids.txt")
+}
+
+pub fn job_sids() -> HashSet<String> {
+    job_sids_at(&job_sids_path())
+}
+
+fn job_sids_at(path: &Path) -> HashSet<String> {
+    std::fs::read_to_string(path)
+        .map(|t| {
+            t.lines()
+                .map(str::trim)
+                .filter(|l| !l.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn register_job_sid(sid: &str) {
+    let path = job_sids_path();
+    let _ = std::fs::create_dir_all(path.parent().unwrap());
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(f, "{sid}");
+    }
+}
+
 pub fn eligible_sessions(vault: &Path, idle: Duration, max: usize, learner: &str) -> Vec<String> {
     let processed = ledger_latest(vault, learner);
     let inflight = inflight_sessions(vault, learner);
+    let jobs = job_sids();
     let mut out = vec![];
     for (sid, path) in capture_files(vault) {
-        if learned_current(&processed, &sid, &path)
+        if jobs.contains(&sid)
+            || learned_current(&processed, &sid, &path)
             || inflight.contains(&sid)
             || !idle_for(&path, idle)
         {
@@ -521,12 +567,12 @@ pub async fn compress_sweep(vault: &Path, idle: Duration) -> bool {
     }
     let claude = ledger_latest(vault, "claude");
     let codex = ledger_latest(vault, "codex");
+    let jobs = job_sids();
     let mut sealed = 0u32;
     for (sid, path) in turns_files(vault, false) {
-        if !learned_current(&claude, &sid, &path)
-            || !learned_current(&codex, &sid, &path)
-            || !idle_for(&path, idle)
-        {
+        // job self-captures seal without waiting for learn — they are never dispatched
+        let learned = learned_current(&claude, &sid, &path) && learned_current(&codex, &sid, &path);
+        if !(learned || jobs.contains(&sid)) || !idle_for(&path, idle) {
             continue;
         }
         if !scrub(&path).await {
@@ -868,5 +914,15 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(root);
+    }
+    #[test]
+    fn job_sid_registry_parses_lines() {
+        let f = std::env::temp_dir().join(format!("plant-jobsids-{}", std::process::id()));
+        std::fs::write(&f, "aaa-111\n\n  bbb-222  \n").unwrap();
+        let sids = job_sids_at(&f);
+        assert!(sids.contains("aaa-111") && sids.contains("bbb-222"));
+        assert_eq!(sids.len(), 2);
+        assert!(job_sids_at(Path::new("/nonexistent/registry")).is_empty());
+        let _ = std::fs::remove_file(f);
     }
 }
