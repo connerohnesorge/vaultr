@@ -1,17 +1,21 @@
-//! Built-in jobs, defined as Rust code in load_jobs()/run_job() below. Compress,
-//! validate, and watchdog run directly in-process; learn/learn-codex/reconcile compute
-//! a prompt in Rust and type it into a fresh Herdr pane.
-//! The cleanup policy controls whether the job's Herdr workspace is
-//! closed when the run ends; kept workspaces are reclaimed by the next run of the same job.
+//! SwiftBar-style job scheduler: jobs are bash scripts at
+//! <vault content root>/jobs/<name>.<interval>.sh (e.g. learn.15m.sh). The filename
+//! carries the cadence; the script body does the work itself, composing the plant/vaultr
+//! CLIs (`plant sessions eligible --claim`, `plant agent run`, `vaultr validate`, …).
+//! Agent-backed jobs MUST go through `plant agent run` (Herdr pane orchestration) —
+//! never `claude -p`.
 //! Outcomes append to ~/.local/state/plant/jobs/<name>.jsonl; the tail line is the
-//! scheduling state (due when now - last.ts >= every). Never `claude -p`.
+//! scheduling state (due when now - last.ts >= every). Exit code contract:
+//! 0 = success, 75 = retry next tick without recording (EX_TEMPFAIL, e.g. herdr down),
+//! anything else = failed. The job set is rescanned every tick — edits and interval
+//! renames take effect without a restart.
 
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::herdr::{self, AgentRun, AgentRunOutcome, WorkspaceCleanup};
+use crate::herdr::WorkspaceCleanup;
 
 pub fn state_dir() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/state/plant")
@@ -27,7 +31,7 @@ pub fn state_dir() -> PathBuf {
 pub struct Cfg(HashMap<String, String>);
 
 impl Cfg {
-    pub fn load(vault_sessions: &Path) -> Self {
+    pub fn load(vault_sessions: &std::path::Path) -> Self {
         let mut map = HashMap::new();
         if let Some(f) = vault_sessions.parent().map(|v| v.join(".env")) {
             if let Ok(text) = std::fs::read_to_string(f) {
@@ -48,31 +52,18 @@ impl Cfg {
     pub fn get(&self, key: &str) -> Option<String> {
         std::env::var(key).ok().or_else(|| self.0.get(key).cloned())
     }
+
+    #[cfg(test)]
+    fn from_map(map: HashMap<String, String>) -> Self {
+        Cfg(map)
+    }
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub enum Kind {
-    Compress,
-    Learn,
-    LearnCodex,
-    Reconcile,
-    Reflect,
-    Validate,
-    ValidateRepair,
-    Watchdog,
-}
-
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Job {
     pub name: String,
-    pub kind: Kind,
+    pub path: PathBuf,
     pub every: Duration,
-    pub timeout: Duration,
-    pub cli: Option<String>,
-    pub model: Option<String>,
-    pub args: Option<String>,
-    pub cwd: String,
-    pub cleanup: WorkspaceCleanup,
 }
 
 /// "90s" / "15m" / "2h" / "30d" — single number + unit.
@@ -104,223 +95,80 @@ fn expand_home(v: &str) -> String {
     }
 }
 
-impl Job {
-    fn new(name: &str, kind: Kind, every: Duration) -> Job {
-        Job {
-            name: name.to_string(),
-            kind,
-            every,
-            timeout: Duration::from_secs(45 * 60),
-            cli: None,
-            model: None,
-            args: None,
-            cwd: expand_home("~/.dotfiles"),
-            cleanup: WorkspaceCleanup::Always,
-        }
-    }
-}
-
-const MIN: u64 = 60;
-
-pub fn load_jobs() -> Vec<Job> {
-    vec![
-        Job {
-            timeout: Duration::from_secs(2 * 3600),
-            ..Job::new("compress", Kind::Compress, Duration::from_secs(30 * MIN))
-        },
-        Job {
-            cli: Some("claude".into()),
-            model: Some("opus[1m]".into()),
-            cleanup: WorkspaceCleanup::OnSuccess,
-            ..Job::new("learn", Kind::Learn, Duration::from_secs(15 * MIN))
-        },
-        Job {
-            cli: Some("codex".into()),
-            model: Some("gpt-5.6-sol".into()),
-            args: Some("-c model_reasoning_effort=xhigh".into()),
-            cleanup: WorkspaceCleanup::OnSuccess,
-            ..Job::new(
-                "learn-codex",
-                Kind::LearnCodex,
-                Duration::from_secs(15 * MIN),
-            )
-        },
-        Job {
-            cli: Some("codex".into()),
-            model: Some("gpt-5.6-sol".into()),
-            args: Some("-c model_reasoning_effort=xhigh".into()),
-            ..Job::new("reconcile", Kind::Reconcile, Duration::from_secs(3600))
-        },
-        Job {
-            cli: Some("claude".into()),
-            model: Some("opus[1m]".into()),
-            cleanup: WorkspaceCleanup::OnSuccess,
-            ..Job::new("reflect", Kind::Reflect, Duration::from_secs(2 * 3600))
-        },
-        Job::new("validate", Kind::Validate, Duration::from_secs(3600)),
-        Job::new("watchdog", Kind::Watchdog, Duration::from_secs(6 * 3600)),
-        Job {
-            cli: Some("codex".into()),
-            model: Some("gpt-5.6-sol".into()),
-            // Stop hook injected per-invocation: codex may not stop until the vault
-            // validates clean (the hook script self-limits to 5 continuations)
-            args: Some(format!(
-                "-c model_reasoning_effort=xhigh --dangerously-bypass-hook-trust \
-                 -c 'hooks.Stop=[{{hooks=[{{type=\"command\",command=\"{}\",timeout=120}}]}}]'",
-                stop_hook_path().display()
-            )),
-            cleanup: WorkspaceCleanup::OnSuccess,
-            ..Job::new(
-                "validate-repair",
-                Kind::ValidateRepair,
-                Duration::from_secs(3600),
-            )
-        },
-    ]
-}
-
-fn stop_hook_path() -> PathBuf {
-    state_dir().join("hooks/stop_until_valid.sh")
-}
-
-/// Idempotently (re)write the codex Stop hook script and reset its continuation counter.
-fn write_stop_hook() -> std::io::Result<()> {
-    let path = stop_hook_path();
-    std::fs::create_dir_all(path.parent().unwrap())?;
-    let script = r#"#!/bin/sh
-# plant validate-repair Stop hook: block codex from stopping until the vault validates.
-cf="$HOME/.local/state/plant/hooks/validate-repair.count"
-if vaultr validate >/dev/null 2>&1; then rm -f "$cf"; echo '{}'; exit 0; fi
-n=$(( $(cat "$cf" 2>/dev/null || echo 0) + 1 ))
-echo "$n" > "$cf"
-if [ "$n" -ge 5 ]; then echo '{}'; exit 0; fi
-echo '{"decision":"block","reason":"The vault is still invalid. Run `vaultr validate --json`, fix every remaining error (repair or remove broken [[wikilinks]], fix markdown path links, repair corrupt ledger lines, and for a preference-pool error consolidate vault/preferences/*.md under the byte cap by merging overlapping / shortening verbose / deleting stale preferences — never silently drop one). For intentional literal examples append <!-- vault-validate: ignore --> to that line instead of deleting it. Never touch vault/sessions/ capture data. Stop only when `vaultr validate` exits 0."}'
-"#;
-    std::fs::write(&path, script)?;
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))?;
-    let _ = std::fs::remove_file(state_dir().join("hooks/validate-repair.count"));
-    Ok(())
-}
-
-/// Eligible session dirs for a learner, or None when there's nothing to learn from.
-/// Claims the batch as in-flight (lease expiring `timeout` + slack from now) before
-/// returning, so the next tick can't re-dispatch the same not-yet-ledgered sessions.
-fn eligible(learner: &str, timeout: Duration) -> Option<String> {
-    let vault = crate::vault_root();
-    let list = crate::sweep::eligible_sessions(&vault, Duration::from_secs(3600), 10, learner);
-    let (total, ledgered) = crate::sweep::eligibility_stats(&vault, learner);
-    println!(
-        "[eligible:{learner}] {} of {total} sessions ({ledgered} ledgered)",
-        list.len()
-    );
-    if list.is_empty() {
+/// "learn.15m.sh" -> ("learn", 900s). None for anything that doesn't match
+/// <name>.<interval>.sh exactly (those files are skipped by the scanner).
+pub fn parse_job_filename(file_name: &str) -> Option<(String, Duration)> {
+    let stem = file_name.strip_suffix(".sh")?;
+    let (name, interval) = stem.rsplit_once('.')?;
+    if name.is_empty() {
         return None;
     }
-    let sids: Vec<String> = list
-        .iter()
-        .filter_map(|d| {
-            std::path::Path::new(d)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .map(String::from)
+    Some((name.to_string(), parse_duration(interval)?))
+}
+
+pub fn jobs_dir() -> Option<PathBuf> {
+    vaultr::validate::content_root(&crate::vault_root())
+        .ok()
+        .map(|root| root.join("jobs"))
+}
+
+pub fn load_jobs() -> Vec<Job> {
+    let Some(dir) = jobs_dir() else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut jobs: Vec<Job> = entries
+        .flatten()
+        .filter_map(|e| {
+            let path = e.path();
+            let file_name = path.file_name()?.to_str()?.to_string();
+            let (name, every) = parse_job_filename(&file_name)?;
+            Some(Job { name, path, every })
         })
         .collect();
-    let expires_at = epoch_now() + timeout.as_secs() + 300;
-    crate::sweep::claim_inflight(&vault, learner, &sids, expires_at);
-    Some(list.join(" "))
+    jobs.sort_by(|a, b| a.name.cmp(&b.name));
+    jobs
 }
 
-/// The prompt an agent job types into its Herdr pane; None => nothing to do, skip.
-fn prompt(job: &Job) -> Option<String> {
-    match job.kind {
-        Kind::Compress => None,
-        Kind::Learn => eligible("claude", job.timeout)
-            .map(|dirs| format!("/Vault learn --learner claude {dirs}")),
-        Kind::LearnCodex => eligible("codex", job.timeout).map(|dirs| {
-            format!(
-                "$Vault Learn with `--learner codex` and these session directories as input: {dirs}"
-            )
-        }),
-        Kind::Reconcile => Some("$Vault reconcile".to_string()),
-        Kind::Reflect => learnings_updated_since(last_record_ts(&job.name))
-            .then(|| "/Vault reflect".to_string()),
-        Kind::Validate => None,
-        Kind::Watchdog => None,
-        Kind::ValidateRepair => {
-            let report = vault_validate()?;
-            if report.errors() == 0 {
-                return None;
-            }
-            let errors: Vec<String> = report
-                .findings
-                .iter()
-                .filter(|f| f.severity == vaultr::validate::Severity::Error)
-                .take(50)
-                .map(|f| format!("- {} {}:{} {}", f.kind, f.file, f.line, f.detail))
-                .collect();
-            Some(format!(
-                "The knowledge vault at ~/.dotfiles/vault has {} validation error(s). \
-                 Fix them all: repair or remove broken [[wikilinks]] (prefer repairing the \
-                 target), fix markdown path links, repair corrupt learnings/.ledger.jsonl \
-                 lines; for a preference-pool error consolidate vault/preferences/*.md \
-                 under the byte cap (merge overlapping, shorten verbose, delete stale — \
-                 never silently drop a preference). For intentional literal examples append \
-                 <!-- vault-validate: ignore --> to that line. Never touch vault/sessions/ \
-                 capture data. Re-run `vaultr validate --json` and iterate until it exits 0.\n\
-                 Current errors:\n{}",
-                report.errors(),
-                errors.join("\n")
-            ))
-        }
+/// Panes are kept open by default so failed agent runs stay inspectable; setting
+/// PLANT_KEEP_PANES=0 opts into auto-close honoring the requested cleanup.
+/// Keep-by-default is a recorded product decision (commit 3f9d55e) — do not invert it.
+pub fn cleanup_policy(requested: WorkspaceCleanup, cfg: &Cfg) -> WorkspaceCleanup {
+    if cfg.get("PLANT_KEEP_PANES").as_deref() == Some("0") {
+        requested
+    } else {
+        WorkspaceCleanup::Never
     }
 }
 
-/// New learnings since `ts`? Ledger mtime is the signal — every Learn pass appends to it.
-/// ponytail: skipped/failed reflect records also bump ts, which just means "only re-reflect
-/// once learnings newer than the last attempt exist" — the intended semantics.
-fn learnings_updated_since(ts: Option<u64>) -> bool {
-    let Ok(root) = vaultr::validate::content_root(&crate::vault_root()) else {
-        return false; // rootless sessions path => no ledger to compare against
+/// Launch line for an agent CLI inside a Herdr pane.
+/// `command` bypasses the user's interactive-shell aliases (a `codex='codex --yolo'`
+/// alias duplicated our flag, clap refused, and the prompt got typed into bare zsh).
+pub fn launch_line(cli: &str, model: Option<&str>, args: Option<&str>) -> String {
+    let codex = cli == "codex";
+    let mut s = if codex {
+        // sandboxed codex blocks on its first approval prompt — background panes can't answer
+        "command codex --dangerously-bypass-approvals-and-sandbox".to_string()
+    } else {
+        "command claude --dangerously-skip-permissions".to_string()
     };
-    let ledger = vaultr::validate::ledger_path(&root);
-    let Some(mtime) = std::fs::metadata(&ledger)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-    else {
-        return false; // no ledger => nothing learned yet
-    };
-    ts.is_none_or(|t| mtime > t)
-}
-
-/// Run the vault content validator; None on scan failure (skip this tick).
-fn vault_validate() -> Option<vaultr::validate::Report> {
-    let root = vaultr::validate::content_root(&crate::vault_root()).ok()?;
-    vaultr::validate::scan(&root).ok()
-}
-
-/// Outcome + detail for a watchdog run. `failed` means the pipeline owes work it
-/// hasn't done; sub-threshold captures can never seal by design (below learn's
-/// substance gate), so they inform the detail but never fail the job.
-fn watchdog_summary(stuck: &[crate::sweep::StuckCapture]) -> (&'static str, String) {
-    if stuck.is_empty() {
-        return ("success", "no stuck captures".to_string());
+    if let Some(m) = model {
+        s.push_str(&if codex {
+            format!(" -m '{m}'")
+        } else {
+            format!(" --model='{m}'")
+        });
     }
-    let mut counts = std::collections::BTreeMap::new();
-    for s in stuck {
-        *counts.entry(s.state.as_str()).or_insert(0u32) += 1;
+    if let Some(a) = args {
+        s.push(' ');
+        s.push_str(a);
     }
-    let detail: Vec<String> = counts.iter().map(|(k, v)| format!("{v} {k}")).collect();
-    let actionable = stuck.iter().any(|s| s.state != "sub-threshold");
-    (
-        if actionable { "failed" } else { "success" },
-        detail.join(", "),
-    )
+    s
 }
 
-fn epoch_now() -> u64 {
+pub fn epoch_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -358,94 +206,84 @@ fn record(name: &str, outcome: &str, started: SystemTime, detail: &str) {
     println!("[job:{name}] {outcome} ({detail})");
 }
 
-fn launch_line(job: &Job) -> String {
-    let codex = job.cli.as_deref() == Some("codex");
-    // `command` bypasses the user's interactive-shell aliases (a `codex='codex --yolo'`
-    // alias duplicated our flag, clap refused, and the prompt got typed into bare zsh)
-    let mut s = if codex {
-        // sandboxed codex blocks on its first approval prompt — background panes can't answer
-        "command codex --dangerously-bypass-approvals-and-sandbox".to_string()
-    } else {
-        "command claude --dangerously-skip-permissions".to_string()
-    };
-    if let Some(m) = &job.model {
-        s.push_str(&if codex {
-            format!(" -m '{m}'")
-        } else {
-            format!(" --model='{m}'")
-        });
-    }
-    if let Some(a) = &job.args {
-        s.push(' ');
-        s.push_str(a);
-    }
-    s
-}
-
-/// Panes are kept open by default so failed agent runs stay inspectable; setting
-/// PLANT_KEEP_PANES=0 opts into auto-close honoring the per-job WorkspaceCleanup.
-/// Keep-by-default is a recorded product decision (commit 3f9d55e) — do not invert it.
-fn cleanup_policy(job: &Job, cfg: &Cfg) -> WorkspaceCleanup {
-    if cfg.get("PLANT_KEEP_PANES").as_deref() == Some("0") {
-        job.cleanup
-    } else {
-        WorkspaceCleanup::Never
+/// Exit status -> ledger outcome. None = don't record, retry next tick (75/EX_TEMPFAIL
+/// mirrors the old herdr-Unavailable behavior; a killed process has no code => failed).
+fn outcome_for(code: Option<i32>) -> Option<&'static str> {
+    match code {
+        Some(0) => Some("success"),
+        Some(75) => None,
+        _ => Some("failed"),
     }
 }
 
-pub async fn run_job(job: &Job, cfg: &Cfg) {
+/// PATH for job scripts: launchd's env is minimal, so prepend the running binary's
+/// own dir (plant) and the Home Manager profile bin (vaultr, jq, bash deps).
+fn script_path_env() -> String {
+    let mut parts = Vec::new();
+    if let Some(dir) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.display().to_string()))
+    {
+        parts.push(dir);
+    }
+    parts.push(expand_home("~/.nix-profile/bin"));
+    parts.push("/usr/bin:/bin".to_string());
+    if let Ok(p) = std::env::var("PATH") {
+        parts.push(p);
+    }
+    parts.join(":")
+}
+
+fn tail_line(text: &str) -> Option<String> {
+    text.lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .map(|l| l.chars().take(300).collect())
+}
+
+/// Runaway backstop only — scripts own their real timeouts (passed to `plant agent run`).
+const SCRIPT_BACKSTOP: Duration = Duration::from_secs(3 * 3600);
+
+pub async fn run_job(job: &Job) {
     let started = SystemTime::now();
-    if job.kind == Kind::Compress {
-        let ok =
-            crate::sweep::compress_sweep(&crate::vault_root(), Duration::from_secs(3600)).await;
-        let outcome = if ok { "success" } else { "failed" };
-        record(&job.name, outcome, started, "compress sweep");
-        return;
-    }
-    if job.kind == Kind::Validate {
-        match vault_validate() {
-            Some(report) => {
-                let outcome = if report.errors() == 0 { "success" } else { "failed" };
-                record(&job.name, outcome, started, &report.summary());
-            }
-            None => record(&job.name, "failed", started, "vault scan failed"),
-        }
-        return;
-    }
-    if job.kind == Kind::Watchdog {
-        let stuck =
-            crate::sweep::stuck_captures(&crate::vault_root(), Duration::from_secs(24 * 3600));
-        for s in &stuck {
-            println!("[watchdog] {}: {} (idle {}h)", s.sid, s.state, s.idle_secs / 3600);
-        }
-        let (outcome, detail) = watchdog_summary(&stuck);
-        record(&job.name, outcome, started, &detail);
-        return;
-    }
-    let Some(prompt) = prompt(job) else {
-        record(&job.name, "skipped", started, "nothing eligible");
-        return;
-    };
-    if job.kind == Kind::ValidateRepair {
-        if let Err(e) = write_stop_hook() {
-            record(&job.name, "failed", started, &format!("stop hook write: {e}"));
+    let mut cmd = tokio::process::Command::new("/bin/bash");
+    cmd.arg(&job.path)
+        .current_dir(expand_home("~/.dotfiles"))
+        .env("PATH", script_path_env())
+        .env(
+            "PLANT_LAST_TS",
+            last_record_ts(&job.name).unwrap_or(0).to_string(),
+        )
+        .kill_on_drop(true)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            record(&job.name, "failed", started, &format!("spawn: {e}"));
             return;
         }
-    }
-    let agent_run = AgentRun {
-        label: format!("job-{}", job.name),
-        cwd: job.cwd.clone(),
-        launch: launch_line(job),
-        prompt,
-        timeout: job.timeout,
-        cleanup: cleanup_policy(job, cfg),
     };
-    match herdr::run_agent(agent_run).await {
-        AgentRunOutcome::Unavailable => {
-            println!("[job:{}] herdr down, retry next tick", job.name)
+    let out = match tokio::time::timeout(SCRIPT_BACKSTOP, child.wait_with_output()).await {
+        Ok(Ok(out)) => out,
+        Ok(Err(e)) => {
+            record(&job.name, "failed", started, &format!("wait: {e}"));
+            return;
         }
-        AgentRunOutcome::Succeeded(detail) => record(&job.name, "success", started, &detail),
-        AgentRunOutcome::Failed(detail) => record(&job.name, "failed", started, &detail),
+        Err(_) => {
+            // kill_on_drop reaped the child when the future was dropped by timeout
+            record(&job.name, "failed", started, "killed: 3h backstop");
+            return;
+        }
+    };
+    let detail = tail_line(&String::from_utf8_lossy(&out.stdout))
+        .or_else(|| tail_line(&String::from_utf8_lossy(&out.stderr)))
+        .unwrap_or_else(|| "no output".to_string());
+    match outcome_for(out.status.code()) {
+        Some(outcome) => record(&job.name, outcome, started, &detail),
+        None => println!("[job:{}] retry next tick ({detail})", job.name),
     }
 }
 
@@ -458,21 +296,30 @@ pub async fn scheduler(cfg: Cfg) {
         .get("PLANT_JOBS_MAX_CONCURRENT")
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
-    let jobs = load_jobs();
-    println!(
-        "[jobs] scheduler: {} job(s) [{}], cap {cap}",
-        jobs.len(),
-        jobs.iter()
-            .map(|j| j.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
     let sem = Arc::new(tokio::sync::Semaphore::new(cap));
     let running: Arc<Mutex<HashSet<String>>> = Default::default();
-    let cfg = Arc::new(cfg);
+    let mut last_seen: Option<Vec<String>> = None;
     tokio::time::sleep(Duration::from_secs(15)).await; // startup settle
     loop {
-        for job in load_jobs() {
+        let jobs = load_jobs();
+        let names: Vec<String> = jobs.iter().map(|j| j.name.clone()).collect();
+        if last_seen.as_ref() != Some(&names) {
+            match jobs_dir() {
+                Some(dir) if jobs.is_empty() => {
+                    println!(
+                        "[jobs] NO job scripts at {} — nothing scheduled",
+                        dir.display()
+                    )
+                }
+                _ => println!(
+                    "[jobs] {} job(s) [{}], cap {cap}",
+                    jobs.len(),
+                    names.join(", ")
+                ),
+            }
+            last_seen = Some(names);
+        }
+        for job in jobs {
             if running.lock().unwrap().contains(&job.name) {
                 continue;
             }
@@ -482,10 +329,10 @@ pub async fn scheduler(cfg: Cfg) {
                 continue;
             }
             running.lock().unwrap().insert(job.name.clone());
-            let (sem, running, cfg) = (sem.clone(), running.clone(), cfg.clone());
+            let (sem, running) = (sem.clone(), running.clone());
             tokio::spawn(async move {
                 let _permit = sem.acquire().await;
-                run_job(&job, &cfg).await;
+                run_job(&job).await;
                 running.lock().unwrap().remove(&job.name);
             });
         }
@@ -497,99 +344,92 @@ pub async fn scheduler(cfg: Cfg) {
 mod tests {
     use super::*;
 
-    fn by_name(name: &str) -> Job {
-        load_jobs().into_iter().find(|j| j.name == name).unwrap()
+    #[test]
+    fn job_filenames_parse_name_and_interval() {
+        assert_eq!(
+            parse_job_filename("learn.15m.sh"),
+            Some(("learn".to_string(), Duration::from_secs(15 * 60)))
+        );
+        assert_eq!(
+            parse_job_filename("learn-codex.15m.sh"),
+            Some(("learn-codex".to_string(), Duration::from_secs(15 * 60)))
+        );
+        assert_eq!(
+            parse_job_filename("compress.30m.sh"),
+            Some(("compress".to_string(), Duration::from_secs(30 * 60)))
+        );
+        assert_eq!(
+            parse_job_filename("watchdog.6h.sh"),
+            Some(("watchdog".to_string(), Duration::from_secs(6 * 3600)))
+        );
+        // dotted names keep everything before the final interval segment
+        assert_eq!(
+            parse_job_filename("a.b.2h.sh"),
+            Some(("a.b".to_string(), Duration::from_secs(2 * 3600)))
+        );
+        for bad in [
+            "README.md",
+            "noninterval.sh",
+            "bad.xx.sh",
+            ".15m.sh",
+            "learn.15m",
+        ] {
+            assert_eq!(parse_job_filename(bad), None, "{bad} should not parse");
+        }
     }
 
     #[test]
-    fn codex_learn_job_uses_requested_model_and_effort() {
-        let job = by_name("learn-codex");
-        assert_eq!(job.cli.as_deref(), Some("codex"));
-        assert_eq!(job.model.as_deref(), Some("gpt-5.6-sol"));
-        assert_eq!(job.args.as_deref(), Some("-c model_reasoning_effort=xhigh"));
-        assert_eq!(job.cleanup, WorkspaceCleanup::OnSuccess);
-    }
-
-    #[test]
-    fn built_in_jobs_have_expected_shape() {
-        let jobs = load_jobs();
-        assert_eq!(jobs.len(), 8);
-        let watchdog = by_name("watchdog");
-        assert_eq!(watchdog.kind, Kind::Watchdog);
-        assert!(watchdog.cli.is_none(), "watchdog is in-process, no agent pane");
-        assert_eq!(watchdog.every, Duration::from_secs(6 * 3600));
-        let reflect = by_name("reflect");
-        assert_eq!(reflect.kind, Kind::Reflect);
-        assert_eq!(reflect.cli.as_deref(), Some("claude"));
-        assert_eq!(reflect.model.as_deref(), Some("opus[1m]"));
-        assert_eq!(reflect.every, Duration::from_secs(2 * 3600));
-        assert_eq!(reflect.cleanup, WorkspaceCleanup::OnSuccess);
-        assert_eq!(by_name("validate").kind, Kind::Validate);
-        let repair = by_name("validate-repair");
-        assert_eq!(repair.cli.as_deref(), Some("codex"));
-        let args = repair.args.unwrap();
-        assert!(args.contains("--dangerously-bypass-hook-trust"));
-        assert!(args.contains("hooks.Stop="));
-        assert!(args.contains("stop_until_valid.sh"));
-        assert_eq!(by_name("compress").kind, Kind::Compress);
-        assert_eq!(by_name("learn").cleanup, WorkspaceCleanup::OnSuccess);
-        assert_eq!(by_name("reconcile").cleanup, WorkspaceCleanup::Always);
-        assert_eq!(by_name("reconcile").every, Duration::from_secs(3600));
+    fn exit_codes_map_to_ledger_outcomes() {
+        assert_eq!(outcome_for(Some(0)), Some("success"));
+        assert_eq!(outcome_for(Some(75)), None, "EX_TEMPFAIL retries silently");
+        assert_eq!(outcome_for(Some(1)), Some("failed"));
+        assert_eq!(outcome_for(Some(2)), Some("failed"));
+        assert_eq!(outcome_for(None), Some("failed"), "signal-killed = failed");
     }
 
     #[test]
     fn launch_line_bypasses_shell_aliases() {
-        assert!(launch_line(&by_name("learn-codex")).starts_with("command codex "));
-        assert!(launch_line(&by_name("learn")).starts_with("command claude "));
+        assert_eq!(
+            launch_line(
+                "codex",
+                Some("gpt-5.6-sol"),
+                Some("-c model_reasoning_effort=xhigh")
+            ),
+            "command codex --dangerously-bypass-approvals-and-sandbox -m 'gpt-5.6-sol' \
+             -c model_reasoning_effort=xhigh"
+        );
+        assert_eq!(
+            launch_line("claude", Some("opus[1m]"), None),
+            "command claude --dangerously-skip-permissions --model='opus[1m]'"
+        );
     }
 
     #[test]
     fn cleanup_policy_keeps_panes_unless_cfg_opts_out() {
         // Guard: real-env PLANT_KEEP_PANES would shadow the map (Cfg checks env first).
         assert!(std::env::var("PLANT_KEEP_PANES").is_err());
-        let job = by_name("learn");
-        assert_eq!(job.cleanup, WorkspaceCleanup::OnSuccess);
         // Default (key absent anywhere): panes kept, per commit 3f9d55e.
-        let keep = Cfg(HashMap::new());
-        assert_eq!(cleanup_policy(&job, &keep), WorkspaceCleanup::Never);
-        // vault/.env fallback opts into the per-job policy, same as the real env.
-        let opt_out = Cfg(HashMap::from([(
+        let keep = Cfg::from_map(HashMap::new());
+        assert_eq!(
+            cleanup_policy(WorkspaceCleanup::OnSuccess, &keep),
+            WorkspaceCleanup::Never
+        );
+        // vault/.env fallback opts into the requested policy, same as the real env.
+        let opt_out = Cfg::from_map(HashMap::from([(
             "PLANT_KEEP_PANES".to_string(),
             "0".to_string(),
         )]));
-        assert_eq!(cleanup_policy(&job, &opt_out), job.cleanup);
-    }
-
-    #[test]
-    fn watchdog_outcome_fails_only_on_actionable_states() {
-        use crate::sweep::StuckCapture;
-        let cap = |state: &str| StuckCapture {
-            sid: format!("sid-{state}"),
-            state: state.to_string(),
-            idle_secs: 90_000,
-        };
-        assert_eq!(watchdog_summary(&[]), ("success", "no stuck captures".to_string()));
-        // sub-threshold alone is informational: counted, but not a failure
         assert_eq!(
-            watchdog_summary(&[cap("sub-threshold"), cap("sub-threshold")]),
-            ("success", "2 sub-threshold".to_string())
+            cleanup_policy(WorkspaceCleanup::OnSuccess, &opt_out),
+            WorkspaceCleanup::OnSuccess
         );
-        // any actionable state fails, with stable per-state counts in the detail
-        let (outcome, detail) = watchdog_summary(&[
-            cap("seal-blocked"),
-            cap("sub-threshold"),
-            cap("half-learned:codex"),
-            cap("seal-blocked"),
-        ]);
-        assert_eq!(outcome, "failed");
-        assert_eq!(detail, "1 half-learned:codex, 2 seal-blocked, 1 sub-threshold");
     }
 
     #[test]
-    fn reconcile_prompt_is_static_and_compress_has_none() {
-        let reconcile = Job::new("reconcile", Kind::Reconcile, Duration::from_secs(3600));
-        let compress = Job::new("compress", Kind::Compress, Duration::from_secs(3600));
-        assert_eq!(prompt(&reconcile).as_deref(), Some("$Vault reconcile"));
-        assert_eq!(prompt(&compress), None);
+    fn tail_line_picks_last_nonempty_and_truncates() {
+        assert_eq!(tail_line("a\nb\n\n  \n"), Some("b".to_string()));
+        assert_eq!(tail_line(""), None);
+        let long = format!("first\n{}", "x".repeat(400));
+        assert_eq!(tail_line(&long).unwrap().len(), 300);
     }
 }
