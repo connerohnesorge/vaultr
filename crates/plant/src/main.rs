@@ -32,11 +32,16 @@ fn vault_root() -> PathBuf {
     })
 }
 
-/// `plant sessions eligible [--learner claude|codex] [--idle 60m] [--max 10]`,
+/// `plant sessions eligible [--learner claude|codex] [--idle 60m] [--max 10] [--claim [50m]]`
+/// (--claim leases the printed batch in-flight so a concurrent call can't re-dispatch it),
 /// `plant sessions stuck [--age 24h]` (stuck-capture report; exit 1 on actionable
-/// findings), `plant compress once [--idle 60m]`, and `plant jobs run <name>` (manual
-/// trigger of a built-in job; the Herdr workspace stays open after the run unless
-/// PLANT_KEEP_PANES=0 opts into the per-job cleanup policy — see jobs::cleanup_policy).
+/// findings), `plant compress once [--idle 60m]`, `plant jobs run <name>` (manual
+/// trigger of a vault/jobs script), and `plant agent run --cli claude|codex [--model M]
+/// [--args '…'] [--label L] [--cleanup always|on-success|never] [--timeout 45m] [--cwd D]`
+/// with the prompt on stdin — the ONLY sanctioned way for job scripts to drive an agent
+/// (Herdr pane orchestration; never `claude -p`). Exit: 0 succeeded, 75 herdr
+/// unavailable (retry later), 1 failed. Requested --cleanup is honored only when
+/// PLANT_KEEP_PANES=0 opts in — see jobs::cleanup_policy.
 async fn subcommand(argv: &[String]) -> Option<i32> {
     let flag = |name: &str| {
         argv.iter()
@@ -61,6 +66,24 @@ async fn subcommand(argv: &[String]) -> Option<i32> {
             );
             if list.is_empty() {
                 return Some(1);
+            }
+            if let Some(i) = argv.iter().position(|a| a == "--claim") {
+                let lease = argv
+                    .get(i + 1)
+                    .and_then(|v| jobs::parse_duration(v))
+                    .unwrap_or(Duration::from_secs(50 * 60));
+                let sids: Vec<String> = list
+                    .iter()
+                    .filter_map(|d| {
+                        PathBuf::from(d)
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .map(String::from)
+                    })
+                    .collect();
+                // same slack the old in-Rust scheduler added past the job timeout
+                let expires_at = jobs::epoch_now() + lease.as_secs() + 300;
+                sweep::claim_inflight(&vault_root(), &learner, &sids, expires_at);
             }
             println!("{}", list.join(" "));
             Some(0)
@@ -90,11 +113,66 @@ async fn subcommand(argv: &[String]) -> Option<i32> {
             let name = argv.get(3).cloned().unwrap_or_default();
             match jobs::load_jobs().into_iter().find(|j| j.name == name) {
                 Some(job) => {
-                    jobs::run_job(&job, &jobs::Cfg::load(&vault_root())).await;
+                    jobs::run_job(&job).await;
                     Some(0)
                 }
                 None => {
-                    eprintln!("unknown job '{name}'");
+                    eprintln!(
+                        "unknown job '{name}' (scripts: {})",
+                        jobs::load_jobs()
+                            .iter()
+                            .map(|j| j.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    );
+                    Some(1)
+                }
+            }
+        }
+        (Some("agent"), Some("run")) => {
+            let Some(cli) = flag("--cli") else {
+                eprintln!("agent run: --cli claude|codex is required");
+                return Some(1);
+            };
+            let mut prompt = String::new();
+            use std::io::Read;
+            if std::io::stdin().read_to_string(&mut prompt).is_err() || prompt.trim().is_empty() {
+                eprintln!("agent run: prompt expected on stdin");
+                return Some(1);
+            }
+            let requested = match flag("--cleanup").as_deref() {
+                Some("always") => herdr::WorkspaceCleanup::Always,
+                Some("on-success") => herdr::WorkspaceCleanup::OnSuccess,
+                _ => herdr::WorkspaceCleanup::Never,
+            };
+            let run = herdr::AgentRun {
+                label: flag("--label").unwrap_or_else(|| "agent".to_string()),
+                cwd: flag("--cwd").unwrap_or_else(|| {
+                    format!("{}/.dotfiles", std::env::var("HOME").unwrap_or_default())
+                }),
+                launch: jobs::launch_line(
+                    &cli,
+                    flag("--model").as_deref(),
+                    flag("--args").as_deref(),
+                ),
+                prompt: prompt.trim().to_string(),
+                timeout: flag("--timeout")
+                    .and_then(|v| jobs::parse_duration(&v))
+                    .unwrap_or(Duration::from_secs(45 * 60)),
+                cleanup: jobs::cleanup_policy(requested, &jobs::Cfg::load(&vault_root())),
+            };
+            let label = run.label.clone();
+            match herdr::run_agent(run).await {
+                herdr::AgentRunOutcome::Succeeded(detail) => {
+                    println!("[agent:{label}] succeeded: {detail}");
+                    Some(0)
+                }
+                herdr::AgentRunOutcome::Unavailable => {
+                    println!("[agent:{label}] herdr unavailable");
+                    Some(75)
+                }
+                herdr::AgentRunOutcome::Failed(detail) => {
+                    println!("[agent:{label}] failed: {detail}");
                     Some(1)
                 }
             }
