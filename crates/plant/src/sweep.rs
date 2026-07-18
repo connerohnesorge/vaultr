@@ -560,6 +560,45 @@ async fn seal_file(raw: &Path) -> Result<(), String> {
     }
 }
 
+/// Sealed captures above this stay on disk but out of git: a 2.7GB .zst blob turned
+/// the vault push into a multi-hour hang (2026-07-18, codex session with
+/// zstd-encoded bodies the outer seal couldn't shrink).
+/// ponytail: fixed 256MB; make it a Cfg key if a legitimate capture ever needs pushing.
+const COMMIT_CAP: u64 = 256 * 1024 * 1024;
+
+/// Append `sealed` to the vault repo's .gitignore so `git add -A sessions` skips it.
+/// Idempotent; the capture data itself is never touched (append-only rule).
+fn exclude_from_commit(vault: &Path, sealed: &Path, size: u64) {
+    let Ok(root) = vaultr::validate::content_root(vault) else {
+        return;
+    };
+    let Ok(rel) = sealed.strip_prefix(&root) else {
+        return;
+    };
+    let line = rel.display().to_string();
+    let gi = root.join(".gitignore");
+    let existing = std::fs::read_to_string(&gi).unwrap_or_default();
+    if existing.lines().any(|l| l.trim() == line) {
+        return;
+    }
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&gi)
+    {
+        let _ = writeln!(
+            f,
+            "# oversized seal (auto, {:.1}GB): kept on disk, excluded from git\n{line}",
+            size as f64 / 1e9
+        );
+        println!(
+            "[compress] {line}: {:.1}GB exceeds commit cap, gitignored",
+            size as f64 / 1e9
+        );
+    }
+}
+
 pub async fn compress_sweep(vault: &Path, idle: Duration) -> bool {
     if !which("zstd") {
         eprintln!("[compress] zstd not on PATH");
@@ -593,6 +632,9 @@ pub async fn compress_sweep(vault: &Path, idle: Duration) -> bool {
                 let after = std::fs::metadata(format!("{path_s}.zst"))
                     .map(|m| m.len())
                     .unwrap_or(0);
+                if after > COMMIT_CAP {
+                    exclude_from_commit(vault, &seal_sibling(&path), after);
+                }
                 let rel = path_s.split("/sessions/").nth(1).unwrap_or(&path_s);
                 println!(
                     "[compress] {rel}: {:.1}MB -> {:.1}MB",
@@ -924,5 +966,29 @@ mod tests {
         assert_eq!(sids.len(), 2);
         assert!(job_sids_at(Path::new("/nonexistent/registry")).is_empty());
         let _ = std::fs::remove_file(f);
+    }
+    #[test]
+    fn oversized_seal_is_gitignored_idempotently() {
+        let root = std::env::temp_dir().join(format!("plant-cap-test-{}", std::process::id()));
+        let sessions = root.join("sessions");
+        let dir = sessions.join("2026/07/18/big-one");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sealed = dir.join("turns.jsonl.zst");
+        std::fs::write(&sealed, "blob").unwrap();
+
+        exclude_from_commit(&sessions, &sealed, 2_700_000_000);
+        exclude_from_commit(&sessions, &sealed, 2_700_000_000); // idempotent
+        let gi = std::fs::read_to_string(root.join(".gitignore")).unwrap();
+        let line = "sessions/2026/07/18/big-one/turns.jsonl.zst";
+        assert_eq!(
+            gi.matches(line).count(),
+            1,
+            "exactly one ignore line:\n{gi}"
+        );
+        assert!(gi.contains("2.7GB"));
+        assert!(sealed.is_file(), "capture data never touched");
+
+        let _ = std::fs::remove_dir_all(root);
     }
 }
