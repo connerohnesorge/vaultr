@@ -3,7 +3,7 @@
 //! eligible` / `plant compress once` subcommands and called directly by the built-in Rust jobs.
 //! Every failure path non-fatal: capture uptime is sacred. All heavy work shells out.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -99,8 +99,10 @@ fn which(bin: &str) -> bool {
         .any(|dir| Path::new(dir).join(bin).is_file())
 }
 
-fn ledger_sessions(vault: &Path, learner: &str) -> HashSet<String> {
-    let mut processed = HashSet::new();
+/// sid -> latest `processed_at` (epoch secs; 0 when the entry has none) for `learner`.
+/// Entries without a `learner` key are the legacy Claude pass.
+fn ledger_latest(vault: &Path, learner: &str) -> HashMap<String, u64> {
+    let mut processed = HashMap::new();
     let Ok(root) = vaultr::validate::content_root(vault) else {
         return processed; // rootless sessions path => nothing ledgered; non-fatal
     };
@@ -110,13 +112,67 @@ fn ledger_sessions(vault: &Path, learner: &str) -> HashSet<String> {
                 let recorded = v.get("learner").and_then(|s| s.as_str());
                 if recorded == Some(learner) || (recorded.is_none() && learner == "claude") {
                     if let Some(sid) = v.get("session_id").and_then(|s| s.as_str()) {
-                        processed.insert(sid.to_string());
+                        let ts = v
+                            .get("processed_at")
+                            .and_then(|s| s.as_str())
+                            .and_then(iso_to_epoch)
+                            .unwrap_or(0);
+                        let e = processed.entry(sid.to_string()).or_insert(0);
+                        *e = (*e).max(ts);
                     }
                 }
             }
         }
     }
     processed
+}
+
+/// "2026-07-14T15:08:26Z" (fractional seconds tolerated) -> epoch secs.
+fn iso_to_epoch(s: &str) -> Option<u64> {
+    let b = s.as_bytes();
+    if b.len() < 19 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
+    let (y, m, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    let (hh, mm, ss) = (num(11..13)?, num(14..16)?, num(17..19)?);
+    // days-from-civil (Howard Hinnant): valid for all post-1970 dates we ledger
+    let (y, m) = if m <= 2 { (y - 1, m + 12) } else { (y, m) };
+    let era = y / 400;
+    let yoe = y - era * 400;
+    let doy = (153 * (m - 3) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    u64::try_from(days * 86_400 + hh * 3600 + mm * 60 + ss).ok()
+}
+
+/// The sealed sibling (`turns.jsonl` -> `turns.jsonl.zst`) of a raw capture file.
+fn seal_sibling(raw: &Path) -> PathBuf {
+    let name = raw.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    raw.with_file_name(format!("{name}.zst"))
+}
+
+/// Has `learner` learned the *current* content behind `path`? Plain contains-check,
+/// except for a raw file with a sealed sibling — a session resumed after sealing —
+/// where the ledger entry only counts if it postdates the sealed content (zstd
+/// preserves the source mtime, so the .zst mtime is the last write of what was
+/// learned+sealed). Sealed-only and never-sealed paths keep the historic semantics:
+/// pre-existing ledger entries stay valid and history is never re-opened.
+fn learned_current(latest: &HashMap<String, u64>, sid: &str, path: &Path) -> bool {
+    let Some(&ts) = latest.get(sid) else {
+        return false;
+    };
+    if path.extension().and_then(|e| e.to_str()) == Some("zst") {
+        return true;
+    }
+    match std::fs::metadata(seal_sibling(path))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+    {
+        None => true, // no prior seal: any entry covers the file
+        Some(sealed) => ts > sealed.as_secs(),
+    }
 }
 
 fn epoch_now() -> u64 {
@@ -128,7 +184,10 @@ fn epoch_now() -> u64 {
 
 fn inflight_path(vault: &Path, learner: &str) -> Option<PathBuf> {
     let root = vaultr::validate::content_root(vault).ok()?;
-    Some(root.join("learnings").join(format!(".inflight-{learner}.json")))
+    Some(
+        root.join("learnings")
+            .join(format!(".inflight-{learner}.json")),
+    )
 }
 
 /// Sessions a still-running learn pass has claimed for `learner`, if the lease hasn't
@@ -151,7 +210,11 @@ fn inflight_sessions(vault: &Path, learner: &str) -> HashSet<String> {
     }
     v.get("sids")
         .and_then(|s| s.as_array())
-        .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -197,7 +260,9 @@ fn idle_secs(path: &Path) -> Option<u64> {
 }
 
 fn idle_for(path: &Path, idle: Duration) -> bool {
-    idle_secs(path).map(|s| s >= idle.as_secs()).unwrap_or(false)
+    idle_secs(path)
+        .map(|s| s >= idle.as_secs())
+        .unwrap_or(false)
 }
 
 /// Learn substance gate: >20KB, or >5 turns (only read small files to count).
@@ -225,15 +290,20 @@ pub struct StuckCapture {
 /// under current rules (learn skips them, sealing needs both ledgers) — reported so the
 /// gap stays visible, but callers treat them as informational, not actionable.
 pub fn stuck_captures(vault: &Path, age: Duration) -> Vec<StuckCapture> {
-    let claude = ledger_sessions(vault, "claude");
-    let codex = ledger_sessions(vault, "codex");
+    let claude = ledger_latest(vault, "claude");
+    let codex = ledger_latest(vault, "codex");
     let mut out = vec![];
     for (sid, path) in turns_files(vault, false) {
-        let Some(idle) = idle_secs(&path) else { continue };
+        let Some(idle) = idle_secs(&path) else {
+            continue;
+        };
         if idle < age.as_secs() {
             continue;
         }
-        let state = match (claude.contains(&sid), codex.contains(&sid)) {
+        let state = match (
+            learned_current(&claude, &sid, &path),
+            learned_current(&codex, &sid, &path),
+        ) {
             (true, true) => "seal-blocked".to_string(),
             (true, false) => "half-learned:codex".to_string(),
             (false, true) => "half-learned:claude".to_string(),
@@ -250,11 +320,14 @@ pub fn stuck_captures(vault: &Path, age: Duration) -> Vec<StuckCapture> {
 }
 
 pub fn eligible_sessions(vault: &Path, idle: Duration, max: usize, learner: &str) -> Vec<String> {
-    let processed = ledger_sessions(vault, learner);
+    let processed = ledger_latest(vault, learner);
     let inflight = inflight_sessions(vault, learner);
     let mut out = vec![];
     for (sid, path) in capture_files(vault) {
-        if processed.contains(&sid) || inflight.contains(&sid) || !idle_for(&path, idle) {
+        if learned_current(&processed, &sid, &path)
+            || inflight.contains(&sid)
+            || !idle_for(&path, idle)
+        {
             continue;
         }
         if substantive(&path) {
@@ -272,7 +345,7 @@ pub fn eligible_sessions(vault: &Path, idle: Duration, max: usize, learner: &str
 pub fn eligibility_stats(vault: &Path, learner: &str) -> (usize, usize) {
     (
         capture_files(vault).len(),
-        ledger_sessions(vault, learner).len(),
+        ledger_latest(vault, learner).len(),
     )
 }
 
@@ -389,16 +462,71 @@ pub async fn scrub(path: &Path) -> bool {
     true
 }
 
+/// Seal `raw` into its `.zst` sibling and remove `raw`. When the sibling already exists
+/// (a session resumed after sealing), the new frame is APPENDED — concatenated zstd
+/// frames are a valid stream that zstdcat reads transparently, so both generations
+/// survive losslessly in chronological order. Atomic: the merged file is assembled in a
+/// temp sibling and renamed over the destination; the raw file is only removed after.
+/// The destination mtime is set to the raw's mtime (as `zstd` itself would), because
+/// learned_current uses it as the generation boundary.
+async fn seal_file(raw: &Path) -> Result<(), String> {
+    let dest = seal_sibling(raw);
+    let raw_mtime = std::fs::metadata(raw)
+        .and_then(|m| m.modified())
+        .map_err(|e| format!("stat: {e}"))?;
+    let frame = raw.with_extension("frame-tmp");
+    let raw_s = raw.display().to_string();
+    let frame_s = frame.display().to_string();
+    let zstd = run(
+        &["zstd", "-19", "-T0", "-q", "-f", "-o", &frame_s, &raw_s],
+        Duration::from_secs(600),
+    )
+    .await;
+    if !zstd.ok {
+        let _ = std::fs::remove_file(&frame);
+        return Err(zstd.failure_detail());
+    }
+    let merged = raw.with_extension("zst-tmp");
+    let assemble = (|| -> std::io::Result<()> {
+        let mut out = std::fs::File::create(&merged)?;
+        if dest.is_file() {
+            std::io::copy(&mut std::fs::File::open(&dest)?, &mut out)?;
+        }
+        std::io::copy(&mut std::fs::File::open(&frame)?, &mut out)?;
+        out.sync_all()?;
+        std::fs::rename(&merged, &dest)?;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&dest)?
+            .set_modified(raw_mtime)?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(&frame);
+    match assemble {
+        Ok(()) => {
+            std::fs::remove_file(raw).map_err(|e| format!("rm raw: {e}"))?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&merged);
+            Err(e.to_string())
+        }
+    }
+}
+
 pub async fn compress_sweep(vault: &Path, idle: Duration) -> bool {
     if !which("zstd") {
         eprintln!("[compress] zstd not on PATH");
         return false;
     }
-    let claude = ledger_sessions(vault, "claude");
-    let codex = ledger_sessions(vault, "codex");
+    let claude = ledger_latest(vault, "claude");
+    let codex = ledger_latest(vault, "codex");
     let mut sealed = 0u32;
     for (sid, path) in turns_files(vault, false) {
-        if !claude.contains(&sid) || !codex.contains(&sid) || !idle_for(&path, idle) {
+        if !learned_current(&claude, &sid, &path)
+            || !learned_current(&codex, &sid, &path)
+            || !idle_for(&path, idle)
+        {
             continue;
         }
         if !scrub(&path).await {
@@ -408,41 +536,27 @@ pub async fn compress_sweep(vault: &Path, idle: Duration) -> bool {
         let path_s = path.display().to_string();
         let herdr = path.with_file_name("herdr.jsonl");
         if herdr.is_file() {
-            let herdr_s = herdr.display().to_string();
-            let zstd = run(
-                &["zstd", "-19", "-T0", "-q", "--rm", &herdr_s],
-                Duration::from_secs(600),
-            )
-            .await;
-            if !zstd.ok {
-                eprintln!(
-                    "[compress] {sid}: herdr.jsonl seal skipped ({}); next sweep retries",
-                    zstd.failure_detail()
-                );
+            if let Err(e) = seal_file(&herdr).await {
+                eprintln!("[compress] {sid}: herdr.jsonl seal skipped ({e}); next sweep retries");
                 continue;
             }
         }
-        let zstd = run(
-            &["zstd", "-19", "-T0", "-q", "--rm", &path_s],
-            Duration::from_secs(600),
-        )
-        .await;
-        if zstd.ok {
-            sealed += 1;
-            let after = std::fs::metadata(format!("{path_s}.zst"))
-                .map(|m| m.len())
-                .unwrap_or(0);
-            let rel = path_s.split("/sessions/").nth(1).unwrap_or(&path_s);
-            println!(
-                "[compress] {rel}: {:.1}MB -> {:.1}MB",
-                before as f64 / 1e6,
-                after as f64 / 1e6
-            );
-        } else {
-            eprintln!(
-                "[compress] {sid}: turns.jsonl seal skipped ({}); next sweep retries",
-                zstd.failure_detail()
-            );
+        match seal_file(&path).await {
+            Ok(()) => {
+                sealed += 1;
+                let after = std::fs::metadata(format!("{path_s}.zst"))
+                    .map(|m| m.len())
+                    .unwrap_or(0);
+                let rel = path_s.split("/sessions/").nth(1).unwrap_or(&path_s);
+                println!(
+                    "[compress] {rel}: {:.1}MB -> {:.1}MB",
+                    before as f64 / 1e6,
+                    after as f64 / 1e6
+                );
+            }
+            Err(e) => {
+                eprintln!("[compress] {sid}: turns.jsonl seal skipped ({e}); next sweep retries");
+            }
         }
     }
     if sealed > 0 {
@@ -522,7 +636,12 @@ mod tests {
         std::fs::create_dir_all(&dated).unwrap();
         std::fs::write(dated.join("turns.jsonl"), "{}\n").unwrap();
         // Non-date dirs at various levels: must never be descended into.
-        for bogus in [".meta/2026/07", "notes/07/16", "2026/backup/16", "2026/07/.tmp"] {
+        for bogus in [
+            ".meta/2026/07",
+            "notes/07/16",
+            "2026/backup/16",
+            "2026/07/.tmp",
+        ] {
             let d = sessions.join(bogus).join("phantom-session");
             std::fs::create_dir_all(&d).unwrap();
             std::fs::write(d.join("turns.jsonl"), "{}\n").unwrap();
@@ -550,11 +669,11 @@ mod tests {
         let day = sessions.join("2026/07/16");
         let _ = std::fs::remove_dir_all(&root);
         for (sid, body) in [
-            ("both-ledgered", "{}\n".repeat(6)),   // seal-blocked
-            ("claude-only", "{}\n".repeat(6)),     // half-learned:codex
-            ("codex-only", "{}\n".repeat(6)),      // half-learned:claude
-            ("nobody-big", "{}\n".repeat(6)),      // unlearned (>5 turns => substantive)
-            ("nobody-small", "{}\n".to_string()),  // sub-threshold
+            ("both-ledgered", "{}\n".repeat(6)),  // seal-blocked
+            ("claude-only", "{}\n".repeat(6)),    // half-learned:codex
+            ("codex-only", "{}\n".repeat(6)),     // half-learned:claude
+            ("nobody-big", "{}\n".repeat(6)),     // unlearned (>5 turns => substantive)
+            ("nobody-small", "{}\n".to_string()), // sub-threshold
         ] {
             let d = day.join(sid);
             std::fs::create_dir_all(&d).unwrap();
@@ -582,7 +701,12 @@ mod tests {
                 .iter()
                 .find(|s| s.sid == sid)
                 .map(|s| s.state.clone())
-                .unwrap_or_else(|| panic!("{sid} missing from {:?}", stuck.iter().map(|s| &s.sid).collect::<Vec<_>>()))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{sid} missing from {:?}",
+                        stuck.iter().map(|s| &s.sid).collect::<Vec<_>>()
+                    )
+                })
         };
         assert_eq!(state("both-ledgered"), "seal-blocked");
         assert_eq!(state("claude-only"), "half-learned:codex");
@@ -612,7 +736,10 @@ mod tests {
 
         // tick 1: not ledgered, not leased -> eligible (this is the dispatch that runs)
         let first = eligible_sessions(&sessions, Duration::ZERO, 10, "claude");
-        assert!(first.iter().any(|p| p.ends_with(sid)), "un-ledgered session should be eligible");
+        assert!(
+            first.iter().any(|p| p.ends_with(sid)),
+            "un-ledgered session should be eligible"
+        );
 
         // that dispatch claims the batch in-flight for the pass's lifetime
         claim_inflight(&sessions, "claude", &[sid.to_string()], epoch_now() + 3600);
@@ -625,9 +752,120 @@ mod tests {
         );
 
         // an expired lease (crashed/zombie pass) must self-heal, not wedge forever
-        claim_inflight(&sessions, "claude", &[sid.to_string()], epoch_now().saturating_sub(1));
+        claim_inflight(
+            &sessions,
+            "claude",
+            &[sid.to_string()],
+            epoch_now().saturating_sub(1),
+        );
         let after = eligible_sessions(&sessions, Duration::ZERO, 10, "claude");
-        assert!(after.iter().any(|p| p.ends_with(sid)), "expired lease must stop excluding");
+        assert!(
+            after.iter().any(|p| p.ends_with(sid)),
+            "expired lease must stop excluding"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+    #[test]
+    fn iso_to_epoch_parses_ledger_timestamps() {
+        assert_eq!(iso_to_epoch("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(iso_to_epoch("2000-01-01T00:00:00Z"), Some(946_684_800));
+        // fractional seconds tolerated (ignored)
+        assert_eq!(iso_to_epoch("2000-01-01T00:00:00.123Z"), Some(946_684_800));
+        assert_eq!(iso_to_epoch("not a date"), None);
+        assert_eq!(iso_to_epoch(""), None);
+    }
+
+    /// A session resumed after sealing: raw turns.jsonl beside turns.jsonl.zst. A ledger
+    /// entry only covers the resumed content if it postdates the sealed generation
+    /// (.zst mtime); older entries mean the learner never saw the new turns.
+    #[test]
+    fn resumed_session_is_relearned_per_generation() {
+        let root = std::env::temp_dir().join(format!("plant-resume-test-{}", std::process::id()));
+        let sessions = root.join("sessions");
+        let sid = "resumed-after-seal";
+        let dir = sessions.join("2026/07/14").join(sid);
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("turns.jsonl"), "{}\n".repeat(6)).unwrap();
+        std::fs::write(dir.join("turns.jsonl.zst"), "gen1-sealed").unwrap();
+        // seal boundary: 2026-07-14T17:42:41Z
+        let sealed_at = 1_784_050_961u64;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("turns.jsonl.zst"))
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(sealed_at))
+            .unwrap();
+        std::fs::create_dir_all(root.join("learnings")).unwrap();
+        // claude ledgered BEFORE the seal boundary, codex AFTER it
+        std::fs::write(
+            root.join("learnings/.ledger.jsonl"),
+            format!(
+                concat!(
+                    "{{\"session_id\":\"{sid}\",\"processed_at\":\"2026-07-14T15:08:26Z\"}}\n",
+                    "{{\"session_id\":\"{sid}\",\"learner\":\"codex\",",
+                    "\"processed_at\":\"2026-07-16T18:53:27Z\"}}\n"
+                ),
+                sid = sid
+            ),
+        )
+        .unwrap();
+
+        // watchdog: codex covered the resumed generation, claude did not
+        let stuck = stuck_captures(&sessions, Duration::ZERO);
+        let entry = stuck.iter().find(|s| s.sid == sid).expect("reported stuck");
+        assert_eq!(entry.state, "half-learned:claude");
+
+        // eligibility mirrors that: claude re-learns, codex does not
+        let claude = eligible_sessions(&sessions, Duration::ZERO, 10, "claude");
+        let codex = eligible_sessions(&sessions, Duration::ZERO, 10, "codex");
+        assert!(claude.iter().any(|p| p.ends_with(sid)));
+        assert!(!codex.iter().any(|p| p.ends_with(sid)));
+
+        // a sealed-only capture (no raw) keeps historic semantics: entry counts as-is
+        assert!(learned_current(
+            &ledger_latest(&sessions, "claude"),
+            sid,
+            &dir.join("turns.jsonl.zst")
+        ));
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Sealing a resumed session appends a second zstd frame; zstd -d reads the
+    /// concatenation back as gen1 + gen2. Requires zstd on PATH (skips otherwise).
+    #[tokio::test]
+    async fn seal_file_appends_frames_for_resumed_sessions() {
+        if !which("zstd") {
+            eprintln!("zstd not on PATH; skipping");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("plant-seal-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let raw = root.join("turns.jsonl");
+        let dest = seal_sibling(&raw);
+
+        std::fs::write(&raw, "gen1-line\n").unwrap();
+        seal_file(&raw).await.expect("first seal");
+        assert!(!raw.exists(), "raw removed after seal");
+        assert!(dest.is_file());
+
+        // resume: raw reappears with new content only
+        std::fs::write(&raw, "gen2-line\n").unwrap();
+        seal_file(&raw).await.expect("merge seal");
+        assert!(!raw.exists());
+
+        let out = std::process::Command::new("zstd")
+            .args(["-d", "-c", dest.to_str().unwrap()])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "gen1-line\ngen2-line\n",
+            "both generations survive in order"
+        );
 
         let _ = std::fs::remove_dir_all(root);
     }
