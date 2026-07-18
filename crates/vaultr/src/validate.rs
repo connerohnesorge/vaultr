@@ -198,7 +198,11 @@ pub fn scan(content_root: &Path) -> Result<Report> {
                 .entry(stem.to_string())
                 .or_default()
                 .push(dir.to_string());
-            all.push((format!("{dir}/{}", path.file_name().unwrap().to_string_lossy()), path, dir));
+            all.push((
+                format!("{dir}/{}", path.file_name().unwrap().to_string_lossy()),
+                path,
+                dir,
+            ));
         }
     }
     for path in md_files(content_root) {
@@ -397,12 +401,10 @@ pub fn scan(content_root: &Path) -> Result<Report> {
 
 fn looks_like_uuid(s: &str) -> bool {
     s.len() == 36
-        && s.chars()
-            .enumerate()
-            .all(|(i, c)| match i {
-                8 | 13 | 18 | 23 => c == '-',
-                _ => c.is_ascii_hexdigit(),
-            })
+        && s.chars().enumerate().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_hexdigit(),
+        })
 }
 
 /// CLI entry: print report, return process exit code.

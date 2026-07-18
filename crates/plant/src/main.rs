@@ -96,11 +96,17 @@ async fn subcommand(argv: &[String]) -> Option<i32> {
             for s in &stuck {
                 println!("{} {} idle={}h", s.state, s.sid, s.idle_secs / 3600);
             }
-            Some(if stuck.iter().any(|s| s.state != "sub-threshold") {
-                1
-            } else {
-                0
-            })
+            // sub-threshold can never seal by design; job-capture is plant's own pane
+            Some(
+                if stuck
+                    .iter()
+                    .any(|s| s.state != "sub-threshold" && s.state != "job-capture")
+                {
+                    1
+                } else {
+                    0
+                },
+            )
         }
         (Some("compress"), Some("once")) => {
             Some(if sweep::compress_sweep(&vault_root(), idle).await {
@@ -145,16 +151,22 @@ async fn subcommand(argv: &[String]) -> Option<i32> {
                 Some("on-success") => herdr::WorkspaceCleanup::OnSuccess,
                 _ => herdr::WorkspaceCleanup::Never,
             };
+            // Pre-register the claude session id so learn passes never dispatch on this
+            // pane's own capture (a learn-over-learn run per learner, per capture).
+            // Codex assigns conversation ids server-side — nothing to register.
+            let mut launch =
+                jobs::launch_line(&cli, flag("--model").as_deref(), flag("--args").as_deref());
+            if cli == "claude" {
+                let sid = uuid::Uuid::new_v4().to_string();
+                sweep::register_job_sid(&sid);
+                launch.push_str(&format!(" --session-id '{sid}'"));
+            }
             let run = herdr::AgentRun {
                 label: flag("--label").unwrap_or_else(|| "agent".to_string()),
                 cwd: flag("--cwd").unwrap_or_else(|| {
                     format!("{}/.dotfiles", std::env::var("HOME").unwrap_or_default())
                 }),
-                launch: jobs::launch_line(
-                    &cli,
-                    flag("--model").as_deref(),
-                    flag("--args").as_deref(),
-                ),
+                launch,
                 prompt: prompt.trim().to_string(),
                 timeout: flag("--timeout")
                     .and_then(|v| jobs::parse_duration(&v))
