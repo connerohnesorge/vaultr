@@ -118,10 +118,7 @@ async fn subcommand(argv: &[String]) -> Option<i32> {
         (Some("jobs"), Some("run")) => {
             let name = argv.get(3).cloned().unwrap_or_default();
             match jobs::load_jobs().into_iter().find(|j| j.name == name) {
-                Some(job) => {
-                    jobs::run_job(&job).await;
-                    Some(0)
-                }
+                Some(job) => Some(jobs::run_job(&job).await),
                 None => {
                     eprintln!(
                         "unknown job '{name}' (scripts: {})",
