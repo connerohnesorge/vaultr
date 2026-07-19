@@ -327,9 +327,10 @@ pub fn stuck_captures(vault: &Path, age: Duration) -> Vec<StuckCapture> {
 /// Sids of agent panes plant itself launched for scheduled jobs. Learn passes must not
 /// dispatch on these self-captures — a learn pane's own capture fed back into the next
 /// learn run cost a full agent run per learner just to be ledgered "skipped".
-/// `plant agent run` registers the --session-id it hands the claude CLI before launch
-/// (codex assigns conversation ids server-side, so codex self-captures still take the
-/// skill-side skip path — ponytail: revisit if codex ever grows a preset-session flag).
+/// `plant agent run` registers the --session-id it hands the claude CLI before launch;
+/// for codex (server-assigned conversation ids) `run_agent` reads the id herdr reports
+/// for the pane once the run finishes and registers it, so both harnesses are excluded
+/// before dispatch — no content-heuristic skip in the learn skill.
 pub fn job_sids_path() -> PathBuf {
     crate::jobs::state_dir().join("job-sids.txt")
 }

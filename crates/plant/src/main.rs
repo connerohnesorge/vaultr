@@ -189,9 +189,11 @@ async fn subcommand(argv: &[String]) -> Option<i32> {
                 Some("on-success") => herdr::WorkspaceCleanup::OnSuccess,
                 _ => herdr::WorkspaceCleanup::Never,
             };
-            // Pre-register the claude session id so learn passes never dispatch on this
-            // pane's own capture (a learn-over-learn run per learner, per capture).
-            // Codex assigns conversation ids server-side — nothing to register.
+            // Keep learn passes from dispatching on this pane's own capture (a
+            // learn-over-learn run per learner, per capture). Claude sids are ours to
+            // mint, so preset + register before launch. Codex assigns conversation ids
+            // server-side, so run_agent discovers and registers the id herdr reports for
+            // the pane once the run finishes (discover_session_id below).
             let mut launch =
                 jobs::launch_line(&cli, flag("--model").as_deref(), flag("--args").as_deref());
             if cli == "claude" {
@@ -210,6 +212,7 @@ async fn subcommand(argv: &[String]) -> Option<i32> {
                     .and_then(|v| jobs::parse_duration(&v))
                     .unwrap_or(Duration::from_secs(45 * 60)),
                 cleanup: jobs::cleanup_policy(requested, &jobs::Cfg::load(&vault_root())),
+                discover_session_id: cli == "codex",
             };
             let label = run.label.clone();
             match herdr::run_agent(run).await {

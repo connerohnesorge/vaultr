@@ -126,6 +126,21 @@ pub struct AgentRun {
     pub prompt: String,
     pub timeout: Duration,
     pub cleanup: WorkspaceCleanup,
+    /// Claude sids are preset + registered before launch; codex conversation ids are
+    /// server-assigned, so for codex we read the id herdr reports for this pane once the
+    /// run finishes and register it, keeping learn from dispatching on the self-capture.
+    pub discover_session_id: bool,
+}
+
+/// The agent_session id herdr reports for `pane_id`, if any. herdr surfaces the same
+/// value the wireproxy files the capture under (see `maybe_snapshot` correlation), so
+/// registering it as a job sid matches the capture in learn eligibility.
+fn pick_session_id(panes: &[Pane], pane_id: &str) -> Option<String> {
+    panes
+        .iter()
+        .find(|p| p.pane_id == pane_id)
+        .and_then(|p| p.agent_session.as_ref())
+        .map(|s| s.value.clone())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -392,6 +407,30 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
     }
     .await;
 
+    // Register this pane's self-capture before cleanup can close it, so no learn pass
+    // ever dispatches on plant's own housekeeping run. Claude preset its sid pre-launch;
+    // codex ids are only knowable now, from what herdr reports for the pane.
+    if agent_run.discover_session_id {
+        if let Some(pane) = &pane_id {
+            let mut registered = None;
+            for _ in 0..3 {
+                if let Some(sid) = pane_list().await.and_then(|p| pick_session_id(&p, pane)) {
+                    crate::sweep::register_job_sid(&sid);
+                    registered = Some(sid);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+            match registered {
+                Some(sid) => println!("[herdr:{}] registered job self-capture {sid}", agent_run.label),
+                None => eprintln!(
+                    "[herdr:{}] no agent_session id for pane {pane}; self-capture may reach learn",
+                    agent_run.label
+                ),
+            }
+        }
+    }
+
     if should_cleanup(agent_run.cleanup, &outcome) {
         if let Some(id) = &workspace_id {
             close_workspace(id).await;
@@ -547,6 +586,14 @@ mod tests {
         assert_eq!(pane.pane_id, "w1:p1");
         assert_eq!(pane.agent.as_deref(), Some("codex"));
 
+        // codex self-capture discovery: the pane's server-assigned session id is picked
+        // by pane_id, and an unknown/agentless pane yields nothing to register.
+        assert_eq!(
+            pick_session_id(&panes.result.panes, "w1:p1").as_deref(),
+            Some("session-1")
+        );
+        assert_eq!(pick_session_id(&panes.result.panes, "nope"), None);
+
         let workspaces: WorkspaceListReply = serde_json::from_str(
             r#"{"result":{"workspaces":[{"workspace_id":"w1","label":"job-smoke","focused":false,"agent_status":"idle"}]}}"#,
         )
@@ -589,6 +636,7 @@ mod tests {
             prompt: "Reply with exactly HERDR_LIFECYCLE_SMOKE_OK and do not use tools.".into(),
             timeout: Duration::from_secs(120),
             cleanup: WorkspaceCleanup::Always,
+            discover_session_id: false,
         })
         .await;
 
