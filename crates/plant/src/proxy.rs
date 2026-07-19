@@ -208,8 +208,14 @@ async fn handle(req: Request<hyper::body::Incoming>, ctx: Arc<ProxyCtx>) -> Resp
                     started_at,
                 };
                 drop(decoded);
-                capture::prepare_capture(&ctx.vault, adapter, req_info, body)
+                Ok((req_info, body))
             });
+        let prepared = match prepared {
+            Ok((req_info, body)) => {
+                capture::prepare_capture(&ctx.vault, adapter, req_info, body).await
+            }
+            Err(e) => Err(e),
+        };
         capture::release_memory();
         match prepared {
             Ok(p) => Some(p),
@@ -273,7 +279,7 @@ async fn handle(req: Request<hyper::body::Incoming>, ctx: Arc<ProxyCtx>) -> Resp
         };
         ctx2.otel
             .record(&ctx2.adapter, pending.model.as_deref(), &pending.req, &resp);
-        if let Err(e) = capture::finish_capture(&ctx2.vault, &ctx2.adapter, pending, &resp) {
+        if let Err(e) = capture::finish_capture(&ctx2.vault, &ctx2.adapter, pending, &resp).await {
             eprintln!("capture failed: {e}");
         }
         capture::release_memory();
