@@ -16,11 +16,18 @@
           # both workspace binaries (vaultr + plant) install into $out/bin
           doCheck = false;
         };
+        # Bun/TypeScript door library, imported by door-*.ts job scripts.
+        # Plain source copy: bun runs .ts directly, nothing to build.
+        door-lib = pkgs.runCommand "vaultr-door" { } ''
+          mkdir -p $out/lib
+          cp -r ${self}/ts/vaultr-door $out/lib/vaultr-door
+        '';
       in {
         packages = {
           default = workspace;
           vaultr = workspace;
           plant = workspace;
+          inherit door-lib;
         };
         apps = {
           vaultr = { type = "app"; program = "${workspace}/bin/vaultr"; };

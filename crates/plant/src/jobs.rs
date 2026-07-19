@@ -1,6 +1,8 @@
-//! SwiftBar-style job scheduler: jobs are bash scripts at
-//! <vault content root>/jobs/<name>.<interval>.sh (e.g. learn.15m.sh). The filename
-//! carries the cadence; the script body does the work itself, composing the plant/vaultr
+//! SwiftBar-style job scheduler: jobs are executable scripts at
+//! <vault content root>/jobs/<name>.<interval>.<ext> (e.g. learn.15m.sh,
+//! door-oncall.30m.ts). The filename carries the cadence; the script is exec'd
+//! directly, so its shebang picks the interpreter (bash, bun, …) — Plant maps no
+//! extensions. The script body does the work itself, composing the plant/vaultr
 //! CLIs (`plant sessions eligible --claim`, `plant agent run`, `vaultr validate`, …).
 //! Agent-backed jobs MUST go through `plant agent run` (Herdr pane orchestration) —
 //! never `claude -p`.
@@ -95,10 +97,13 @@ fn expand_home(v: &str) -> String {
     }
 }
 
-/// "learn.15m.sh" -> ("learn", 900s). None for anything that doesn't match
-/// <name>.<interval>.sh exactly (those files are skipped by the scanner).
+/// "learn.15m.sh" -> ("learn", 900s). Extension-agnostic: anything matching
+/// <name>.<interval>.<ext>. None otherwise (those files are skipped by the scanner).
 pub fn parse_job_filename(file_name: &str) -> Option<(String, Duration)> {
-    let stem = file_name.strip_suffix(".sh")?;
+    let (stem, ext) = file_name.rsplit_once('.')?;
+    if ext.is_empty() {
+        return None;
+    }
     let (name, interval) = stem.rsplit_once('.')?;
     if name.is_empty() {
         return None;
@@ -247,9 +252,10 @@ const SCRIPT_BACKSTOP: Duration = Duration::from_secs(3 * 3600);
 
 pub async fn run_job(job: &Job) -> i32 {
     let started = SystemTime::now();
-    let mut cmd = tokio::process::Command::new("/bin/bash");
-    cmd.arg(&job.path)
-        .current_dir(expand_home("~/.dotfiles"))
+    // Exec the script directly: the shebang picks the interpreter. A missing
+    // shebang or exec bit fails at spawn (ENOEXEC/EACCES) and is recorded below.
+    let mut cmd = tokio::process::Command::new(&job.path);
+    cmd.current_dir(expand_home("~/.dotfiles"))
         .env("PATH", script_path_env())
         .env(
             "PLANT_LAST_TS",
@@ -372,6 +378,11 @@ mod tests {
         assert_eq!(
             parse_job_filename("a.b.2h.sh"),
             Some(("a.b".to_string(), Duration::from_secs(2 * 3600)))
+        );
+        // extension-agnostic: shebang picks the interpreter, not Plant
+        assert_eq!(
+            parse_job_filename("door-oncall.30m.ts"),
+            Some(("door-oncall".to_string(), Duration::from_secs(30 * 60)))
         );
         for bad in [
             "README.md",

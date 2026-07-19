@@ -1,0 +1,33 @@
+# Plant Agent Jobs — Delta
+
+## ADDED Requirements
+
+### Requirement: Polyglot shebang job execution
+
+Plant MUST discover jobs as executable files matching
+`<name>.<interval>.<ext>` for any extension and MUST execute each job by
+exec'ing its path directly so the script's shebang selects the interpreter.
+Plant MUST NOT hardwire or map interpreters per extension.
+
+#### Scenario: TypeScript job runs via its shebang
+
+- WHEN `door-oncall.30m.ts` is executable with a `#!/usr/bin/env bun` shebang
+- THEN the scanner registers it with a 30-minute cadence
+- AND Plant executes it directly, with Bun chosen by the shebang
+
+#### Scenario: Non-job files are skipped
+
+- WHEN a file in the jobs directory lacks an interval segment (e.g. `AGENTS.md`)
+- THEN the scanner skips it, as today
+
+#### Scenario: Shebang-less scripts keep working
+
+- WHEN an executable job has no shebang
+- THEN the OS exec fallback runs it via `/bin/sh`
+- AND legacy shell jobs need no migration
+
+#### Scenario: Unspawnable job fails visibly
+
+- WHEN a job cannot be spawned (e.g. missing execute permission)
+- THEN Plant records a failed attempt with the spawn error in the job ledger
+- AND the scheduler continues unaffected
