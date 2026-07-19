@@ -103,7 +103,10 @@ async fn subcommand(argv: &[String]) -> Option<i32> {
                         c.in_window_native - c.missing.len(),
                         c.in_window_native,
                     );
-                    println!("  window_start={} carryover={}", c.window_start, c.carryover);
+                    println!(
+                        "  window_start={} carryover={}",
+                        c.window_start, c.carryover
+                    );
                     if c.captured > c.in_window_native {
                         // captured envelopes with no in-window native match (e.g. pre-window
                         // boundary or non-transcript calls) — informational, not loss.
@@ -301,6 +304,14 @@ async fn main() {
     }));
 
     let vault = vault_root();
+
+    // Recover ordered-capture journals and staged Envelopes BEFORE binding ports
+    // or arming the scheduler (which may seal). Failing closed preserves evidence.
+    if let Err(e) = capture::recover_all(&vault) {
+        eprintln!("[plant] capture recovery failed: {e}");
+        record_exit(started, "exit:1");
+        std::process::exit(1);
+    }
 
     let otel = Arc::new(otel::Otel::new());
     let client = http_client();

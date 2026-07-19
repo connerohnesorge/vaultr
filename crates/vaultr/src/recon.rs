@@ -39,6 +39,7 @@ impl Harness {
 }
 
 /// Result of reconstructing a capture.
+#[derive(Debug)]
 pub struct Recon {
     /// History key seen on the wire: "messages" (Anthropic) or "input" (Codex).
     pub key: String,
@@ -81,46 +82,80 @@ pub fn reconstruct(path: &Path) -> Result<Recon> {
                 File::open(sealed).with_context(|| format!("open {}", sealed.display()))?;
             let raw = File::open(raw).with_context(|| format!("open {}", raw.display()))?;
             let dec = zstd::Decoder::new(sealed).context("zstd decoder")?;
-            return reconstruct_reader(dec.chain(raw));
+            // Sealed generation is strict; the trailing raw generation is the
+            // live tail (one unterminated final fragment tolerated). Shared state
+            // so the raw deltas continue the sealed history.
+            let mut st = ReconState::new();
+            run_segment(BufReader::new(dec), Segment::Sealed, &mut st)?;
+            run_segment(BufReader::new(raw), Segment::LiveRaw, &mut st)?;
+            return Ok(st.finish());
         }
     }
 
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut st = ReconState::new();
     if path.extension().and_then(|e| e.to_str()) == Some("zst") {
+        // A lone sealed capture is fully terminated: strict.
         let dec = zstd::Decoder::new(file).context("zstd decoder")?;
-        reconstruct_reader(dec)
+        run_segment(BufReader::new(dec), Segment::Sealed, &mut st)?;
     } else {
-        reconstruct_reader(file)
+        run_segment(BufReader::new(file), Segment::LiveRaw, &mut st)?;
+    }
+    Ok(st.finish())
+}
+
+/// Streaming core over any reader — treated as a single live raw segment (one
+/// unterminated final fragment tolerated). Public for callers that already hold
+/// a reader; path-based [`reconstruct`] distinguishes sealed vs raw strictness.
+pub fn reconstruct_reader<R: Read>(reader: R) -> Result<Recon> {
+    let mut st = ReconState::new();
+    run_segment(BufReader::new(reader), Segment::LiveRaw, &mut st)?;
+    Ok(st.finish())
+}
+
+/// A capture segment: `Sealed` records are final and MUST fully parse; `LiveRaw`
+/// is the growing tail where exactly one unterminated final fragment is ignored.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Segment {
+    Sealed,
+    LiveRaw,
+}
+
+impl Segment {
+    fn label(self) -> &'static str {
+        match self {
+            Segment::Sealed => "sealed",
+            Segment::LiveRaw => "raw",
+        }
     }
 }
 
-/// Streaming core: line-by-line over any reader.
-pub fn reconstruct_reader<R: Read>(reader: R) -> Result<Recon> {
-    let mut lines = BufReader::new(reader);
-    let mut msgs: Vec<Value> = Vec::new();
-    let mut hash_dict: HashMap<String, Value> = HashMap::new();
-    let mut key = String::from("messages");
-    let mut harness: Option<Harness> = None;
-    let mut trailing: Vec<Value> = Vec::new();
-    let mut envelopes = 0usize;
-    let mut buf = String::new();
+/// Accumulated reconstruction state, shared across a capture's segments.
+struct ReconState {
+    msgs: Vec<Value>,
+    hash_dict: HashMap<String, Value>,
+    key: String,
+    harness: Option<Harness>,
+    trailing: Vec<Value>,
+    envelopes: usize,
+}
 
-    loop {
-        buf.clear();
-        let n = lines.read_line(&mut buf)?;
-        if n == 0 {
-            break;
+impl ReconState {
+    fn new() -> Self {
+        ReconState {
+            msgs: Vec::new(),
+            hash_dict: HashMap::new(),
+            key: String::from("messages"),
+            harness: None,
+            trailing: Vec::new(),
+            envelopes: 0,
         }
-        let line = buf.trim();
-        if line.is_empty() {
-            continue;
-        }
-        // A truncated live-tail final line fails to parse — ignore it (and any
-        // other malformed line), snapshotting through the last complete envelope.
-        let Ok(env) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        envelopes += 1;
+    }
+
+    /// Apply one parsed Envelope value: derive harness, track its (possibly
+    /// final) completed response as the trailing output, and replay its delta.
+    fn apply(&mut self, env: &Value) {
+        self.envelopes += 1;
         // Derive harness identity once, envelope-first: the envelope field is
         // the captured wire truth; key == "input" resolves Codex only while
         // no envelope has said otherwise.
@@ -129,59 +164,120 @@ pub fn reconstruct_reader<R: Read>(reader: R) -> Result<Recon> {
             .and_then(Value::as_str)
             .and_then(Harness::from_label)
         {
-            Some(h) => harness = Some(h),
+            Some(h) => self.harness = Some(h),
             None => {
-                if harness.is_none()
+                if self.harness.is_none()
                     && env
                         .pointer("/request/body_delta/history/key")
                         .and_then(Value::as_str)
                         == Some("input")
                 {
-                    harness = Some(Harness::Codex);
+                    self.harness = Some(Harness::Codex);
                 }
             }
         }
         // The response of every envelope *before* the last is reflected in the
         // next request's history delta; only the final envelope's completed
         // response needs appending. Track it per-envelope, keeping only the last.
-        trailing = extract_response_output(&env, harness);
+        self.trailing = extract_response_output(env, self.harness);
         // Codex stamps each replayed item with the turn it belongs to; the
         // request-side items of this turn carry it already (baked into the
         // wire), but the response-side items we append here don't — add it so
         // a fork's resume replays them byte-identically to a native resume.
-        if harness == Some(Harness::Codex) {
+        if self.harness == Some(Harness::Codex) {
             if let Some(turn_id) = env.get("turn_id").and_then(Value::as_str) {
-                for item in &mut trailing {
+                for item in &mut self.trailing {
                     if let Some(o) = item.as_object_mut() {
                         o.insert(
                             "internal_chat_message_metadata_passthrough".into(),
-                            serde_json::json!({"turn_id": turn_id}),
+                            serde_json::json!({ "turn_id": turn_id }),
                         );
                     }
                 }
             }
         }
 
-        let Some(h) = env.pointer("/request/body_delta/history") else {
-            continue;
-        };
-        if let Some(k) = h.get("key").and_then(Value::as_str) {
-            key = k.to_string();
+        if let Some(h) = env.pointer("/request/body_delta/history") {
+            if let Some(k) = h.get("key").and_then(Value::as_str) {
+                self.key = k.to_string();
+            }
+            apply_delta(h, &mut self.msgs, &mut self.hash_dict);
         }
-        apply_delta(h, &mut msgs, &mut hash_dict);
     }
 
-    let history_len = msgs.len();
-    let trailing_appended = trailing.len();
-    msgs.extend(trailing);
-    Ok(Recon {
-        key,
-        harness,
-        history_len,
-        messages: msgs,
-        trailing_appended,
-        envelopes,
-    })
+    fn finish(mut self) -> Recon {
+        let history_len = self.msgs.len();
+        let trailing_appended = self.trailing.len();
+        self.msgs.extend(self.trailing);
+        Recon {
+            key: self.key,
+            harness: self.harness,
+            history_len,
+            messages: self.msgs,
+            trailing_appended,
+            envelopes: self.envelopes,
+        }
+    }
+}
+
+/// Process one segment record-by-record. A physical record is the bytes up to a
+/// newline (the final record may be unterminated). Each record may hold one or
+/// more concatenated complete Envelope JSON values (a historical concurrent-write
+/// artifact) followed by optional whitespace — every complete value is applied.
+/// Whitespace-only records contribute nothing. Non-whitespace residue that
+/// cannot form complete Envelopes fails with the segment and one-based record
+/// number (never echoing content), except one unterminated final fragment in a
+/// `LiveRaw` segment, which is ignored.
+fn run_segment<R: BufRead>(mut reader: R, segment: Segment, st: &mut ReconState) -> Result<()> {
+    let mut record_no = 0usize;
+    let mut buf: Vec<u8> = Vec::new();
+    loop {
+        buf.clear();
+        let n = reader.read_until(b'\n', &mut buf)?;
+        if n == 0 {
+            break;
+        }
+        record_no += 1;
+        let terminated = buf.last() == Some(&b'\n');
+        let end = buf.len() - terminated as usize;
+        let content = &buf[..end];
+        let Some(start) = content.iter().position(|b| !b.is_ascii_whitespace()) else {
+            continue; // whitespace-only record
+        };
+        let stop = content
+            .iter()
+            .rposition(|b| !b.is_ascii_whitespace())
+            .unwrap()
+            + 1;
+        let trimmed = &content[start..stop];
+
+        let mut stream = serde_json::Deserializer::from_slice(trimmed).into_iter::<Value>();
+        let mut consumed = 0usize;
+        loop {
+            match stream.next() {
+                Some(Ok(v)) => {
+                    consumed = stream.byte_offset();
+                    st.apply(&v);
+                }
+                Some(Err(_)) => {
+                    let rest = &trimmed[consumed..];
+                    if !rest.iter().any(|b| !b.is_ascii_whitespace()) {
+                        break; // only trailing whitespace remained
+                    }
+                    // Non-whitespace residue that cannot form a complete Envelope.
+                    if !terminated && segment == Segment::LiveRaw {
+                        break; // one unterminated final fragment on a live tail
+                    }
+                    anyhow::bail!(
+                        "reconstruct: {} record {record_no}: incomplete or malformed JSON",
+                        segment.label()
+                    );
+                }
+                None => break,
+            }
+        }
+    }
+    Ok(())
 }
 
 /// commonPrefix: element-wise JSON equality.
@@ -389,6 +485,73 @@ pub fn parse_sse(sse: &str) -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn env_append(prefix: u64, role: &str, content: &str) -> String {
+        json!({
+            "harness": "claude-code",
+            "request": { "body_delta": { "history": {
+                "key": "messages", "prefix_length": prefix,
+                "append": [{ "role": role, "content": content }],
+            }}},
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn concatenated_record_recovers_every_envelope() {
+        // The historical concurrent-write artifact: two complete Envelopes on one
+        // physical record (`JSONJSON`) followed by a blank record.
+        let a = env_append(0, "user", "a");
+        let b = env_append(1, "user", "b");
+        let raw = format!("{a}{b}\n\n");
+        let r = reconstruct_reader(raw.as_bytes()).unwrap();
+        assert_eq!(r.envelopes, 2, "both concatenated envelopes applied");
+        assert_eq!(r.history_len, 2);
+        assert_eq!(r.messages[0]["content"], "a");
+        assert_eq!(r.messages[1]["content"], "b");
+    }
+
+    #[test]
+    fn whitespace_only_records_ignored() {
+        let a = env_append(0, "user", "a");
+        let raw = format!("\n   \n{a}\n\t\n");
+        let r = reconstruct_reader(raw.as_bytes()).unwrap();
+        assert_eq!(r.envelopes, 1);
+        assert_eq!(r.history_len, 1);
+    }
+
+    #[test]
+    fn live_raw_ignores_one_unterminated_final_fragment() {
+        let a = env_append(0, "user", "a");
+        let raw = format!("{a}\n{{\"harness\":\"claude-code\",\"req"); // truncated tail, no newline
+        let r = reconstruct_reader(raw.as_bytes()).unwrap();
+        assert_eq!(r.envelopes, 1);
+    }
+
+    #[test]
+    fn sealed_segment_fails_on_malformed_trailing_content() {
+        // A sealed (fully terminated) capture must not silently drop a broken tail.
+        let a = env_append(0, "user", "a");
+        let sealed_bytes = format!("{a}\n{{\"harness\":\"claude-code\",\"req\n"); // terminated junk
+        let tmp = tempfile::TempDir::new().unwrap();
+        let zst = tmp.path().join("turns.jsonl.zst");
+        std::fs::write(&zst, zstd::encode_all(sealed_bytes.as_bytes(), 3).unwrap()).unwrap();
+        let err = reconstruct(&zst).unwrap_err().to_string();
+        assert!(err.contains("sealed"), "error names the segment: {err}");
+        assert!(
+            !err.contains("harness"),
+            "error must not echo content: {err}"
+        );
+    }
+
+    #[test]
+    fn terminated_junk_record_in_raw_fails() {
+        // A non-final terminated record that can't form an Envelope is corruption.
+        let a = env_append(0, "user", "a");
+        let raw = format!("{a}\nnot json at all\n{}\n", env_append(1, "user", "b"));
+        let err = reconstruct_reader(raw.as_bytes()).unwrap_err().to_string();
+        assert!(err.contains("raw record 2"), "locates the record: {err}");
+    }
 
     /// Test-only inverse of `encode_delta`: replay set/remove over the prior
     /// body and `apply_delta` over its history.

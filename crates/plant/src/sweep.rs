@@ -614,6 +614,11 @@ pub async fn compress_sweep(vault: &Path, idle: Duration) -> bool {
         if !(learned || jobs.contains(&sid)) || !idle_for(&path, idle) {
             continue;
         }
+        // Never seal a raw generation with an open reservation or undrained stage:
+        // the delta lineage isn't final until every prepared sequence has drained.
+        if crate::capture::has_open_capture(vault, &sid) {
+            continue;
+        }
         if !scrub(&path).await {
             continue; // unscrubbed data must not leave the machine
         }
@@ -687,7 +692,9 @@ fn capture_lines(path: &Path) -> Vec<String> {
     };
     let mut text = String::new();
     let ok = if path.extension().and_then(|e| e.to_str()) == Some("zst") {
-        zstd::Decoder::new(file).and_then(|mut d| d.read_to_string(&mut text)).is_ok()
+        zstd::Decoder::new(file)
+            .and_then(|mut d| d.read_to_string(&mut text))
+            .is_ok()
     } else {
         let mut f = file;
         f.read_to_string(&mut text).is_ok()
