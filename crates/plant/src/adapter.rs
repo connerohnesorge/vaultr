@@ -73,7 +73,12 @@ pub fn adapters() -> Vec<Adapter> {
 impl Adapter {
     pub fn captures(&self, method: &str, path: &str) -> bool {
         match self.kind {
-            Harness::ClaudeCode => method == "POST" && path.starts_with("/v1/messages"),
+            // Exact match, not a prefix: /v1/messages/count_tokens carries no
+            // metadata.user_id, so a prefix match parsed its (full-history) body
+            // only to fail identity extraction and drop it — spamming
+            // "capture failed: no session identity" and burning a DOM_GATE permit
+            // that real turns contend for. count_tokens is a side-query, not a turn.
+            Harness::ClaudeCode => method == "POST" && path == "/v1/messages",
             Harness::Codex => method == "POST" && path.ends_with("/responses"),
         }
     }
@@ -238,5 +243,34 @@ fn count(value: Option<&Value>) -> u64 {
             .map(|f| f as u64)
             .unwrap_or(0),
         _ => 0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn claude() -> Adapter {
+        adapters().remove(0)
+    }
+    fn codex() -> Adapter {
+        adapters().remove(1)
+    }
+
+    #[test]
+    fn captures_streaming_messages_but_not_count_tokens() {
+        let c = claude();
+        // the streaming turn endpoint — captured (query is stripped before this call)
+        assert!(c.captures("POST", "/v1/messages"));
+        // count_tokens is a side-query with no session identity — must NOT be captured
+        assert!(!c.captures("POST", "/v1/messages/count_tokens"));
+        // batches likewise are not interactive turns
+        assert!(!c.captures("POST", "/v1/messages/batches"));
+        // wrong method
+        assert!(!c.captures("GET", "/v1/messages"));
+
+        let x = codex();
+        assert!(x.captures("POST", "/backend-api/codex/responses"));
+        assert!(!x.captures("POST", "/backend-api/codex/responses/count_tokens"));
     }
 }
