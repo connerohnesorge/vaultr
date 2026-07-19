@@ -245,7 +245,7 @@ fn tail_line(text: &str) -> Option<String> {
 /// Runaway backstop only — scripts own their real timeouts (passed to `plant agent run`).
 const SCRIPT_BACKSTOP: Duration = Duration::from_secs(3 * 3600);
 
-pub async fn run_job(job: &Job) {
+pub async fn run_job(job: &Job) -> i32 {
     let started = SystemTime::now();
     let mut cmd = tokio::process::Command::new("/bin/bash");
     cmd.arg(&job.path)
@@ -263,27 +263,33 @@ pub async fn run_job(job: &Job) {
         Ok(c) => c,
         Err(e) => {
             record(&job.name, "failed", started, &format!("spawn: {e}"));
-            return;
+            return 1;
         }
     };
     let out = match tokio::time::timeout(SCRIPT_BACKSTOP, child.wait_with_output()).await {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => {
             record(&job.name, "failed", started, &format!("wait: {e}"));
-            return;
+            return 1;
         }
         Err(_) => {
             // kill_on_drop reaped the child when the future was dropped by timeout
             record(&job.name, "failed", started, "killed: 3h backstop");
-            return;
+            return 1;
         }
     };
     let detail = tail_line(&String::from_utf8_lossy(&out.stdout))
         .or_else(|| tail_line(&String::from_utf8_lossy(&out.stderr)))
         .unwrap_or_else(|| "no output".to_string());
-    match outcome_for(out.status.code()) {
+    let code = out.status.code();
+    match outcome_for(code) {
         Some(outcome) => record(&job.name, outcome, started, &detail),
         None => println!("[job:{}] retry next tick ({detail})", job.name),
+    }
+    match code {
+        Some(0) => 0,
+        Some(75) => 75,
+        _ => 1,
     }
 }
 
@@ -332,7 +338,7 @@ pub async fn scheduler(cfg: Cfg) {
             let (sem, running) = (sem.clone(), running.clone());
             tokio::spawn(async move {
                 let _permit = sem.acquire().await;
-                run_job(&job).await;
+                let _ = run_job(&job).await;
                 running.lock().unwrap().remove(&job.name);
             });
         }

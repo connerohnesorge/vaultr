@@ -57,7 +57,34 @@ pub struct Recon {
 }
 
 /// Reconstruct from a capture file path (`.zst` handled transparently).
+///
+/// A resumed capture can have a sealed generation followed by a raw one.
+/// Entering through either canonical sibling reconstructs both in that order.
 pub fn reconstruct(path: &Path) -> Result<Recon> {
+    let sibling = match path.file_name().and_then(|name| name.to_str()) {
+        Some("turns.jsonl") => Some(path.with_file_name("turns.jsonl.zst")),
+        Some("turns.jsonl.zst") => Some(path.with_file_name("turns.jsonl")),
+        _ => None,
+    };
+    if let Some(sibling) = sibling {
+        if sibling
+            .try_exists()
+            .with_context(|| format!("inspect {}", sibling.display()))?
+        {
+            let (sealed, raw) =
+                if path.file_name().and_then(|name| name.to_str()) == Some("turns.jsonl.zst") {
+                    (path, sibling.as_path())
+                } else {
+                    (sibling.as_path(), path)
+                };
+            let sealed =
+                File::open(sealed).with_context(|| format!("open {}", sealed.display()))?;
+            let raw = File::open(raw).with_context(|| format!("open {}", raw.display()))?;
+            let dec = zstd::Decoder::new(sealed).context("zstd decoder")?;
+            return reconstruct_reader(dec.chain(raw));
+        }
+    }
+
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     if path.extension().and_then(|e| e.to_str()) == Some("zst") {
         let dec = zstd::Decoder::new(file).context("zstd decoder")?;

@@ -114,6 +114,42 @@ fn raw_and_zst_parity() {
 }
 
 #[test]
+fn mixed_generations_reconstruct_from_either_sibling() {
+    let full = fs::read_to_string(fixture("claude_append.jsonl")).unwrap();
+    let mut lines = full.lines();
+    let sealed_generation = lines.next().unwrap();
+    let raw_generation = lines.next().unwrap();
+    assert!(lines.next().is_none());
+    assert_eq!(
+        serde_json::from_str::<Value>(raw_generation)
+            .unwrap()
+            .pointer("/request/body_delta/history/prefix_length"),
+        Some(&json!(2)),
+    );
+
+    let expected = recon::reconstruct(&fixture("claude_append.jsonl")).unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sealed_path = tmp.path().join("turns.jsonl.zst");
+    let raw_path = tmp.path().join("turns.jsonl");
+    fs::write(
+        &sealed_path,
+        zstd::encode_all(format!("{sealed_generation}\n").as_bytes(), 3).unwrap(),
+    )
+    .unwrap();
+    fs::write(&raw_path, format!("{raw_generation}\n")).unwrap();
+
+    let from_raw = recon::reconstruct(&raw_path).unwrap();
+    let from_sealed = recon::reconstruct(&sealed_path).unwrap();
+    assert_eq!(from_raw.messages, expected.messages);
+    assert_eq!(from_sealed.messages, expected.messages);
+    assert_eq!(from_raw.envelopes, 2);
+    assert_eq!(from_sealed.envelopes, 2);
+
+    fs::write(&sealed_path, "not zstd").unwrap();
+    assert!(recon::reconstruct(&raw_path).is_err());
+}
+
+#[test]
 fn permissive_sse_parser_keeps_only_valid_data_json() {
     let events = recon::parse_sse(
         "event: message\n\
