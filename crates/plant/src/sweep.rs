@@ -676,9 +676,242 @@ pub async fn compress_sweep(vault: &Path, idle: Duration) -> bool {
     true
 }
 
+/// Read a capture file's envelope lines, decompressing `.zst` transparently.
+/// ponytail: single-file only — the transient sealed+raw sibling pair (mid-resume)
+/// is chained by recon::reconstruct elsewhere; coverage is a point-in-time audit and
+/// reads whichever file `capture_file` returns. Unreadable => empty, never fatal.
+fn capture_lines(path: &Path) -> Vec<String> {
+    use std::io::Read;
+    let Ok(file) = std::fs::File::open(path) else {
+        return vec![];
+    };
+    let mut text = String::new();
+    let ok = if path.extension().and_then(|e| e.to_str()) == Some("zst") {
+        zstd::Decoder::new(file).and_then(|mut d| d.read_to_string(&mut text)).is_ok()
+    } else {
+        let mut f = file;
+        f.read_to_string(&mut text).is_ok()
+    };
+    if !ok {
+        return vec![];
+    }
+    text.lines().map(String::from).collect()
+}
+
+/// Capture completeness for one Session Capture, measured over Plant's observation
+/// window (see ADR-0001). A resumed session's pre-window transcript history is
+/// reported as `carryover`, never as loss.
+pub struct Coverage {
+    pub sid: String,
+    /// Earliest captured `observed_at`, else meta `original_start`.
+    pub window_start: String,
+    pub resumed: bool,
+    /// Distinct native assistant `requestId`s at or after the window start.
+    pub in_window_native: usize,
+    /// Distinct captured Envelope `request-id`s.
+    pub captured: usize,
+    /// Native `requestId`s predating the window (out-of-scope, not lost).
+    pub carryover: usize,
+    /// In-window native `requestId`s with no captured Envelope, sorted.
+    pub missing: Vec<String>,
+}
+
+impl Coverage {
+    /// In-window captured / in-window native, as a percentage. Empty window is 100%.
+    pub fn pct(&self) -> f64 {
+        if self.in_window_native == 0 {
+            return 100.0;
+        }
+        let hit = self.in_window_native - self.missing.len();
+        hit as f64 * 100.0 / self.in_window_native as f64
+    }
+}
+
+/// Compute [`Coverage`] for a session id (or unambiguous prefix). Read-only over the
+/// Session Capture and the harness transcript named in meta; mutates nothing.
+pub fn coverage(vault: &Path, query: &str) -> Result<Coverage, String> {
+    let session = vaultr::vault::resolve_id(vault, query).map_err(|e| e.to_string())?;
+    let dir = vaultr::vault::session_dir(vault, &session).map_err(|e| e.to_string())?;
+    let cap = vaultr::vault::capture_file(&dir).map_err(|e| e.to_string())?;
+
+    // Captured side: distinct response request-ids, and the window start (min observed_at).
+    let mut captured: HashSet<String> = HashSet::new();
+    let mut window_start: Option<String> = None;
+    for line in capture_lines(&cap) {
+        let Ok(env) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if let Some(rid) = env
+            .pointer("/response/headers/request-id")
+            .and_then(|v| v.as_str())
+        {
+            captured.insert(rid.to_string());
+        }
+        if let Some(obs) = env.get("observed_at").and_then(|v| v.as_str()) {
+            if window_start.as_deref().is_none_or(|w| obs < w) {
+                window_start = Some(obs.to_string());
+            }
+        }
+    }
+    let window_start = window_start
+        .or_else(|| session.meta.original_start.clone())
+        .ok_or_else(|| format!("no envelopes and no original_start for {}", session.id))?;
+
+    // Native side: assistant requestId -> earliest transcript timestamp.
+    let transcript = session
+        .meta
+        .transcript_path
+        .clone()
+        .ok_or_else(|| format!("no transcript_path in meta for {}", session.id))?;
+    let text = std::fs::read_to_string(&transcript)
+        .map_err(|e| format!("read transcript {transcript}: {e}"))?;
+    let mut first_seen: HashMap<String, String> = HashMap::new();
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
+            continue;
+        }
+        let Some(rid) = v.get("requestId").and_then(|r| r.as_str()) else {
+            continue;
+        };
+        let ts = v
+            .get("timestamp")
+            .and_then(|t| t.as_str())
+            .unwrap_or("")
+            .to_string();
+        first_seen
+            .entry(rid.to_string())
+            .and_modify(|e| {
+                if ts < *e {
+                    *e = ts.clone();
+                }
+            })
+            .or_insert(ts);
+    }
+
+    let mut in_window_native = 0usize;
+    let mut carryover = 0usize;
+    let mut missing = vec![];
+    for (rid, ts) in &first_seen {
+        if ts.as_str() >= window_start.as_str() {
+            in_window_native += 1;
+            if !captured.contains(rid) {
+                missing.push(rid.clone());
+            }
+        } else {
+            carryover += 1;
+        }
+    }
+    missing.sort();
+
+    Ok(Coverage {
+        sid: session.id,
+        window_start,
+        resumed: session.meta.session_start_source.as_deref() == Some("resume"),
+        in_window_native,
+        captured: captured.len(),
+        carryover,
+        missing,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build a minimal vault: meta index + dated session dir with turns.jsonl + a
+    /// claude transcript. `envelopes` and `transcript` are raw file bodies.
+    fn coverage_fixture(label: &str, resumed: bool, envelopes: &str, transcript: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("plant-cov-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let sid = "cov00000-0000-4000-8000-000000000000";
+        let start = "2026-07-17T19:00:00.000Z";
+        let dir = root.join("2026/07/17").join(sid);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("turns.jsonl"), envelopes).unwrap();
+        let transcript_path = root.join("transcript.jsonl");
+        std::fs::write(&transcript_path, transcript).unwrap();
+        std::fs::create_dir_all(root.join(".meta")).unwrap();
+        let source = if resumed { "resume" } else { "wire" };
+        std::fs::write(
+            root.join(".meta").join(format!("{sid}.json")),
+            format!(
+                r#"{{"session_id":"{sid}","original_start":"{start}","session_start_source":"{source}","transcript_path":"{}"}}"#,
+                transcript_path.display()
+            ),
+        )
+        .unwrap();
+        root
+    }
+
+    fn envelope(observed_at: &str, request_id: &str) -> String {
+        format!(
+            r#"{{"observed_at":"{observed_at}","response":{{"headers":{{"request-id":"{request_id}"}}}}}}"#
+        )
+    }
+    fn assistant(ts: &str, request_id: &str) -> String {
+        format!(r#"{{"type":"assistant","requestId":"{request_id}","timestamp":"{ts}"}}"#)
+    }
+
+    #[test]
+    fn coverage_resume_carryover_is_not_loss() {
+        // Window opens at the first envelope (19:18); pre-window transcript ids are carryover.
+        let envelopes = format!("{}\n", envelope("2026-07-17T19:18:00.000Z", "req_A"));
+        let transcript = format!(
+            "{}\n{}\n{}\n",
+            assistant("2026-07-17T18:23:00.000Z", "req_OLD1"),
+            assistant("2026-07-17T18:24:00.000Z", "req_OLD2"),
+            assistant("2026-07-17T19:18:00.000Z", "req_A"),
+        );
+        let root = coverage_fixture("carryover", true, &envelopes, &transcript);
+        let c = coverage(&root, "cov00000").unwrap();
+        assert!(c.resumed);
+        assert_eq!(c.window_start, "2026-07-17T19:18:00.000Z");
+        assert_eq!(c.carryover, 2, "pre-window ids are carryover");
+        assert_eq!(c.in_window_native, 1);
+        assert!(c.missing.is_empty(), "in-window fully captured");
+        assert_eq!(c.pct(), 100.0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn coverage_full_window_is_complete() {
+        let envelopes = format!(
+            "{}\n{}\n",
+            envelope("2026-07-17T19:18:00.000Z", "req_A"),
+            envelope("2026-07-17T19:19:00.000Z", "req_B"),
+        );
+        let transcript = format!(
+            "{}\n{}\n",
+            assistant("2026-07-17T19:18:00.000Z", "req_A"),
+            assistant("2026-07-17T19:19:00.000Z", "req_B"),
+        );
+        let root = coverage_fixture("full", false, &envelopes, &transcript);
+        let c = coverage(&root, "cov00000").unwrap();
+        assert_eq!(c.in_window_native, 2);
+        assert!(c.missing.is_empty());
+        assert_eq!(c.pct(), 100.0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn coverage_reports_genuine_in_window_gap() {
+        // req_B is native in-window but never captured -> residual, coverage drops.
+        let envelopes = format!("{}\n", envelope("2026-07-17T19:18:00.000Z", "req_A"));
+        let transcript = format!(
+            "{}\n{}\n",
+            assistant("2026-07-17T19:18:00.000Z", "req_A"),
+            assistant("2026-07-17T19:20:00.000Z", "req_B"),
+        );
+        let root = coverage_fixture("gap", false, &envelopes, &transcript);
+        let c = coverage(&root, "cov00000").unwrap();
+        assert_eq!(c.in_window_native, 2);
+        assert_eq!(c.missing, vec!["req_B".to_string()]);
+        assert_eq!(c.pct(), 50.0);
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn eligibility_is_independent_per_learner() {

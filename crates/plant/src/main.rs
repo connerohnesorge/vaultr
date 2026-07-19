@@ -88,6 +88,44 @@ async fn subcommand(argv: &[String]) -> Option<i32> {
             println!("{}", list.join(" "));
             Some(0)
         }
+        (Some("sessions"), Some("coverage")) => {
+            let Some(sid) = argv.get(3) else {
+                eprintln!("sessions coverage: <session-id> required");
+                return Some(1);
+            };
+            match sweep::coverage(&vault_root(), sid) {
+                Ok(c) => {
+                    let tag = if c.resumed { " (resumed)" } else { "" };
+                    println!(
+                        "{} coverage {:.1}% ({}/{} in-window){tag}",
+                        c.sid,
+                        c.pct(),
+                        c.in_window_native - c.missing.len(),
+                        c.in_window_native,
+                    );
+                    println!("  window_start={} carryover={}", c.window_start, c.carryover);
+                    if c.captured > c.in_window_native {
+                        // captured envelopes with no in-window native match (e.g. pre-window
+                        // boundary or non-transcript calls) — informational, not loss.
+                        println!("  captured={} (>= in-window native)", c.captured);
+                    }
+                    if c.missing.is_empty() {
+                        println!("  no in-window gap");
+                        Some(0)
+                    } else {
+                        println!("  missing {} in-window request-id(s):", c.missing.len());
+                        for rid in &c.missing {
+                            println!("    {rid}");
+                        }
+                        Some(1)
+                    }
+                }
+                Err(e) => {
+                    eprintln!("sessions coverage: {e}");
+                    Some(1)
+                }
+            }
+        }
         (Some("sessions"), Some("stuck")) => {
             let age = flag("--age")
                 .and_then(|v| jobs::parse_duration(&v))
