@@ -1,5 +1,6 @@
 use crate::capture::{cached_session_ids, iso_now, session_dir};
-use crate::sweep::{run, run30};
+use crate::process::RunResult;
+use crate::sweep::run30;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -190,10 +191,46 @@ pub(crate) async fn pane_list() -> Option<Vec<Pane>> {
 /// Herdr reports `idle` for a bare shell too. Only native Claude/Codex panes in
 /// a prompt-safe state may receive TUI input.
 fn pane_accepts_prompt(panes: &[Pane], pane: &str) -> bool {
+    ready_pane_identity(panes, pane).is_some()
+}
+
+#[derive(Debug, PartialEq)]
+struct PaneIdentity {
+    terminal_id: String,
+    agent_session: Option<String>,
+}
+
+fn ready_pane_identity(panes: &[Pane], pane: &str) -> Option<PaneIdentity> {
+    panes
+        .iter()
+        .find(|candidate| {
+            candidate.pane_id == pane
+                && matches!(candidate.agent.as_deref(), Some("claude" | "codex"))
+                && matches!(candidate.agent_status.as_str(), "idle" | "done")
+        })
+        .map(|candidate| PaneIdentity {
+            terminal_id: candidate.terminal_id.clone(),
+            agent_session: candidate
+                .agent_session
+                .as_ref()
+                .map(|session| session.value.clone()),
+        })
+}
+
+fn same_pane_identity(expected: &PaneIdentity, panes: &[Pane], pane: &str) -> bool {
     panes.iter().any(|candidate| {
         candidate.pane_id == pane
-            && matches!(candidate.agent.as_deref(), Some("claude" | "codex"))
-            && matches!(candidate.agent_status.as_str(), "idle" | "done")
+            && candidate.terminal_id == expected.terminal_id
+            && match &expected.agent_session {
+                None => true,
+                Some(session) => {
+                    candidate
+                        .agent_session
+                        .as_ref()
+                        .map(|current| &current.value)
+                        == Some(session)
+                }
+            }
     })
 }
 
@@ -213,8 +250,128 @@ async fn wait_for_prompt_ready(pane: &str, timeout: Duration) -> bool {
     .unwrap_or(false)
 }
 
+struct AgentStartSubscription {
+    pane_id: String,
+    workspace_id: String,
+    reader: BufReader<UnixStream>,
+}
+
+async fn subscribe_agent_start_at(
+    path: &Path,
+    pane_id: &str,
+    workspace_id: &str,
+) -> Result<AgentStartSubscription, String> {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let stream = UnixStream::connect(path)
+            .await
+            .map_err(|error| format!("connect: {error}"))?;
+        let mut reader = BufReader::new(stream);
+        let mut request = serde_json::to_vec(&serde_json::json!({
+            "id": "plant-agent-start",
+            "method": "events.subscribe",
+            "params": {
+                "subscriptions": [{
+                    "type": "pane.agent_status_changed",
+                    "pane_id": pane_id,
+                }],
+            },
+        }))
+        .map_err(|error| format!("encode: {error}"))?;
+        request.push(b'\n');
+        reader
+            .get_mut()
+            .write_all(&request)
+            .await
+            .map_err(|error| format!("subscribe: {error}"))?;
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .await
+            .map_err(|error| format!("subscribe acknowledgment: {error}"))?;
+        let reply: Value =
+            serde_json::from_str(&line).map_err(|error| format!("subscribe reply: {error}"))?;
+        if reply.pointer("/result/type").and_then(Value::as_str) != Some("subscription_started") {
+            return Err("Herdr did not acknowledge the agent-start subscription".to_string());
+        }
+        Ok(AgentStartSubscription {
+            pane_id: pane_id.to_string(),
+            workspace_id: workspace_id.to_string(),
+            reader,
+        })
+    })
+    .await
+    .map_err(|_| "agent-start subscription timed out".to_string())?
+}
+
+async fn subscribe_agent_start(
+    pane_id: &str,
+    workspace_id: &str,
+) -> Result<AgentStartSubscription, String> {
+    subscribe_agent_start_at(&socket_path(), pane_id, workspace_id).await
+}
+
+impl AgentStartSubscription {
+    async fn wait(self, timeout: Duration) -> Result<(), String> {
+        tokio::time::timeout(timeout, async {
+            let mut reader = self.reader;
+            let mut working = false;
+            loop {
+                let mut line = String::new();
+                let bytes = reader
+                    .read_line(&mut line)
+                    .await
+                    .map_err(|error| format!("agent-start event: {error}"))?;
+                if bytes == 0 {
+                    return Err(if working {
+                        "agent-start subscription closed before done".to_string()
+                    } else {
+                        "agent-start subscription closed before working".to_string()
+                    });
+                }
+                let event: Value = serde_json::from_str(&line)
+                    .map_err(|error| format!("agent-start event: {error}"))?;
+                if event.get("event").and_then(Value::as_str) != Some("pane.agent_status_changed")
+                    || event.pointer("/data/pane_id").and_then(Value::as_str)
+                        != Some(self.pane_id.as_str())
+                    || event.pointer("/data/workspace_id").and_then(Value::as_str)
+                        != Some(self.workspace_id.as_str())
+                    || !matches!(
+                        event.pointer("/data/agent").and_then(Value::as_str),
+                        Some("claude" | "codex")
+                    )
+                {
+                    continue;
+                }
+                match event.pointer("/data/agent_status").and_then(Value::as_str) {
+                    Some("working") => working = true,
+                    Some("done") if working => return Ok(()),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .map_err(|_| "submitted prompt never completed a working-to-done transition".to_string())?
+    }
+}
+
+fn require_command(result: &RunResult, action: &str) -> Result<(), String> {
+    if result.ok {
+        Ok(())
+    } else {
+        Err(format!("{action} failed ({})", result.failure_detail()))
+    }
+}
+
 async fn workspaces() -> Option<Vec<Workspace>> {
-    serde_json::from_str::<WorkspaceListReply>(&run30(&["herdr", "workspace", "list"]).await.out)
+    let result = run30(&["herdr", "workspace", "list"]).await;
+    if !result.ok {
+        eprintln!(
+            "[herdr] workspace list failed ({})",
+            result.failure_detail()
+        );
+        return None;
+    }
+    serde_json::from_str::<WorkspaceListReply>(&result.out)
         .ok()
         .map(|reply| reply.result.workspaces)
 }
@@ -231,10 +388,22 @@ async fn focused_workspace() -> Option<String> {
 /// unfocused. Restore the user's prior focus when that happens.
 async fn close_workspace(id: &str) {
     let before = focused_workspace().await;
-    run30(&["herdr", "workspace", "close", id]).await;
+    let closed = run30(&["herdr", "workspace", "close", id]).await;
+    if !closed.ok {
+        eprintln!(
+            "[herdr] workspace close {id} failed ({})",
+            closed.failure_detail()
+        );
+    }
     if let Some(previous) = before {
         if previous != id && focused_workspace().await.as_deref() != Some(previous.as_str()) {
-            run30(&["herdr", "workspace", "focus", &previous]).await;
+            let focused = run30(&["herdr", "workspace", "focus", &previous]).await;
+            if !focused.ok {
+                eprintln!(
+                    "[herdr] workspace focus {previous} failed ({})",
+                    focused.failure_detail()
+                );
+            }
         }
     }
 }
@@ -298,7 +467,10 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
         "--no-focus",
     ])
     .await;
-    let parsed = serde_json::from_str::<WorkspaceCreateReply>(&created.out).ok();
+    let parsed = created
+        .ok
+        .then(|| serde_json::from_str::<WorkspaceCreateReply>(&created.out).ok())
+        .flatten();
     let workspace_id = parsed
         .as_ref()
         .map(|reply| reply.result.workspace.workspace_id.clone());
@@ -307,10 +479,11 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
         .map(|reply| reply.result.root_pane.pane_id.clone());
 
     let outcome = async {
-        let (Some(pane), Some(_)) = (&pane_id, &workspace_id) else {
+        let (Some(pane), Some(workspace)) = (&pane_id, &workspace_id) else {
             eprintln!(
-                "[herdr:{}] workspace create failed: {}",
+                "[herdr:{}] workspace create failed ({}): {}",
                 agent_run.label,
+                created.failure_detail(),
                 created.out.chars().take(200).collect::<String>()
             );
             let orphans = close_by_label(&agent_run.label).await;
@@ -337,82 +510,79 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
         }
         // Agent detection precedes TUI input readiness by ~1-2 seconds.
         tokio::time::sleep(Duration::from_secs(3)).await;
-        if !pane_list()
+        let Some(identity) = pane_list()
             .await
-            .is_some_and(|panes| pane_accepts_prompt(&panes, pane))
-        {
+            .and_then(|panes| ready_pane_identity(&panes, pane))
+        else {
             return AgentRunOutcome::Failed(
                 "CLI pane was not a ready native Claude/Codex agent after settle".to_string(),
             );
+        };
+        // Herdr 0.7.4 pane.run atomically sends the text plus Enter. Arm and
+        // acknowledge one unfiltered status stream first so even a fast
+        // working→done turn is buffered on this same pane/workspace cursor.
+        let lifecycle = match subscribe_agent_start(pane, workspace).await {
+            Ok(subscription) => subscription,
+            Err(detail) => {
+                return AgentRunOutcome::Failed(format!(
+                    "could not observe submitted turn ({detail})"
+                ));
+            }
+        };
+        let submitted = run30(&["herdr", "pane", "run", pane, &agent_run.prompt]).await;
+        if let Err(detail) = require_command(&submitted, "prompt submission") {
+            return AgentRunOutcome::Failed(detail);
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let read = run30(&[
+            "herdr",
+            "pane",
+            "read",
+            pane,
+            "--source",
+            "recent-unwrapped",
+            "--lines",
+            "80",
+        ])
+        .await;
+        if let Err(detail) = require_command(&read, "prompt verification") {
+            return AgentRunOutcome::Failed(detail);
         }
         let needle: String = agent_run.prompt.chars().take(30).collect();
-        let mut landed = false;
-        let mut read_failure = None;
-        for _ in 0..3 {
-            run30(&["herdr", "pane", "run", pane, &agent_run.prompt]).await;
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            let read = run30(&[
-                "herdr",
-                "pane",
-                "read",
-                pane,
-                "--source",
-                "recent-unwrapped",
-                "--lines",
-                "80",
-            ])
-            .await;
-            if !read.ok {
-                read_failure = Some(read.failure_detail());
-                break;
-            }
-            // Claude collapses large pastes to this placeholder; it proves delivery.
-            if read.out.contains(&needle) || read.out.contains("[Pasted text") {
-                landed = true;
-                break;
-            }
+        // Claude collapses large pastes to this placeholder; it proves delivery.
+        if !read.out.contains(&needle) && !read.out.contains("[Pasted text") {
+            return AgentRunOutcome::Failed("submitted prompt was not visible in pane".to_string());
         }
-        if !landed {
-            return AgentRunOutcome::Failed(match read_failure {
-                Some(detail) => format!("prompt never landed in pane (pane read: {detail})"),
-                None => "prompt never landed in pane".to_string(),
-            });
+        if let Err(detail) = lifecycle
+            .wait(agent_run.timeout + Duration::from_secs(60))
+            .await
+        {
+            return AgentRunOutcome::Failed(format!(
+                "submitted prompt did not complete ({detail})"
+            ));
         }
-        run30(&["herdr", "pane", "send-keys", pane, "Enter"]).await;
-        run30(&["herdr", "pane", "send-keys", pane, "Enter"]).await;
-        let timeout_ms = agent_run.timeout.as_millis().to_string();
-        let done = run(
-            &[
-                "herdr",
-                "wait",
-                "agent-status",
-                pane,
-                "--status",
-                "done",
-                "--timeout",
-                &timeout_ms,
-            ],
-            agent_run.timeout + Duration::from_secs(60),
-        )
-        .await;
+        if !pane_list()
+            .await
+            .is_some_and(|panes| same_pane_identity(&identity, &panes, pane))
+        {
+            return AgentRunOutcome::Failed(
+                "pane terminal/session identity changed during submitted turn".to_string(),
+            );
+        }
         let tail = run30(&[
             "herdr", "pane", "read", pane, "--source", "recent", "--lines", "15",
         ])
         .await;
-        let detail = (!done.ok).then(|| done.failure_detail());
+        let tail_text = if tail.ok {
+            tail.out.trim().to_string()
+        } else {
+            format!("<tail read failed: {}>", tail.failure_detail())
+        };
         println!(
-            "[herdr:{}] agent {}; tail:\n{}",
-            agent_run.label,
-            match &detail {
-                None => "done".to_string(),
-                Some(d) => format!("FAILED ({d})"),
-            },
-            tail.out.trim()
+            "[herdr:{}] agent done; tail:\n{}",
+            agent_run.label, tail_text
         );
-        match detail {
-            None => AgentRunOutcome::Succeeded("agent done".to_string()),
-            Some(d) => AgentRunOutcome::Failed(format!("agent wait failed ({d})")),
-        }
+        AgentRunOutcome::Succeeded("agent done".to_string())
     }
     .await;
 
@@ -587,6 +757,47 @@ pub fn maybe_snapshot(vault: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process::RunEnd;
+
+    async fn subscription_server(
+        path: PathBuf,
+        statuses: Vec<&'static str>,
+    ) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request = String::new();
+            reader.read_line(&mut request).await.unwrap();
+            let request: Value = serde_json::from_str(&request).unwrap();
+            assert_eq!(
+                request.pointer("/params/subscriptions/0"),
+                Some(&serde_json::json!({
+                    "type": "pane.agent_status_changed",
+                    "pane_id": "w1:p1",
+                }))
+            );
+            reader
+                .get_mut()
+                .write_all(b"{\"id\":\"plant-agent-start\",\"result\":{\"type\":\"subscription_started\"}}\n")
+                .await
+                .unwrap();
+            for status in statuses {
+                let mut event = serde_json::to_vec(&serde_json::json!({
+                    "event": "pane.agent_status_changed",
+                    "data": {
+                        "pane_id": "w1:p1",
+                        "workspace_id": "w1",
+                        "agent_status": status,
+                        "agent": "codex",
+                    },
+                }))
+                .unwrap();
+                event.push(b'\n');
+                reader.get_mut().write_all(&event).await.unwrap();
+            }
+        })
+    }
 
     #[test]
     fn decodes_typed_panes_and_workspaces() {
@@ -656,6 +867,15 @@ mod tests {
             &[pane(Some("codex"), "done")],
             "other"
         ));
+
+        let mut original = pane(Some("codex"), "done");
+        original.agent_session = Some(AgentSession {
+            value: "session-1".to_string(),
+        });
+        let identity = ready_pane_identity(&[original.clone()], "w1:p1").unwrap();
+        assert!(same_pane_identity(&identity, &[original.clone()], "w1:p1"));
+        original.terminal_id = "replacement".to_string();
+        assert!(!same_pane_identity(&identity, &[original], "w1:p1"));
     }
 
     #[test]
@@ -670,6 +890,51 @@ mod tests {
             WorkspaceCleanup::Always,
             &AgentRunOutcome::Unavailable
         ));
+    }
+
+    #[test]
+    fn failed_atomic_pane_run_is_a_terminal_submission_error() {
+        let failed = RunResult {
+            ok: false,
+            out: String::new(),
+            stderr: "pane rejected keys".to_string(),
+            end: RunEnd::Exited(Some(1)),
+        };
+        assert_eq!(
+            require_command(&failed, "prompt submission").unwrap_err(),
+            "prompt submission failed (exit 1: pane rejected keys)"
+        );
+    }
+
+    #[tokio::test]
+    async fn preexisting_done_without_post_submit_working_is_not_success() {
+        let path = PathBuf::from("/tmp").join(format!("ph-{}.sock", uuid::Uuid::new_v4()));
+        let server = subscription_server(path.clone(), vec!["done"]).await;
+        let subscription = subscribe_agent_start_at(&path, "w1:p1", "w1")
+            .await
+            .unwrap();
+        let error = subscription
+            .wait(Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error, "agent-start subscription closed before working",
+            "a pre-submit done observation must not complete this run"
+        );
+        server.await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn acknowledged_working_event_survives_a_fast_turn() {
+        let path = PathBuf::from("/tmp").join(format!("ph-{}.sock", uuid::Uuid::new_v4()));
+        let server = subscription_server(path.clone(), vec!["working", "done"]).await;
+        let subscription = subscribe_agent_start_at(&path, "w1:p1", "w1")
+            .await
+            .unwrap();
+        subscription.wait(Duration::from_millis(100)).await.unwrap();
+        server.await.unwrap();
+        std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]

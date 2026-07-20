@@ -13,8 +13,9 @@ use serde_json::Value;
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tokio::net::TcpListener;
+use tokio::task::JoinSet;
 
 pub type BoxBody = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
 
@@ -51,8 +52,57 @@ pub async fn bind(port: u16) -> std::io::Result<(TcpListener, u16)> {
 }
 
 pub async fn serve(listener: TcpListener, ctx: Arc<ProxyCtx>) {
+    let _lease = serve_with_shutdown(
+        listener,
+        ctx,
+        std::future::pending(),
+        Duration::from_secs(30),
+    )
+    .await;
+}
+
+pub async fn serve_until_shutdown(
+    listener: TcpListener,
+    ctx: Arc<ProxyCtx>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    drain_timeout: Duration,
+) -> TcpListener {
+    serve_with_shutdown(
+        listener,
+        ctx,
+        async move {
+            while !*shutdown.borrow() {
+                if shutdown.changed().await.is_err() {
+                    std::future::pending::<()>().await;
+                }
+            }
+        },
+        drain_timeout,
+    )
+    .await
+}
+
+async fn serve_with_shutdown(
+    listener: TcpListener,
+    ctx: Arc<ProxyCtx>,
+    shutdown: impl std::future::Future<Output = ()>,
+    drain_timeout: Duration,
+) -> TcpListener {
+    tokio::pin!(shutdown);
+    let mut connections = JoinSet::new();
     loop {
-        let (stream, _) = match listener.accept().await {
+        let accepted = tokio::select! {
+            biased;
+            () = &mut shutdown => break,
+            completed = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    eprintln!("connection task failed: {error}");
+                }
+                continue;
+            }
+            accepted = listener.accept() => accepted,
+        };
+        let (stream, _) = match accepted {
             Ok(x) => x,
             Err(e) => {
                 eprintln!("[{}] accept error: {e}", ctx.adapter.harness);
@@ -60,7 +110,7 @@ pub async fn serve(listener: TcpListener, ctx: Arc<ProxyCtx>) {
             }
         };
         let ctx = ctx.clone();
-        tokio::spawn(async move {
+        connections.spawn(async move {
             let io = hyper_util::rt::TokioIo::new(stream);
             let service = hyper::service::service_fn(move |req| {
                 let ctx = ctx.clone();
@@ -79,6 +129,23 @@ pub async fn serve(listener: TcpListener, ctx: Arc<ProxyCtx>) {
             }
         });
     }
+
+    // Cancellation fixes the in-flight set: no new accept branch is polled while
+    // these exact connection tasks drain, and the listener lease stays owned.
+    let deadline = tokio::time::Instant::now() + drain_timeout;
+    while !connections.is_empty() {
+        match tokio::time::timeout_at(deadline, connections.join_next()).await {
+            Ok(Some(Ok(()))) => {}
+            Ok(Some(Err(error))) => eprintln!("connection task failed: {error}"),
+            Ok(None) => break,
+            Err(_) => {
+                connections.abort_all();
+                while connections.join_next().await.is_some() {}
+                break;
+            }
+        }
+    }
+    listener
 }
 
 async fn handle(req: Request<hyper::body::Incoming>, ctx: Arc<ProxyCtx>) -> Response<BoxBody> {
@@ -308,5 +375,163 @@ pub fn decode_bytes(raw: &[u8], encoding: Option<&str>) -> std::io::Result<Vec<u
         zstd::decode_all(raw)
     } else {
         Ok(raw.to_vec())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn blocking_upstream() -> (
+        std::net::SocketAddr,
+        tokio::sync::mpsc::UnboundedReceiver<()>,
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (started_tx, started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let started_tx = started_tx.clone();
+                let mut release_rx = release_rx.clone();
+                tokio::spawn(async move {
+                    let mut request = [0_u8; 4096];
+                    let _ = stream.read(&mut request).await;
+                    let _ = started_tx.send(());
+                    while !*release_rx.borrow() {
+                        if release_rx.changed().await.is_err() {
+                            return;
+                        }
+                    }
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                        )
+                        .await;
+                });
+            }
+        });
+        (address, started_rx, release_tx, task)
+    }
+
+    fn test_ctx(upstream: std::net::SocketAddr) -> Arc<ProxyCtx> {
+        let mut adapter = crate::adapter::adapters().remove(0);
+        adapter.upstream = format!("http://{upstream}");
+        Arc::new(ProxyCtx {
+            adapter,
+            vault: std::env::temp_dir(),
+            client: reqwest::Client::new(),
+            otel: Arc::new(Otel::new()),
+        })
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_accepting_but_finishes_the_fixed_connection_set() {
+        let (upstream, mut started, release, upstream_task) = blocking_upstream().await;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let supervisor = tokio::spawn(serve_until_shutdown(
+            listener,
+            test_ctx(upstream),
+            shutdown_rx,
+            Duration::from_secs(2),
+        ));
+
+        let first = tokio::spawn(async move {
+            reqwest::get(format!("http://{address}/block"))
+                .await
+                .unwrap()
+                .text()
+                .await
+                .unwrap()
+        });
+        tokio::time::timeout(Duration::from_secs(1), started.recv())
+            .await
+            .expect("first connection was not accepted")
+            .expect("upstream stopped");
+
+        shutdown_tx.send(true).unwrap();
+        let second =
+            tokio::spawn(
+                async move { reqwest::get(format!("http://{address}/after-cancel")).await },
+            );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), started.recv())
+                .await
+                .is_err(),
+            "a post-cancellation connection reached the upstream"
+        );
+        assert!(
+            TcpListener::bind(address).await.is_err(),
+            "listener lease was released while the fixed set was draining"
+        );
+
+        release.send(true).unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), first)
+                .await
+                .unwrap()
+                .unwrap(),
+            "ok"
+        );
+        let lease = tokio::time::timeout(Duration::from_secs(1), supervisor)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(TcpListener::bind(address).await.is_err());
+        drop(lease);
+        drop(TcpListener::bind(address).await.unwrap());
+
+        second.abort();
+        let _ = second.await;
+        upstream_task.abort();
+        let _ = upstream_task.await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_and_reaps_connections_at_the_drain_deadline() {
+        let (upstream, mut started, _release, upstream_task) = blocking_upstream().await;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let supervisor = tokio::spawn(serve_until_shutdown(
+            listener,
+            test_ctx(upstream),
+            shutdown_rx,
+            Duration::from_millis(50),
+        ));
+        let request =
+            tokio::spawn(async move { reqwest::get(format!("http://{address}/never")).await });
+        tokio::time::timeout(Duration::from_secs(1), started.recv())
+            .await
+            .expect("connection was not accepted")
+            .expect("upstream stopped");
+
+        shutdown_tx.send(true).unwrap();
+        let lease = tokio::time::timeout(Duration::from_secs(1), supervisor)
+            .await
+            .expect("connection drain exceeded its deadline")
+            .unwrap();
+        assert!(
+            TcpListener::bind(address).await.is_err(),
+            "listener lease was released before aborted tasks were reaped"
+        );
+        tokio::time::timeout(Duration::from_secs(1), request)
+            .await
+            .expect("aborted client connection stayed open")
+            .unwrap()
+            .expect_err("aborted connection unexpectedly completed");
+        drop(lease);
+        drop(TcpListener::bind(address).await.unwrap());
+
+        upstream_task.abort();
+        let _ = upstream_task.await;
     }
 }

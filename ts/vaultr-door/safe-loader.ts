@@ -31,6 +31,14 @@ export interface StableFileOptions {
   afterStat?: (path: string) => void;
 }
 
+export interface StableRegularFileDescriptor {
+  readonly fd: number;
+  readonly stat: StableFileStat;
+  readonly canonicalPath: string;
+  verify(): StableFileStat;
+  close(): void;
+}
+
 export class InitialFileMissingError extends Error {
   readonly code = "ENOENT";
 
@@ -38,6 +46,8 @@ export class InitialFileMissingError extends Error {
     super(`file was absent when opened: ${path}`, options);
   }
 }
+
+export class StableFileIdentityError extends Error {}
 
 function isBeneath(parent: string, child: string): boolean {
   const rel = relative(parent, child);
@@ -88,18 +98,56 @@ function sameStat(a: StableFileStat, b: StableFileStat): boolean {
     && a.ctimeMs === b.ctimeMs;
 }
 
-/**
- * Open one traversal-free path beneath a canonical root with no-follow and
- * nonblocking semantics, read through that exact descriptor, then prove both
- * the descriptor and current lexical pathname still identify the same stable
- * regular file beneath the root.
- */
-export function withStableRegularFile<T>(
+function inspectDescriptor(
+  fd: number,
   canonicalRoot: string,
   relativePath: string,
-  options: StableFileOptions,
-  reader: (fd: number, stat: StableFileStat) => T,
-): StableFile<T> {
+  lexical: string,
+): { stat: StableFileStat; canonicalPath: string } {
+  const raw = fstatSync(fd);
+  if (!raw.isFile()) {
+    throw new Error(`not a regular file beneath canonical root: ${relativePath}`);
+  }
+  const stat = stableStat(raw);
+  const canonicalPath = realpathSync(descriptorPath(fd));
+  if (!isBeneath(canonicalRoot, canonicalPath)) {
+    throw new Error(`opened file escapes canonical root: ${relativePath}`);
+  }
+  let lexicalStat: ReturnType<typeof lstatSync>;
+  try {
+    lexicalStat = lstatSync(lexical);
+  } catch (error) {
+    throw new StableFileIdentityError(
+      `lexical file identity changed while open: ${relativePath}`,
+      { cause: error },
+    );
+  }
+  if (!lexicalStat.isFile()
+    || lexicalStat.dev !== stat.dev
+    || lexicalStat.ino !== stat.ino
+    || lexicalStat.size !== stat.size
+    || lexicalStat.mtimeMs !== stat.mtimeMs
+    || lexicalStat.ctimeMs !== stat.ctimeMs) {
+    throw new StableFileIdentityError(
+      `lexical file identity changed while open: ${relativePath}`,
+    );
+  }
+  const lexicalCanonical = realpathSync(lexical);
+  if (!isBeneath(canonicalRoot, lexicalCanonical) || lexicalCanonical !== canonicalPath) {
+    throw new StableFileIdentityError(
+      `lexical file escapes canonical root: ${relativePath}`,
+    );
+  }
+  return { stat, canonicalPath };
+}
+
+/** Retain one validated regular-file descriptor so callers can hold a kernel
+ * lock and re-prove that the canonical pathname still names this same inode. */
+export function openStableRegularFileDescriptor(
+  canonicalRoot: string,
+  relativePath: string,
+  writable = false,
+): StableRegularFileDescriptor {
   if (!validRelativeFilePath(relativePath)) {
     throw new Error(`invalid relative file path: ${relativePath}`);
   }
@@ -113,7 +161,12 @@ export function withStableRegularFile<T>(
 
   let fd: number;
   try {
-    fd = openSync(lexical, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    fd = openSync(
+      lexical,
+      (writable ? constants.O_RDWR : constants.O_RDONLY)
+      | constants.O_NOFOLLOW
+      | constants.O_NONBLOCK,
+    );
   } catch (error: any) {
     if (error?.code === "ENOENT") {
       throw new InitialFileMissingError(relativePath, { cause: error });
@@ -124,51 +177,93 @@ export function withStableRegularFile<T>(
     throw error;
   }
   try {
-    const beforeRaw = fstatSync(fd);
-    if (!beforeRaw.isFile()) {
-      throw new Error(`not a regular file beneath canonical root: ${relativePath}`);
-    }
-    const before = stableStat(beforeRaw);
+    const opened = inspectDescriptor(fd, canonicalRoot, relativePath, lexical);
+    let closed = false;
+    return {
+      fd,
+      stat: opened.stat,
+      canonicalPath: opened.canonicalPath,
+      verify() {
+        if (closed) throw new Error(`descriptor already closed: ${relativePath}`);
+        const current = inspectDescriptor(fd, canonicalRoot, relativePath, lexical);
+        if (!sameStat(opened.stat, current.stat)
+          || current.canonicalPath !== opened.canonicalPath) {
+          throw new StableFileIdentityError(
+            `file changed while descriptor was retained: ${relativePath}`,
+          );
+        }
+        return current.stat;
+      },
+      close() {
+        if (!closed) {
+          closed = true;
+          closeSync(fd);
+        }
+      },
+    };
+  } catch (error) {
+    closeSync(fd);
+    throw error;
+  }
+}
+
+export function readStableRegularDescriptor(
+  handle: StableRegularFileDescriptor,
+  relativePath: string,
+  maxSize: number,
+): Buffer {
+  const before = handle.verify();
+  if (before.size > maxSize) {
+    throw new Error(`file exceeds ${maxSize} byte limit: ${relativePath}`);
+  }
+  const buffer = Buffer.allocUnsafe(before.size + 1);
+  let offset = 0;
+  while (offset < buffer.length) {
+    const bytes = readSync(handle.fd, buffer, offset, buffer.length - offset, offset);
+    if (bytes === 0) break;
+    offset += bytes;
+  }
+  if (offset !== before.size) {
+    throw new StableFileIdentityError(`file changed length while reading: ${relativePath}`);
+  }
+  handle.verify();
+  return buffer.subarray(0, before.size);
+}
+
+/**
+ * Open one traversal-free path beneath a canonical root with no-follow and
+ * nonblocking semantics, read through that exact descriptor, then prove both
+ * the descriptor and current lexical pathname still identify the same stable
+ * regular file beneath the root.
+ */
+export function withStableRegularFile<T>(
+  canonicalRoot: string,
+  relativePath: string,
+  options: StableFileOptions,
+  reader: (fd: number, stat: StableFileStat) => T,
+): StableFile<T> {
+  const handle = openStableRegularFileDescriptor(canonicalRoot, relativePath);
+  try {
+    const before = handle.stat;
     if (options.maxSize !== undefined && before.size > options.maxSize) {
       throw new Error(`file exceeds ${options.maxSize} byte limit: ${relativePath}`);
     }
-    const openedBefore = realpathSync(descriptorPath(fd));
-    if (!isBeneath(canonicalRoot, openedBefore)) {
-      throw new Error(`opened file escapes canonical root: ${relativePath}`);
-    }
 
     options.afterStat?.(relativePath);
-    const value = reader(fd, before);
-
-    const afterRaw = fstatSync(fd);
-    if (!afterRaw.isFile()) {
-      throw new Error(`opened file changed type: ${relativePath}`);
+    const value = reader(handle.fd, before);
+    try {
+      handle.verify();
+    } catch (error) {
+      if (error instanceof StableFileIdentityError) {
+        throw new StableFileIdentityError(`file changed while reading: ${relativePath}`, {
+          cause: error,
+        });
+      }
+      throw error;
     }
-    const after = stableStat(afterRaw);
-    if (!sameStat(before, after)) {
-      throw new Error(`file changed while reading: ${relativePath}`);
-    }
-    const openedAfter = realpathSync(descriptorPath(fd));
-    if (!isBeneath(canonicalRoot, openedAfter) || openedAfter !== openedBefore) {
-      throw new Error(`opened file moved outside canonical root: ${relativePath}`);
-    }
-
-    const lexicalStat = lstatSync(lexical);
-    if (!lexicalStat.isFile()
-      || lexicalStat.dev !== before.dev
-      || lexicalStat.ino !== before.ino
-      || lexicalStat.size !== before.size
-      || lexicalStat.mtimeMs !== before.mtimeMs
-      || lexicalStat.ctimeMs !== before.ctimeMs) {
-      throw new Error(`lexical file identity changed while reading: ${relativePath}`);
-    }
-    const lexicalCanonical = realpathSync(lexical);
-    if (!isBeneath(canonicalRoot, lexicalCanonical) || lexicalCanonical !== openedAfter) {
-      throw new Error(`lexical file escapes canonical root: ${relativePath}`);
-    }
-    return { value, stat: before, canonicalPath: openedAfter };
+    return { value, stat: before, canonicalPath: handle.canonicalPath };
   } finally {
-    closeSync(fd);
+    handle.close();
   }
 }
 

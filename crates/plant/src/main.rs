@@ -439,7 +439,8 @@ async fn main() {
     let client = http_client();
     println!("vault={}", vault.display());
 
-    let mut _accept_loops = vec![];
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut accept_loops = vec![];
     for (listener, _, a) in ownership.into_servers() {
         let ctx = Arc::new(ProxyCtx {
             adapter: a,
@@ -447,7 +448,12 @@ async fn main() {
             client: client.clone(),
             otel: otel.clone(),
         });
-        _accept_loops.push(tokio::spawn(proxy::serve(listener, ctx)));
+        accept_loops.push(tokio::spawn(proxy::serve_until_shutdown(
+            listener,
+            ctx,
+            shutdown_rx.clone(),
+            Duration::from_secs(30),
+        )));
     }
 
     if otel.enabled {
@@ -490,11 +496,22 @@ async fn main() {
         _ = usr2.recv() => "signal:SIGUSR2",
     };
     if why == "signal:SIGTERM" || why == "signal:SIGINT" {
-        // Retain both listener leases through the bounded drain. Releasing them
-        // early would let a replacement recover/seal while existing capture
-        // tasks can still commit.
+        // Each supervisor stops accepting, drains only its fixed pre-cancellation
+        // connection set, aborts/reaps leftovers, and returns its listener lease.
         println!("[plant] {why}, draining up to 30s");
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        let _ = shutdown_tx.send(true);
+        let mut listener_leases = Vec::with_capacity(accept_loops.len());
+        for accept_loop in accept_loops {
+            match accept_loop.await {
+                Ok(listener) => listener_leases.push(listener),
+                Err(error) => {
+                    eprintln!("[plant] accept loop failed during shutdown: {error}");
+                    record_exit(started, "exit:1");
+                    std::process::exit(1);
+                }
+            }
+        }
+        drop(listener_leases);
         record_exit(started, "exit:0");
         std::process::exit(0);
     }
@@ -521,25 +538,6 @@ mod tests {
             );
             assert!(health_matches(&health, &adapter));
         }
-    }
-
-    #[tokio::test]
-    async fn listener_lease_survives_the_bounded_drain() {
-        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
-            .await
-            .unwrap();
-        let address = listener.local_addr().unwrap();
-        let drain = tokio::spawn(async move {
-            let _lease = listener;
-            tokio::time::sleep(Duration::from_millis(50)).await;
-        });
-        assert!(
-            tokio::net::TcpListener::bind(address).await.is_err(),
-            "replacement must not bind during drain"
-        );
-        drain.await.unwrap();
-        let replacement = tokio::net::TcpListener::bind(address).await.unwrap();
-        drop(replacement);
     }
 
     #[tokio::test]

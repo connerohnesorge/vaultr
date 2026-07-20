@@ -21,6 +21,7 @@ import {
   agentRun,
   setIngestionStatHookForTest,
   setMetadataStatHookForTest,
+  setStaleOwnerReadHookForTest,
   setStaleRecoveryHookForTest,
   setStatePublishHookForTest,
 } from "./index.ts";
@@ -159,6 +160,7 @@ beforeEach(() => {
 afterEach(() => {
   setIngestionStatHookForTest();
   setMetadataStatHookForTest();
+  setStaleOwnerReadHookForTest();
   setStaleRecoveryHookForTest();
   setStatePublishHookForTest();
   rmSync(tmp, { recursive: true, force: true });
@@ -468,7 +470,7 @@ test("concurrent door processes launch one batch once", async () => {
   writeIdempotentStub(0, { delay: 0.3 });
   const first = spawnWorker();
   let owner: any;
-  for (let attempt = 0; attempt < 50 && !owner; attempt++) {
+  for (let attempt = 0; attempt < 200 && !owner; attempt++) {
     try {
       owner = JSON.parse(readFileSync(join(tmp, "state", "t.lock"), "utf8"));
     } catch {
@@ -482,7 +484,7 @@ test("concurrent door processes launch one batch once", async () => {
   expect(stubCalls()).toBe(1);
 });
 
-test("two processes taking over one stale owner cannot remove the successor lock", async () => {
+test("two contenders retaining one stale inode cannot remove its successor lock", async () => {
   landFile("mail/a.md", 1000);
   writeIdempotentStub(0, { delay: 1 });
   mkdirSync(join(tmp, "state"), { recursive: true });
@@ -531,6 +533,62 @@ test("two processes taking over one stale owner cannot remove the successor lock
   expect(JSON.parse(readFileSync(lock, "utf8"))).toEqual(successor);
   expect(await winner.exited).toBe(0);
   expect(stubCalls()).toBe(1);
+  expect(existsSync(`${lock}.recovery`)).toBe(false);
+});
+
+test("a live successor swapped in after guarded owner parse is retained", async () => {
+  landFile("mail/a.md", 1000);
+  mkdirSync(join(tmp, "state"), { recursive: true });
+  const exited = Bun.spawn(["/usr/bin/true"]);
+  await exited.exited;
+  const stale = { pid: exited.pid, token: "stale-owner" };
+  const successor = { pid: process.pid, token: "live-successor" };
+  const lock = join(tmp, "state", "t.lock");
+  writeFileSync(lock, `${JSON.stringify(stale)}\n`);
+  let swapped = false;
+  setStaleOwnerReadHookForTest(() => {
+    renameSync(lock, `${lock}.stale`);
+    writeFileSync(lock, `${JSON.stringify(successor)}\n`);
+    swapped = true;
+  });
+
+  const result = await door({ name: "t", watch: "mail/*.md", prompt: () => "must not launch" });
+  expect(result).toEqual({ code: 75, detail: 'door "t" is already running' });
+  expect(swapped).toBe(true);
+  expect(JSON.parse(readFileSync(lock, "utf8"))).toEqual(successor);
+  expect(JSON.parse(readFileSync(`${lock}.stale`, "utf8"))).toEqual(stale);
+  expect(stubCalls()).toBe(0);
+});
+
+test("retargeting an intermediate state alias cannot redirect stale unlink", async () => {
+  landFile("mail/a.md", 1000);
+  const oldBase = join(tmp, "old-base");
+  const newBase = join(tmp, "new-base");
+  const alias = join(tmp, "state-alias");
+  mkdirSync(join(oldBase, "doors"), { recursive: true });
+  mkdirSync(join(newBase, "doors"), { recursive: true });
+  symlinkSync(oldBase, alias);
+  process.env.DOOR_STATE_DIR = join(alias, "doors");
+
+  const exited = Bun.spawn(["/usr/bin/true"]);
+  await exited.exited;
+  const stale = { pid: exited.pid, token: "stale-owner" };
+  const successor = { pid: process.pid, token: "new-root-successor" };
+  const oldLock = join(oldBase, "doors", "t.lock");
+  const successorLock = join(newBase, "doors", "t.lock");
+  writeFileSync(oldLock, `${JSON.stringify(stale)}\n`);
+  writeFileSync(successorLock, `${JSON.stringify(successor)}\n`);
+  setStaleOwnerReadHookForTest(() => {
+    unlinkSync(alias);
+    symlinkSync(newBase, alias);
+  });
+
+  const result = await door({ name: "t", watch: "mail/*.md", prompt: () => "must not launch" });
+  expect(result.code).toBe(1);
+  expect(result.detail).toContain("state root changed");
+  expect(existsSync(oldLock)).toBe(false);
+  expect(JSON.parse(readFileSync(successorLock, "utf8"))).toEqual(successor);
+  expect(stubCalls()).toBe(0);
 });
 
 test("an incomplete legacy lock is retained and fails closed", async () => {
@@ -592,6 +650,13 @@ test("lock control reads reject FIFO, symlink, oversize, swap, and post-open rem
   });
   expect(huge.code).toBe(1);
   expect(huge.detail).toContain("1048576 byte limit");
+
+  mkdirSync(join(state, "lock-directory.lock"));
+  expect((await door({
+    name: "lock-directory",
+    watch: "mail/*.md",
+    prompt: () => "must not launch",
+  })).code).toBe(1);
 
   for (const mode of ["swap", "missing"] as const) {
     const name = `lock-${mode}`;

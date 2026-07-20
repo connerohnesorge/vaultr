@@ -37,11 +37,20 @@ and fsynced before the canonical lock path becomes visible. An incomplete
 canonical lock from the legacy publisher MUST be boundedly reread and then left
 intact while the Door fails closed; it MUST NOT be reclaimed by a running Door.
 Its removal requires an explicit offline migration after verifying no legacy
-Door process exists. Reclaiming a complete lock whose owner is dead MUST occur
-under one kernel-backed per-door recovery lock, with the observed PID and token
-reread and matched while guarded before unlink and directory fsync. If that
-guard is unavailable or the owner changed, the Door MUST fail closed or retry
-without unlinking the canonical lock. A given file MUST never launch a second
+Door process exists. Reclaiming a complete lock whose owner is dead MUST open
+the canonical complete lock itself beneath the canonical state root with
+no-follow and nonblocking semantics, verify a bounded regular file and stable
+descriptor/path device-inode identity, and retain that descriptor while taking
+an exclusive flock. The observed PID and token MUST be parsed and rechecked
+through that same descriptor; the canonical pathname MUST still identify that
+descriptor immediately before unlink while the flock remains held. Unlink and
+directory fsync MUST use the retained canonical root and entry rather than the
+original state-directory alias, and acquisition MUST fail closed if that alias
+no longer resolves to the same root. If the descriptor guard is unavailable,
+the owner changes, or the path is a symlink, FIFO, non-regular node, oversize
+file, missing path, replacement inode, or retargeted intermediate alias, the
+Door MUST fail closed or retry without unlinking any successor. A given file
+MUST never launch a second
 agent run. Legacy scalar and cursor migrations MUST reject negative zero,
 frontiers with no representable finite successor, and absolute or traversing
 paths. Every migrated value MUST pass canonical v2 parsing before it is saved
@@ -88,9 +97,18 @@ its first post-migration launch.
 #### Scenario: Two processes observe one stale owner
 
 - WHEN two Door processes read the same complete lock whose recorded owner is dead
-- THEN stale-owner verification and unlink occur under the same kernel-backed recovery lock
+- THEN both retain the same canonical lock inode and serialize on its exclusive flock
+- AND each parses and rechecks the PID/token through that descriptor and reproves canonical path device-inode identity before unlink
 - AND a delayed contender cannot unlink a successor's live canonical lock
 - AND only one process can claim and launch the batch
+
+#### Scenario: Hostile stale-lock control path or root alias
+
+- WHEN the canonical complete lock is a symlink, FIFO, non-regular node, oversize file, or is replaced after guarded owner parsing
+- OR an intermediate state-directory alias is retargeted after the canonical descriptor is opened
+- THEN no-follow nonblocking descriptor validation fails closed without blocking
+- AND unlink and fsync cannot be redirected through the alias
+- AND the Door does not unlink the replacement, advance state, or launch an agent
 
 #### Scenario: Files share a timestamp
 

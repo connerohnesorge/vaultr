@@ -40,7 +40,10 @@ durably publish a unique attempt fence before waiting for scheduler capacity or
 performing any job side effect. Every terminal execution path MUST pass one
 typed result through exactly one durable final-record transition or one
 retryable-fence transition. Plant MUST retain a nonretryable fence whenever the
-final outcome cannot be proven durable.
+final outcome cannot be proven durable. On daemon cancellation, Plant MUST
+stop both listener supervisors from accepting, freeze and boundedly drain only
+their pre-cancellation connection sets, abort and reap leftovers, and retain
+both listener leases until both supervisors join.
 
 #### Scenario: State is unavailable before dispatch
 
@@ -103,7 +106,13 @@ final outcome cannot be proven durable.
 - THEN it acquires both capture listeners or releases any partial bind before mutation
 - AND performs startup/offline capture recovery once while retaining both leases
 - AND scheduled compression sweeps never invoke capture recovery
-- AND daemon shutdown retains both listener leases through the bounded in-flight drain
+
+#### Scenario: Daemon shutdown freezes and drains accepted work
+
+- WHEN the listener-owning daemon receives cancellation
+- THEN both listener supervisors stop accepting new work
+- AND each supervisor freezes its pre-cancellation connection set, drains only that set to a bounded deadline, then aborts and reaps leftovers
+- AND both listener leases remain held until both supervisors have joined
 
 ### Requirement: Idempotent Plant agent runs
 
@@ -154,7 +163,7 @@ persistence failures as a conclusive `Failed` outcome.
 
 ### Requirement: Deep Herdr agent lifecycle
 
-Plant MUST run each agent-backed Cultivation Job through one high-level Herdr lifecycle interface that owns workspace creation and reclamation, verified agent readiness, prompt delivery, completion waiting, and best-effort cleanup with focus restoration. The scheduler MUST retain job selection, launch construction, prompts, cadence, and outcome recording.
+Plant MUST run each agent-backed Cultivation Job through one high-level Herdr lifecycle interface that owns workspace creation and reclamation, verified agent readiness, prompt delivery, completion waiting, and best-effort cleanup with focus restoration. After the final ready check, it MUST snapshot the selected native Claude/Codex pane's terminal and available agent-session identity, receive a subscription acknowledgment before exactly one checked atomic `pane run` prompt submission, observe that same pane/workspace enter `working` after the acknowledgment, observe its later `done` on the same buffered subscription, and recheck terminal/session identity before returning success. A failed submission, missing transition, pre-existing terminal state, or pane identity change MUST NOT return `Succeeded`. The scheduler MUST retain job selection, launch construction, prompts, cadence, and outcome recording.
 
 #### Scenario: Herdr is unavailable before an attempt
 
@@ -164,15 +173,30 @@ Plant MUST run each agent-backed Cultivation Job through one high-level Herdr li
 
 #### Scenario: Startup or prompt delivery fails
 
-- WHEN Herdr is available but workspace creation, CLI startup, or prompt delivery fails
+- WHEN Herdr is available but workspace creation, CLI startup, subscription acknowledgment, or the single atomic prompt submission fails
 - THEN the lifecycle returns `Failed` with a diagnostic detail
 - AND Plant records the failed attempt using the existing cadence policy
 
 #### Scenario: Agent run succeeds
 
-- WHEN a verified native Claude or Codex pane is idle or done, receives the verified prompt, and reaches completion
+- WHEN a verified native Claude or Codex pane is idle or done
+- AND the lifecycle acknowledges its pane-scoped status subscription before exactly one checked `pane run`
+- AND that same buffered stream observes `working` followed by `done`
+- AND the terminal and available agent-session identities remain unchanged
 - THEN the lifecycle returns `Succeeded` with a diagnostic detail
 - AND applies the supplied `Never`, `Always`, or `OnSuccess` cleanup policy without changing user focus
+
+#### Scenario: Pre-existing done is not this run
+
+- WHEN the selected pane is already `done` before prompt submission but no post-acknowledgment `working` transition is observed
+- THEN the lifecycle returns `Failed`
+- AND Plant MUST NOT durably report the run as succeeded
+
+#### Scenario: Pane identity changes during the turn
+
+- WHEN the pane's terminal or captured agent-session identity changes after submission
+- THEN the lifecycle returns `Failed` even if a terminal status is observed
+- AND Plant MUST NOT durably report the run as succeeded
 
 #### Scenario: Agentless or unknown pane is observed
 

@@ -9,12 +9,13 @@ typed code rather than bash or a bespoke declarative format.
 
 ## Non-goals
 
-- Defending mail projector path publication against a hostile same-account
-  process that substitutes a directory within one individual Node path syscall
-  is out of scope. Stable Bun/Node exposes no portable `openat`/`linkat`/
-  `renameat` API, and experimental `bun:ffi` is not a production dependency.
-  The shipped held-directory fallback prevents static and pre-operation
-  substitution and fails closed under deterministic directory-swap tests.
+- Defending a mail projector publication or stale Door-lock unlink against a
+  hostile same-account process that substitutes a path within one individual
+  Node path syscall is out of scope. Stable Bun/Node exposes no portable
+  `openat`/`linkat`/`renameat` API, and experimental `bun:ffi` is not a
+  production dependency. The shipped retained-descriptor and held-directory
+  guards prevent static and pre-operation substitution and fail closed under
+  deterministic path-swap tests.
 
 ## Decision summary
 
@@ -28,8 +29,11 @@ typed code rather than bash or a bespoke declarative format.
   cannot strand the guard.
 - The daemon and offline compressor acquire both capture listeners before
   recovery. Startup/offline recovery runs once under those leases; scheduled
-  compression only sweeps. Daemon accept loops retain the leases through the
-  shutdown drain, and a failed partial bind is dropped before any mutation.
+  compression only sweeps. On daemon cancellation, each listener supervisor
+  stops accepting, freezes its pre-cancellation connection `JoinSet`, drains
+  only that set to one deadline, aborts and reaps leftovers, and returns its
+  listener descriptor. Both leases remain held until both supervisors join. A
+  failed partial bind is dropped before any mutation.
 - The fragile parts — dedup fencing, watch-root policy, fire-rate breaking,
   agent launch — are written once in a shared TypeScript library, not
   re-authored per door.
@@ -89,6 +93,15 @@ receipt and durable idempotency transition around that lifecycle, and
 `state.rs` owns the durable filesystem operations shared by Agent Runs, jobs,
 capture staging, and sweep state. Herdr therefore does not depend back on the
 job scheduler for persistence.
+
+After the final native Claude/Codex ready check, the lifecycle snapshots the
+pane's terminal and reported agent session, acknowledges one pane-scoped
+`pane.agent_status_changed` subscription, and performs exactly one checked
+`pane run`. Herdr 0.7.4 submits that text plus Enter atomically. The lifecycle
+accepts success only after the same buffered subscription observes `working`
+followed by `done`, then rechecks the terminal/session identity. Thus a
+pre-existing `done`, failed submission, missing transition, fast
+working-to-done turn, or pane reuse cannot be confused with this run.
 
 ### ADR-0004: Loop prevention is allowlist-by-construction plus a rate breaker
 
@@ -174,10 +187,19 @@ incomplete canonical lock may still belong to the shipped legacy publisher:
 the Door boundedly rereads it, then fails closed without unlinking it. Such a
 lock is removed only as an explicit offline migration after verifying no
 legacy Door process exists. Complete locks whose recorded owner is dead are
-reclaimed only while holding a descriptor-bound advisory lock on a permanent
-per-door recovery inode. The winner rereads the canonical owner and verifies
-the exact observed PID and token before unlinking and fsyncing; contenders
-whose guarded observation changed cannot remove the successor lock.
+reclaimed through the canonical lock inode itself. Each contender opens that
+path under the canonical state root with no-follow and nonblocking semantics,
+bounds and parses the regular file through the retained descriptor, and takes
+an exclusive flock on that descriptor. While flock remains held, it rereads
+and matches the observed PID/token through the same descriptor, revalidates
+that the canonical pathname still names the retained device/inode, unlinks
+only that canonical pathname, and fsyncs the retained canonical parent rather
+than any original state-directory alias. The alias must still resolve to the
+same root before acquisition continues. Contenders that retained the old inode
+serialize; after one unlinks or publishes a successor, a delayed contender
+observes a missing or changed pathname and cannot remove the successor.
+Symlinks, FIFOs, non-regular nodes, oversize metadata, pathname replacement,
+and intermediate state-root alias retargeting fail closed.
 
 Shipped scalar `hwm` and v1 `(mtime,path)` states migrate under the Door lock
 and the v2 replacement is durable before evaluation. A scalar `hwm` cannot

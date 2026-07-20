@@ -25,7 +25,11 @@ import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path
 import {
   canonicalDirectory,
   InitialFileMissingError,
+  openStableRegularFileDescriptor,
+  readStableRegularDescriptor,
   readStableRegularFile,
+  StableFileIdentityError,
+  type StableRegularFileDescriptor,
   validRelativeFilePath,
   withStableRegularFile,
 } from "./safe-loader.ts";
@@ -63,6 +67,9 @@ let beforeStatePublishForTest: (() => void) | undefined;
 let beforeStaleRecoveryForTest:
   | ((owner: { pid: number; token: string }) => void | Promise<void>)
   | undefined;
+let afterStaleOwnerReadForTest:
+  | ((owner: { pid: number; token: string }) => void | Promise<void>)
+  | undefined;
 
 export function setIngestionStatHookForTest(hook?: (path: string) => void): void {
   afterIngestionStatForTest = hook;
@@ -80,6 +87,12 @@ export function setStaleRecoveryHookForTest(
   hook?: (owner: { pid: number; token: string }) => void | Promise<void>,
 ): void {
   beforeStaleRecoveryForTest = hook;
+}
+
+export function setStaleOwnerReadHookForTest(
+  hook?: (owner: { pid: number; token: string }) => void | Promise<void>,
+): void {
+  afterStaleOwnerReadForTest = hook;
 }
 
 export type AgentRunReceipt =
@@ -209,10 +222,6 @@ interface DoorState {
 
 function statePath(name: string): string {
   return `${stateDir()}/${name}.json`;
-}
-
-function lockPath(name: string): string {
-  return `${stateDir()}/${name}.lock`;
 }
 
 function compareFile(a: FileOrder, b: FileOrder): number {
@@ -513,9 +522,7 @@ function readControlFile(fileName: string): Buffer | undefined {
   }
 }
 
-function lockOwner(path: string): { pid: number; token: string } | undefined {
-  const bytes = readControlFile(basename(path));
-  if (bytes === undefined) return undefined;
+function parseLockOwner(bytes: Buffer, path: string): { pid: number; token: string } {
   let owner: any;
   try {
     owner = JSON.parse(bytes.toString("utf8"));
@@ -527,6 +534,23 @@ function lockOwner(path: string): { pid: number; token: string } | undefined {
     throw new IncompleteLockOwner(`invalid door lock ${path}`);
   }
   return owner;
+}
+
+function lockOwner(path: string): { pid: number; token: string } | undefined {
+  const root = canonicalDirectory(dirname(path));
+  let bytes: Buffer;
+  try {
+    bytes = readStableRegularFile(
+      root,
+      basename(path),
+      MAX_STATE_BYTES,
+      afterMetadataStatForTest,
+    ).value;
+  } catch (error) {
+    if (error instanceof InitialFileMissingError) return undefined;
+    throw error;
+  }
+  return parseLockOwner(bytes, path);
 }
 
 async function readPublishedLockOwner(
@@ -553,24 +577,68 @@ async function recoverStaleLock(
   if (!kernelLock) {
     throw new Error(`kernel-backed recovery unavailable; refusing to remove stale lock ${path}`);
   }
-  const recoveryPath = `${path}.recovery`;
-  const fd = openSync(recoveryPath, constants.O_RDWR | constants.O_CREAT, 0o600);
-  if (kernelLock.symbols.flock(fd, LOCK_EX | LOCK_NB) !== 0) {
-    closeSync(fd);
-    throw new Error(`stale lock recovery already in progress for ${path}`);
-  }
+  const relativePath = basename(path);
+  const root = canonicalDirectory(dirname(path));
+  const canonicalPath = resolve(root, relativePath);
+  let handle: StableRegularFileDescriptor;
   try {
-    const current = await readPublishedLockOwner(path);
-    if (!current) return false;
+    handle = openStableRegularFileDescriptor(root, relativePath, true);
+  } catch (error) {
+    if (error instanceof InitialFileMissingError) return false;
+    throw error;
+  }
+  let locked = false;
+  try {
+    // Both contenders retain the canonical stale inode before they serialize.
+    // A delayed contender can therefore prove the pathname was unlinked or now
+    // names a successor instead of ever touching that successor.
+    await beforeStaleRecoveryForTest?.(observed);
+    for (let attempt = 0; attempt < 400; attempt++) {
+      if (kernelLock.symbols.flock(handle.fd, LOCK_EX | LOCK_NB) === 0) {
+        locked = true;
+        break;
+      }
+      await Bun.sleep(5);
+    }
+    if (!locked) {
+      throw new Error(`timed out serializing stale lock recovery for ${path}`);
+    }
+
+    let current: { pid: number; token: string };
+    try {
+      current = parseLockOwner(
+        readStableRegularDescriptor(handle, relativePath, MAX_STATE_BYTES),
+        path,
+      );
+    } catch (error) {
+      if (error instanceof StableFileIdentityError) return false;
+      throw error;
+    }
     if (current.pid !== observed.pid || current.token !== observed.token || pidAlive(current.pid)) {
       return false;
     }
-    unlinkSync(path);
-    syncDirectory(stateDir());
+    await afterStaleOwnerReadForTest?.(current);
+    try {
+      const rechecked = parseLockOwner(
+        readStableRegularDescriptor(handle, relativePath, MAX_STATE_BYTES),
+        path,
+      );
+      if (rechecked.pid !== observed.pid
+        || rechecked.token !== observed.token
+        || pidAlive(rechecked.pid)) {
+        return false;
+      }
+      handle.verify();
+    } catch (error) {
+      if (error instanceof StableFileIdentityError) return false;
+      throw error;
+    }
+    unlinkSync(canonicalPath);
+    syncDirectory(root);
     return true;
   } finally {
-    kernelLock.symbols.flock(fd, LOCK_UN);
-    closeSync(fd);
+    if (locked) kernelLock.symbols.flock(handle.fd, LOCK_UN);
+    handle.close();
   }
 }
 
@@ -584,6 +652,7 @@ function pidAlive(pid: number): boolean {
 }
 
 function publishLock(path: string, owner: { pid: number; token: string }): boolean {
+  const root = dirname(path);
   const tmp = `${path}.tmp-${owner.token}`;
   let fd: number | undefined;
   let linked = false;
@@ -600,13 +669,13 @@ function publishLock(path: string, owner: { pid: number; token: string }): boole
       if (error?.code === "EEXIST") return false;
       throw error;
     }
-    syncDirectory(stateDir());
+    syncDirectory(root);
     return true;
   } catch (error) {
     if (linked) {
       try {
         unlinkSync(path);
-        syncDirectory(stateDir());
+        syncDirectory(root);
       } catch {}
     }
     throw error;
@@ -614,21 +683,24 @@ function publishLock(path: string, owner: { pid: number; token: string }): boole
     if (fd !== undefined) closeSync(fd);
     try {
       unlinkSync(tmp);
-      syncDirectory(stateDir());
+      syncDirectory(root);
     } catch {}
   }
 }
 
 async function acquireLock(name: string): Promise<(() => void) | undefined> {
   ensureDirectoryDurable(stateDir());
-  const path = lockPath(name);
+  const root = canonicalDirectory(stateDir());
+  const path = resolve(root, `${name}.lock`);
   for (let attempt = 0; attempt < 3; attempt++) {
+    if (canonicalDirectory(stateDir()) !== root) {
+      throw new Error(`door state root changed while acquiring ${name}`);
+    }
     const token = randomUUID();
     if (!publishLock(path, { pid: process.pid, token })) {
       const owner = await readPublishedLockOwner(path);
       if (!owner) continue;
       if (pidAlive(owner.pid)) return undefined;
-      await beforeStaleRecoveryForTest?.(owner);
       await recoverStaleLock(path, owner);
       continue;
     }
@@ -637,7 +709,7 @@ async function acquireLock(name: string): Promise<(() => void) | undefined> {
         throw new Error(`door lock ownership changed for ${name}`);
       }
       unlinkSync(path);
-      syncDirectory(stateDir());
+      syncDirectory(root);
     };
   }
   throw new Error(`could not recover stale door lock ${path}`);
