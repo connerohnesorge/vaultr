@@ -114,6 +114,30 @@ fn generation_policy_propagates_post_inventory_io_errors() {
 }
 
 #[test]
+fn prior_generation_loss_after_inventory_fails_maintenance_policy() {
+    let root = temp_root("prior-generation-io");
+    let directory = root.join("session");
+    let raw = directory.join("turns.jsonl");
+    let sealed = directory.join("turns.jsonl.zst");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(&raw, "{}\n".repeat(6)).unwrap();
+    std::fs::write(&sealed, "sealed").unwrap();
+    let inventory = vaultr::vault::CaptureGenerations::load(&directory).unwrap();
+    let generation = SessionGeneration::current("session".to_string(), inventory).unwrap();
+    let learned = HashMap::from([("session".to_string(), u64::MAX)]);
+
+    std::fs::remove_file(&sealed).unwrap();
+    let error = generation.learned_current(&learned).unwrap_err();
+    assert!(error.contains(&sealed.display().to_string()), "{error}");
+    let error = generation
+        .ready_to_seal(&learned, &learned, &HashSet::new(), Duration::ZERO)
+        .unwrap_err();
+    assert!(error.contains(&sealed.display().to_string()), "{error}");
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn stuck_classification_covers_every_ledger_state() {
     let root = temp_root("stuck");
     let sessions = root.join("sessions");
@@ -299,7 +323,9 @@ fn resumed_session_is_relearned_per_generation() {
     let inventory = vaultr::vault::CaptureGenerations::load(&directory).unwrap();
     let sealed = SessionGeneration::current(sid.to_string(), inventory).unwrap();
     assert_eq!(sealed.selected, GenerationKind::Sealed);
-    assert!(sealed.learned_current(&ledger_latest(&sessions, Harness::ClaudeCode)));
+    assert!(sealed
+        .learned_current(&ledger_latest(&sessions, Harness::ClaudeCode))
+        .unwrap());
 
     std::fs::remove_dir_all(root).unwrap();
 }

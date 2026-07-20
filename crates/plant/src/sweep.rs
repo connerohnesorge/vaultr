@@ -126,27 +126,34 @@ impl SessionGeneration {
         .expect("selected capture generation is present")
     }
 
-    fn learned_current(&self, latest: &HashMap<String, u64>) -> bool {
+    fn learned_current(&self, latest: &HashMap<String, u64>) -> Result<bool, String> {
         let Some(&timestamp) = latest.get(&self.sid) else {
-            return false;
+            return Ok(false);
         };
         if self.selected != GenerationKind::Raw {
-            return true;
+            return Ok(true);
         }
-        let previous = self
+        let Some(previous) = self
             .inventory
             .detached
             .as_ref()
             .map(|generation| generation.path.as_path())
-            .or(self.inventory.sealed.as_deref());
-        match previous
-            .and_then(|path| std::fs::metadata(path).ok())
-            .and_then(|metadata| metadata.modified().ok())
-            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
-        {
-            None => true,
-            Some(boundary) => timestamp > boundary.as_secs(),
-        }
+            .or(self.inventory.sealed.as_deref())
+        else {
+            return Ok(true);
+        };
+        let modified = std::fs::metadata(previous)
+            .and_then(|metadata| metadata.modified())
+            .map_err(|error| {
+                format!(
+                    "inspect prior capture generation {}: {error}",
+                    previous.display()
+                )
+            })?;
+        let Some(boundary) = modified.duration_since(std::time::UNIX_EPOCH).ok() else {
+            return Ok(true);
+        };
+        Ok(timestamp > boundary.as_secs())
     }
 
     fn idle_secs(&self) -> Result<Option<u64>, String> {
@@ -200,9 +207,11 @@ impl SessionGeneration {
         if self.selected == GenerationKind::Detached {
             return Ok(true);
         }
-        Ok((self.learned_current(claude) && self.learned_current(codex)
-            || jobs.contains(&self.sid))
-            && self.idle_for(idle)?)
+        Ok(
+            (self.learned_current(claude)? && self.learned_current(codex)?
+                || jobs.contains(&self.sid))
+                && self.idle_for(idle)?,
+        )
     }
 }
 
@@ -364,8 +373,8 @@ pub fn stuck_captures(vault: &Path, age: Duration) -> Result<Vec<StuckCapture>, 
             StuckState::JobCapture
         } else {
             match (
-                generation.learned_current(&claude),
-                generation.learned_current(&codex),
+                generation.learned_current(&claude)?,
+                generation.learned_current(&codex)?,
             ) {
                 (true, true) => StuckState::SealBlocked,
                 (true, false) => StuckState::HalfLearned(Harness::Codex),
@@ -434,7 +443,7 @@ fn eligible_candidates(
     let mut candidates = Vec::new();
     for generation in current_generations(vault)? {
         if jobs.contains(&generation.sid)
-            || generation.learned_current(&processed)
+            || generation.learned_current(&processed)?
             || inflight.contains(&generation.sid)
             || !generation.idle_for(idle)?
             || !generation.substantive()?
