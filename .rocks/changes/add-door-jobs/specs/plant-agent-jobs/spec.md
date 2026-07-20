@@ -132,10 +132,19 @@ MUST return its prior durable outcome without creating another Herdr workspace.
 Unreadable, corrupt, or unresolved in-progress idempotency state MUST fail
 closed without launching. Plant MUST durably link newly created state
 directories before publishing a job fence, Agent Run claim, or outcome. The
-command MUST directly serialize one tagged `AgentRunReceipt` enum whose variant
-determines exit status and durability; it MUST NOT independently serialize
-state, durability, and exit-code fields that can disagree or report claim or
-persistence failures as a conclusive `Failed` outcome.
+command MUST directly serialize one tagged `AgentRunReceipt` enum when an
+idempotency key is supplied; its variant determines exit status and durability.
+It MUST NOT independently serialize state, durability, and exit-code fields
+that can disagree or report claim or persistence failures as a conclusive
+`Failed` outcome. Without an idempotency key, the command MUST preserve its
+legacy human status line and exit mapping instead of emitting receipt JSON.
+
+#### Scenario: An unkeyed agent run uses the legacy CLI contract
+
+- WHEN `plant agent run` is invoked without an idempotency key
+- THEN its final stdout line is `[agent:<label>] succeeded: <detail>`, `[agent:<label>] herdr unavailable`, or `[agent:<label>] failed: <detail>`
+- AND it exits 0, 75, or 1 respectively
+- AND it does not emit an `AgentRunReceipt`
 
 #### Scenario: A completed agent run is retried
 

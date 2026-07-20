@@ -239,15 +239,34 @@ async fn subcommand(argv: &[String]) -> Option<i32> {
                 preset_session_id,
                 discover_session_id: cli == "codex",
             };
-            let receipt = match flag("--idempotency-key") {
-                Some(key) => agent_run::run_idempotent(run, &key).await,
-                None => agent_run::AgentRunReceipt::untracked(herdr::run_agent(run).await),
-            };
-            println!(
-                "{}",
-                serde_json::to_string(&receipt).expect("receipt serializes")
-            );
-            Some(receipt.exit_code())
+            match flag("--idempotency-key") {
+                Some(key) => {
+                    let receipt = agent_run::run_idempotent(run, &key).await;
+                    println!(
+                        "{}",
+                        serde_json::to_string(&receipt).expect("receipt serializes")
+                    );
+                    Some(receipt.exit_code())
+                }
+                None => {
+                    let label = run.label.clone();
+                    match agent_run::AgentRunReceipt::untracked(herdr::run_agent(run).await) {
+                        agent_run::AgentRunReceipt::UntrackedSucceeded { detail } => {
+                            println!("[agent:{label}] succeeded: {detail}");
+                            Some(0)
+                        }
+                        agent_run::AgentRunReceipt::Retryable { .. } => {
+                            println!("[agent:{label}] herdr unavailable");
+                            Some(75)
+                        }
+                        agent_run::AgentRunReceipt::UntrackedFailed { detail } => {
+                            println!("[agent:{label}] failed: {detail}");
+                            Some(1)
+                        }
+                        _ => unreachable!("untracked run produced a durable receipt"),
+                    }
+                }
+            }
         }
         _ => None,
     }

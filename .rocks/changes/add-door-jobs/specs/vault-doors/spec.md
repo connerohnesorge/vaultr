@@ -354,12 +354,22 @@ manual re-arm before the door fires again.
 
 ### Requirement: Typed launch over plant agent run
 
-The library MUST launch agent sessions only through `plant agent run`, MUST
-pass the persisted claim's stable idempotency key, and MUST require Plant's
-tagged `AgentRunReceipt`, deriving durability and the expected process exit
-status from the receipt variant. It MUST NOT reconstruct independently supplied
-state, durability, and exit-code fields or reimplement any part of the Herdr
-lifecycle owned by Plant.
+The library MUST launch Door agent sessions through `agentRunReceipt`, which
+MUST call `plant agent run` with the persisted claim's stable idempotency key
+and require Plant's tagged `AgentRunReceipt`, deriving durability and the
+expected process exit status from the receipt variant. It MUST NOT reconstruct
+independently supplied state, durability, and exit-code fields or reimplement
+any part of the Herdr lifecycle owned by Plant. The package entry point MUST
+also retain the legacy uppercase `AgentOutcome` type and unkeyed `agentRun`
+wrapper, mapping exit 0 to `Succeeded`, 75 to `Unavailable`, and every other
+exit to `Failed`.
+
+#### Scenario: Existing unkeyed library caller remains compatible
+
+- WHEN a caller imports `AgentOutcome` and `agentRun` from the package entry point
+- THEN the public result uses only `Succeeded`, `Unavailable`, or `Failed`
+- AND the wrapper consumes Plant's legacy unkeyed human output
+- AND Door's durable receipt handling remains isolated in `agentRunReceipt`
 
 #### Scenario: Non-durable result does not advance the claim
 

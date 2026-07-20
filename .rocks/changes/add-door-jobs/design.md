@@ -82,15 +82,18 @@ code is wanted (filters, prompt building).
 The jobs contract already requires agent jobs to drive panes only via
 `plant agent run`, and `plant-agent-jobs` made Plant's Herdr lifecycle the
 single owner of workspace creation, readiness, delivery, wait, and cleanup.
-The library is a thin typed client over that interface: it supplies the
-persisted batch's stable idempotency key and parses Plant's serialized
-`AgentRunReceipt` tagged enum, whose variant alone determines exit status and
-durability, never a second lifecycle implementation. Plant durably claims each
-key before Herdr side effects, records conclusive outcomes before returning,
-and returns an already-recorded outcome without creating another workspace. A
-pre-launch unavailable probe is retryable; pending or inaccessible idempotency
-state and outcome-persistence failure are indeterminate. Neither advances Door
-state.
+The public library retains its legacy uppercase three-state `AgentOutcome` and
+unkeyed `agentRun` wrapper. Door uses the separate `agentRunReceipt` client,
+which supplies the persisted batch's stable idempotency key and parses Plant's
+serialized `AgentRunReceipt` tagged enum. The receipt variant alone determines
+exit status and durability, never a second lifecycle implementation. Plant
+durably claims each key before Herdr side effects, records conclusive outcomes
+before returning, and returns an already-recorded outcome without creating
+another workspace. A pre-launch unavailable probe is retryable; pending or
+inaccessible idempotency state and outcome-persistence failure are
+indeterminate. Neither advances Door state. Unkeyed CLI calls keep their
+established human status line and exit mapping; only keyed calls emit receipt
+JSON.
 
 Within Plant, `herdr.rs` owns only the Herdr lifecycle, `agent_run.rs` owns the
 receipt and durable idempotency transition around that lifecycle, and

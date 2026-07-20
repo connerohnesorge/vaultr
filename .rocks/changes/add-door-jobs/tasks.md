@@ -28,3 +28,4 @@
 - [x] 4.1 Put reusable retained-root durable create/no-replace/atomic-replace primitives in `safe-loader.ts`, bind Door state and locking to them from acquisition through release, and add adversarial publication regressions
 - [x] 4.2 Own capture tee/finalizer tasks in the listener shutdown set, cancel stalled upstream reads on client disconnect, and verify bounded shutdown before lease return
 - [x] 4.3 Split the Door library and tests by owned concept while keeping fault injection out of the public package entry point
+- [x] 4.4 Preserve the legacy uppercase `agentRun` API and unkeyed Plant human output while keeping keyed durable receipts on a separate `agentRunReceipt` API

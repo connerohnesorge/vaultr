@@ -1,7 +1,7 @@
 // A Door is a Plant job that turns new ingestion files into one durable agent run.
 
 import { basename } from "node:path";
-import { agentRun, receiptDurable } from "./agent-run.ts";
+import { agentRunReceipt, receiptDurable } from "./agent-run.ts";
 import type { AgentOpts } from "./agent-run.ts";
 import {
   claimRelativePath,
@@ -25,8 +25,13 @@ import {
   type DoorState,
 } from "./state.ts";
 
-export { agentRun } from "./agent-run.ts";
-export type { AgentOpts, AgentRunReceipt } from "./agent-run.ts";
+export { agentRun, agentRunReceipt } from "./agent-run.ts";
+export type {
+  AgentOpts,
+  AgentOutcome,
+  AgentRunReceipt,
+  AgentRunReceiptOpts,
+} from "./agent-run.ts";
 
 const WINDOW_MS = 3_600_000;
 
@@ -205,7 +210,7 @@ export async function door(spec: DoorSpec): Promise<DoorResult> {
     bindLegacyClaimIdentity(name, root, state, persist);
     const claim = state.claim!;
     const matched = hydrateClaim(root, claim);
-    const result = await agentRun(spec.prompt(matched), {
+    const result = await agentRunReceipt(spec.prompt(matched), {
       label: `door-${name}`,
       ...spec.agent,
       idempotencyKey: claim.key,

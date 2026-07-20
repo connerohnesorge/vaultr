@@ -1,5 +1,7 @@
 const plantBin = () => process.env.PLANT_BIN ?? "plant";
 
+export type AgentOutcome = "Succeeded" | "Unavailable" | "Failed";
+
 export type AgentRunReceipt =
   | { outcome: "succeeded"; detail: string }
   | { outcome: "failed"; detail: string }
@@ -16,7 +18,10 @@ export interface AgentOpts {
   cwd?: string;
   timeout?: string;
   cleanup?: "never" | "always" | "on-success";
-  idempotencyKey?: string;
+}
+
+export interface AgentRunReceiptOpts extends AgentOpts {
+  idempotencyKey: string;
 }
 
 function receiptExitCode(receipt: AgentRunReceipt): 0 | 1 | 75 {
@@ -39,11 +44,15 @@ function parseReceipt(value: unknown): AgentRunReceipt | undefined {
   return receipt as AgentRunReceipt;
 }
 
-/** Typed client over `plant agent run`, the only sanctioned agent launcher. */
-export async function agentRun(
+function lastLine(text: string): string | undefined {
+  return text.split("\n").map((line) => line.trim()).filter(Boolean).pop();
+}
+
+async function invokePlant(
   prompt: string,
-  opts: AgentOpts = {},
-): Promise<AgentRunReceipt> {
+  opts: AgentOpts,
+  idempotencyKey?: string,
+) {
   const argv = [
     plantBin(),
     "agent",
@@ -59,10 +68,10 @@ export async function agentRun(
     ["--cwd", opts.cwd],
     ["--timeout", opts.timeout],
     ["--cleanup", opts.cleanup],
-    ["--idempotency-key", opts.idempotencyKey],
   ] as const) {
     if (value) argv.push(flag, value);
   }
+  if (idempotencyKey) argv.push("--idempotency-key", idempotencyKey);
   const proc = Bun.spawn(argv, {
     stdin: new TextEncoder().encode(prompt),
     stdout: "pipe",
@@ -73,8 +82,35 @@ export async function agentRun(
     new Response(proc.stderr).text(),
     proc.exited,
   ]);
-  const lastLine = (text: string) =>
-    text.split("\n").map((line) => line.trim()).filter(Boolean).pop();
+  return { out, err, code };
+}
+
+/** Legacy typed client: exit 0/75/other maps to uppercase outcomes. */
+export async function agentRun(
+  prompt: string,
+  opts: AgentOpts = {},
+): Promise<{ outcome: AgentOutcome; detail: string }> {
+  const { out, err, code } = await invokePlant(prompt, opts);
+  const outcome: AgentOutcome = code === 0
+    ? "Succeeded"
+    : code === 75 ? "Unavailable" : "Failed";
+  return {
+    outcome,
+    detail: lastLine(out) ?? lastLine(err) ?? "no output",
+  };
+}
+
+/** Keyed durable protocol client for Door claims. */
+export async function agentRunReceipt(
+  prompt: string,
+  opts: AgentRunReceiptOpts,
+): Promise<AgentRunReceipt> {
+  const { idempotencyKey, ...agentOpts } = opts;
+  const { out, err, code } = await invokePlant(
+    prompt,
+    agentOpts,
+    idempotencyKey,
+  );
   const fallback = lastLine(err) ?? lastLine(out) ?? "no output";
   let receipt: AgentRunReceipt | undefined;
   try {
