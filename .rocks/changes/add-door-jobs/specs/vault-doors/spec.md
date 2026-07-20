@@ -34,7 +34,12 @@ and fsynced before the canonical lock path becomes visible. An incomplete
 canonical lock from the legacy publisher MUST be boundedly reread and then left
 intact while the Door fails closed; it MUST NOT be reclaimed by a running Door.
 Its removal requires an explicit offline migration after verifying no legacy
-Door process exists. A given file MUST never launch a second agent run.
+Door process exists. Reclaiming a complete lock whose owner is dead MUST occur
+under one kernel-backed per-door recovery lock, with the observed PID and token
+reread and matched while guarded before unlink and directory fsync. If that
+guard is unavailable or the owner changed, the Door MUST fail closed or retry
+without unlinking the canonical lock. A given file MUST never launch a second
+agent run.
 
 #### Scenario: A sync batch produces one session
 
@@ -72,6 +77,13 @@ Door process exists. A given file MUST never launch a second agent run.
 - AND it leaves the canonical lock intact for explicit offline migration
 - AND no agent session is launched
 
+#### Scenario: Two processes observe one stale owner
+
+- WHEN two Door processes read the same complete lock whose recorded owner is dead
+- THEN stale-owner verification and unlink occur under the same kernel-backed recovery lock
+- AND a delayed contender cannot unlink a successor's live canonical lock
+- AND only one process can claim and launch the batch
+
 #### Scenario: Files share a timestamp
 
 - WHEN `z.md` is durably processed and `a.md` lands later with the same mtime
@@ -107,11 +119,13 @@ Door process exists. A given file MUST never launch a second agent run.
 ### Requirement: Ingestion-only watch roots
 
 The library MUST select exactly one allowlisted ingestion root — a path written
-only by sync jobs — for each watch glob. It MUST reject traversal and MUST
-canonicalize the selected root and every scanned or hydrated file, rejecting
-any real path outside that selected root, including symlink escapes, before
-reading content or launching an agent. A door whose watch glob falls outside
-the allowlist MUST fail loudly before launch, so a door cannot subscribe to
+only by sync jobs — for each watch glob. It MUST reject traversal and
+canonicalize the selected root. Every scanned or hydrated file MUST be opened
+with no-follow semantics, its opened descriptor identity MUST be verified
+beneath that root, and its metadata and content MUST be read from that same
+descriptor. A real path outside the selected root, including a symlink escape,
+MUST be rejected before launch. A door whose watch glob falls outside the
+allowlist MUST fail loudly before launch, so a door cannot subscribe to
 agent-written Vault Content.
 
 #### Scenario: Watching agent-written content is rejected
@@ -131,6 +145,12 @@ agent-written Vault Content.
 - WHEN an escaping symlink does not match the Door's watch glob
 - THEN no-follow glob scanning excludes it from evaluation
 - AND matching safe files remain eligible
+
+#### Scenario: Match is replaced after open
+
+- WHEN a matching pathname is replaced by an escaping symlink after the Door opens it
+- THEN metadata and content are read only from the already-opened no-follow descriptor
+- AND outside-root content does not enter the prompt or launch
 
 ### Requirement: Rolling-window fire breaker
 

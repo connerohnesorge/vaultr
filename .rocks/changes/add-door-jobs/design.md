@@ -96,10 +96,12 @@ post-launch Door crashes. A retry resumes that claim; only a confirmed durable
 Plant `Succeeded` or `Failed` outcome advances the frontier and clears the
 claim atomically. Retryable and indeterminate results retain the claim and key.
 
-The watch resolver selects one configured ingestion root, canonicalizes it,
-and resolves both scanned and claimed files through that root. Traversal and
-real paths outside the selected root, including symlink escapes, fail closed
-before content is read or an agent is launched.
+The watch resolver selects one configured ingestion root and canonicalizes it.
+Both scanning and claim hydration open matches with no-follow semantics, verify
+the opened descriptor's canonical identity remains beneath that root, then
+`fstat` and read through that same descriptor. Traversal, symlink escapes, and
+pathname replacement between validation and read therefore fail closed or
+leave the already-opened safe file as the only content visible to the agent.
 
 New Plant and Door state directories are created one level at a time and both
 the new directory and its parent are fsynced before any fence, claim, lock, or
@@ -109,7 +111,11 @@ so their crashes leave an ignorable temp file or a complete lock. An
 incomplete canonical lock may still belong to the shipped legacy publisher:
 the Door boundedly rereads it, then fails closed without unlinking it. Such a
 lock is removed only as an explicit offline migration after verifying no
-legacy Door process exists.
+legacy Door process exists. Complete locks whose recorded owner is dead are
+reclaimed only while holding a descriptor-bound advisory lock on a permanent
+per-door recovery inode. The winner rereads the canonical owner and verifies
+the exact observed PID and token before unlinking and fsyncing; contenders
+whose guarded observation changed cannot remove the successor lock.
 
 Shipped scalar `hwm` and v1 `(mtime,path)` states migrate under the Door lock
 and the v2 replacement is durable before evaluation. A scalar `hwm` cannot

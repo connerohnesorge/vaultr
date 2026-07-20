@@ -5,6 +5,7 @@ import {
   mkdtempSync,
   mkdirSync,
   readFileSync,
+  renameSync,
   rmSync,
   symlinkSync,
   unlinkSync,
@@ -14,7 +15,7 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { door, agentRun } from "./index.ts";
+import { door, agentRun, setIngestionOpenHookForTest } from "./index.ts";
 
 let tmp: string;
 let vault: string;
@@ -132,6 +133,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  setIngestionOpenHookForTest();
   rmSync(tmp, { recursive: true, force: true });
 });
 
@@ -322,6 +324,26 @@ test("concurrent door processes launch one batch once", async () => {
   expect(stubCalls()).toBe(1);
 });
 
+test("two processes taking over one stale owner cannot remove the successor lock", async () => {
+  landFile("mail/a.md", 1000);
+  writeIdempotentStub(0, { delay: 0.3 });
+  mkdirSync(join(tmp, "state"), { recursive: true });
+  const exited = Bun.spawn(["/usr/bin/true"]);
+  await exited.exited;
+  writeFileSync(
+    join(tmp, "state", "t.lock"),
+    `${JSON.stringify({ pid: exited.pid, token: "stale-owner" })}\n`,
+  );
+
+  const first = spawnWorker();
+  const second = spawnWorker();
+  const codes = await Promise.all([first.exited, second.exited]);
+  expect(codes.every((code) => code === 0 || code === 1 || code === 75)).toBe(true);
+  expect(codes.filter((code) => code === 0)).toHaveLength(1);
+  expect(codes.filter((code) => code !== 0)).toHaveLength(1);
+  expect(stubCalls()).toBe(1);
+});
+
 test("an incomplete legacy lock is retained and fails closed", async () => {
   landFile("mail/a.md", 1000);
   mkdirSync(join(tmp, "state"), { recursive: true });
@@ -454,6 +476,29 @@ test("an unrelated escaping symlink outside the glob does not disable the door",
   landFile("mail/a.md", 1000);
   const result = await door({ name: "t", watch: "mail/*.md", prompt: () => "go" });
   expect(result.code).toBe(0);
+  expect(stubCalls()).toBe(1);
+});
+
+test("a pathname swapped after open cannot change the descriptor-backed content", async () => {
+  landFile("mail/a.md", 1000);
+  const outside = join(tmp, "outside.md");
+  writeFileSync(outside, "hostile outside content");
+  let opens = 0;
+  setIngestionOpenHookForTest((path) => {
+    if (path !== "a.md" || ++opens !== 2) return;
+    renameSync(join(vault, "mail", "a.md"), join(vault, "mail", "a.opened"));
+    symlinkSync(outside, join(vault, "mail", "a.md"));
+  });
+
+  const result = await door({
+    name: "t",
+    watch: "mail/*.md",
+    prompt: (files) => files.map((file) => file.text).join("\n"),
+  });
+  expect(result.code).toBe(0);
+  expect(opens).toBe(2);
+  expect(readFileSync(stubLog, "utf8")).toContain("content of mail/a.md");
+  expect(readFileSync(stubLog, "utf8")).not.toContain("hostile outside content");
   expect(stubCalls()).toBe(1);
 });
 

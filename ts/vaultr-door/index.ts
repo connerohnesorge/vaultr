@@ -5,8 +5,11 @@
 // fire breaker, typed idempotent launch. Spec: .rocks/specs/vault-doors/spec.md.
 
 import { createHash, randomUUID } from "node:crypto";
+import { dlopen, FFIType } from "bun:ffi";
 import {
   closeSync,
+  constants,
+  fstatSync,
   fsyncSync,
   linkSync,
   mkdirSync,
@@ -29,6 +32,28 @@ const plantBin = () => process.env.PLANT_BIN ?? "plant";
 const allowedRoots = () => (process.env.DOOR_ROOTS ?? "mail,teams,tickets").split(",").map((r) => r.trim()).filter(Boolean);
 
 const WINDOW_MS = 3_600_000;
+const LOCK_EX = 2;
+const LOCK_NB = 4;
+const LOCK_UN = 8;
+const kernelLock = (() => {
+  const library = process.platform === "darwin"
+    ? "/usr/lib/libSystem.B.dylib"
+    : process.platform === "linux" ? "libc.so.6" : undefined;
+  if (!library) return undefined;
+  try {
+    return dlopen(library, {
+      flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+    });
+  } catch {
+    return undefined;
+  }
+})();
+
+let afterIngestionOpenForTest: ((path: string) => void) | undefined;
+
+export function setIngestionOpenHookForTest(hook?: (path: string) => void): void {
+  afterIngestionOpenForTest = hook;
+}
 
 export type AgentRunReceipt =
   | { outcome: "succeeded"; detail: string }
@@ -421,6 +446,39 @@ async function readPublishedLockOwner(path: string): Promise<{ pid: number; toke
   );
 }
 
+async function recoverStaleLock(
+  path: string,
+  observed: { pid: number; token: string },
+): Promise<boolean> {
+  if (!kernelLock) {
+    throw new Error(`kernel-backed recovery unavailable; refusing to remove stale lock ${path}`);
+  }
+  const recoveryPath = `${path}.recovery`;
+  const fd = openSync(recoveryPath, constants.O_RDWR | constants.O_CREAT, 0o600);
+  if (kernelLock.symbols.flock(fd, LOCK_EX | LOCK_NB) !== 0) {
+    closeSync(fd);
+    throw new Error(`stale lock recovery already in progress for ${path}`);
+  }
+  try {
+    let current: { pid: number; token: string };
+    try {
+      current = await readPublishedLockOwner(path);
+    } catch (error: any) {
+      if (error?.code === "ENOENT") return false;
+      throw error;
+    }
+    if (current.pid !== observed.pid || current.token !== observed.token || pidAlive(current.pid)) {
+      return false;
+    }
+    unlinkSync(path);
+    syncDirectory(stateDir());
+    return true;
+  } finally {
+    kernelLock.symbols.flock(fd, LOCK_UN);
+    closeSync(fd);
+  }
+}
+
 function pidAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
@@ -480,8 +538,7 @@ async function acquireLock(name: string): Promise<(() => void) | undefined> {
         throw error;
       }
       if (pidAlive(owner.pid)) return undefined;
-      unlinkSync(path);
-      syncDirectory(stateDir());
+      await recoverStaleLock(path, owner);
       continue;
     }
     return () => {
@@ -541,7 +598,27 @@ function resolveIngestionRoot(watch: string): IngestionRoot {
   return { prefix, path, pattern: watch === prefix ? "*" : watch.slice(prefix.length + 1) };
 }
 
-function resolveIngestionFile(root: IngestionRoot, path: string): string {
+interface LoadedIngestionFile {
+  abs: string;
+  mtimeMs: number;
+  text: string;
+}
+
+function descriptorPath(fd: number): string {
+  if (process.platform === "darwin") return `/dev/fd/${fd}`;
+  if (process.platform === "linux") return `/proc/self/fd/${fd}`;
+  throw new Error("descriptor identity validation is unavailable");
+}
+
+function openedPathBeneath(root: IngestionRoot, fd: number, path: string): string {
+  const canonical = realpathSync(descriptorPath(fd));
+  if (!isBeneath(root.path, canonical)) {
+    throw new Error(`symlink escapes ingestion root: ${path}`);
+  }
+  return canonical;
+}
+
+function loadIngestionFile(root: IngestionRoot, path: string): LoadedIngestionFile | undefined {
   if (!validRelativePath(path, true)) {
     throw new Error(`invalid path beneath ingestion root: ${path}`);
   }
@@ -549,11 +626,27 @@ function resolveIngestionFile(root: IngestionRoot, path: string): string {
   if (!isBeneath(root.path, lexical)) {
     throw new Error(`path escapes ingestion root: ${path}`);
   }
-  const canonical = realpathSync(lexical);
-  if (!isBeneath(root.path, canonical)) {
-    throw new Error(`symlink escapes ingestion root: ${path}`);
+  if (typeof constants.O_NOFOLLOW !== "number") {
+    throw new Error("no-follow file opens are unavailable");
   }
-  return canonical;
+  let fd: number;
+  try {
+    fd = openSync(lexical, constants.O_RDONLY | constants.O_NOFOLLOW);
+  } catch (error: any) {
+    if (error?.code === "ELOOP") throw new Error(`symlink escapes ingestion root: ${path}`);
+    throw error;
+  }
+  try {
+    openedPathBeneath(root, fd, path);
+    afterIngestionOpenForTest?.(path);
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) return undefined;
+    const text = readFileSync(fd, "utf8").slice(0, 65536);
+    const abs = openedPathBeneath(root, fd, path);
+    return { abs, mtimeMs: stat.mtimeMs, text };
+  } finally {
+    closeSync(fd);
+  }
 }
 
 function claimRelativePath(root: IngestionRoot, path: string): string {
@@ -565,15 +658,14 @@ function claimRelativePath(root: IngestionRoot, path: string): string {
 
 function hydrateClaim(root: IngestionRoot, claim: DoorClaim): DoorFile[] {
   return claim.files.map((file) => {
-    const abs = resolveIngestionFile(root, claimRelativePath(root, file.path));
-    const stat = statSync(abs);
-    if (!stat.isFile() || stat.mtimeMs !== file.mtimeMs) {
+    const loaded = loadIngestionFile(root, claimRelativePath(root, file.path));
+    if (!loaded || loaded.mtimeMs !== file.mtimeMs) {
       throw new Error(`claimed file changed before launch: ${file.path}`);
     }
     return {
       ...file,
-      abs,
-      text: readFileSync(abs, "utf8").slice(0, 65536),
+      abs: loaded.abs,
+      text: loaded.text,
     };
   });
 }
@@ -624,14 +716,17 @@ export async function door(spec: DoorSpec): Promise<DoorResult> {
         onlyFiles: false,
       })) {
         try {
-          const abs = resolveIngestionFile(root, path);
-          const stat = statSync(abs);
-          if (!stat.isFile()) continue;
-          const mtimeMs = stat.mtimeMs;
+          const loaded = loadIngestionFile(root, path);
+          if (!loaded) continue;
+          const mtimeMs = loaded.mtimeMs;
           const vaultPath = `${root.prefix}/${path}`;
           if (isNew({ mtimeMs, path: vaultPath }, state.frontier)) {
-            const text = readFileSync(abs, "utf8").slice(0, 65536);
-            files.push({ path: vaultPath, abs, mtimeMs, text });
+            files.push({
+              path: vaultPath,
+              abs: loaded.abs,
+              mtimeMs,
+              text: loaded.text,
+            });
           }
         } catch (error: any) {
           if (error?.code === "ENOENT") continue; // raced away mid-scan
