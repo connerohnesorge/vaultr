@@ -13,6 +13,7 @@
 //! renames take effect without a restart.
 
 use std::collections::{HashMap, HashSet};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -259,9 +260,22 @@ const SCRIPT_BACKSTOP: Duration = Duration::from_secs(3 * 3600);
 
 pub async fn run_job(job: &Job) -> i32 {
     let started = SystemTime::now();
-    // Exec the script directly: the shebang picks the interpreter. A missing
-    // shebang or exec bit fails at spawn (ENOEXEC/EACCES) and is recorded below.
-    let mut cmd = tokio::process::Command::new(&job.path);
+    // Exec directly so the shebang picks the interpreter. Linux does not provide
+    // macOS's ENOEXEC shell fallback, so preserve that contract explicitly for
+    // executable legacy scripts without a shebang; a missing exec bit still fails.
+    let executable = std::fs::metadata(&job.path)
+        .map(|meta| meta.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false);
+    let has_shebang = std::fs::read(&job.path)
+        .map(|body| body.starts_with(b"#!"))
+        .unwrap_or(true);
+    let mut cmd = if executable && !has_shebang {
+        let mut shell = tokio::process::Command::new("/bin/sh");
+        shell.arg(&job.path);
+        shell
+    } else {
+        tokio::process::Command::new(&job.path)
+    };
     cmd.current_dir(expand_home("~/.dotfiles"))
         .env("PATH", script_path_env())
         .env(

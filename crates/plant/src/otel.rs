@@ -5,11 +5,13 @@ use crate::capture::{CapturedRequest, CapturedResponse};
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const HISTOGRAM_BOUNDS: [u64; 11] = [
     100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000, 120_000, 300_000,
 ];
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+const RETRY_DELAY: Duration = Duration::from_millis(100);
 
 struct HistogramPoint {
     attributes: Value,
@@ -22,13 +24,15 @@ struct State {
     tokens: HashMap<String, (Value, u64)>,
     requests: HashMap<String, (Value, u64)>,
     durations: HashMap<String, HistogramPoint>,
-    logs: Vec<Value>,
+    logs: Vec<(u64, Value)>,
+    next_log_id: u64,
 }
 
 pub struct Otel {
     pub enabled: bool,
     pub endpoint: String,
     start_ns: String,
+    timeout: Duration,
     state: Mutex<State>,
 }
 
@@ -96,11 +100,17 @@ impl Otel {
                 .trim_end_matches('/')
                 .to_string(),
             start_ns: now_ns(),
+            timeout: std::env::var("VAULTR_OTEL_TIMEOUT_MS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .map(Duration::from_millis)
+                .unwrap_or(DEFAULT_TIMEOUT),
             state: Mutex::new(State {
                 tokens: HashMap::new(),
                 requests: HashMap::new(),
                 durations: HashMap::new(),
                 logs: vec![],
+                next_log_id: 0,
             }),
         }
     }
@@ -184,14 +194,16 @@ impl Otel {
             ("tokens", json!(usage.input + usage.output)),
             ("duration_ms", json!(duration_ms)),
         ]);
-        st.logs.push(json!({
+        let log_id = st.next_log_id;
+        st.next_log_id += 1;
+        st.logs.push((log_id, json!({
             "timeUnixNano": t,
             "observedTimeUnixNano": t,
             "severityNumber": if ok { 9 } else { 13 },
             "severityText": if ok { "INFO" } else { "WARN" },
             "body": { "stringValue": format!("{} {} request {}{}", adapter.harness.capture_label(), model, resp.status, if resp.complete { "" } else { " incomplete" }) },
             "attributes": log_attrs,
-        }));
+        })));
         // ponytail: bound outage memory; dropped logs remain recoverable from turns.jsonl.
         let len = st.logs.len();
         if len > 1_000 {
@@ -247,6 +259,48 @@ impl Otel {
         }] })
     }
 
+    pub(crate) fn pending_logs(&self) -> usize {
+        self.state.lock().unwrap().logs.len()
+    }
+
+    async fn export(
+        &self,
+        client: &reqwest::Client,
+        token: &str,
+        path: &str,
+        body: &Value,
+    ) -> bool {
+        for attempt in 0..2 {
+            let request = client
+                .post(format!("{}{}", self.endpoint, path))
+                .header("content-type", "application/json")
+                .bearer_auth(token)
+                .json(body)
+                .send();
+            let retry = match tokio::time::timeout(self.timeout, request).await {
+                Ok(Ok(response)) if response.status().is_success() => return true,
+                Ok(Ok(response)) => {
+                    let status = response.status();
+                    eprintln!("[otel] export failed: {path}: {status}");
+                    status == reqwest::StatusCode::TOO_MANY_REQUESTS || status.is_server_error()
+                }
+                Ok(Err(error)) => {
+                    eprintln!("[otel] export failed: {path}: {error}");
+                    true
+                }
+                Err(_) => {
+                    eprintln!("[otel] export timed out: {path}");
+                    true
+                }
+            };
+            if !retry || attempt == 1 {
+                break;
+            }
+            tokio::time::sleep(RETRY_DELAY).await;
+        }
+        false
+    }
+
     pub async fn flush(&self, client: &reqwest::Client, token_override: Option<&str>) {
         if !self.enabled && token_override.is_none() {
             return;
@@ -254,17 +308,21 @@ impl Otel {
         let token = match token_override {
             Some(t) => t.to_string(),
             None => {
-                let out = tokio::process::Command::new("cnb")
+                let mut command = tokio::process::Command::new("cnb");
+                command
                     .args(["auth", "token"])
                     .env("PATH", crate::process::augmented_path())
-                    .output()
-                    .await;
-                match out {
-                    Ok(o) if o.status.success() => {
-                        String::from_utf8_lossy(&o.stdout).trim().to_string()
+                    .kill_on_drop(true);
+                match tokio::time::timeout(self.timeout, command.output()).await {
+                    Ok(Ok(output)) if output.status.success() => {
+                        String::from_utf8_lossy(&output.stdout).trim().to_string()
                     }
-                    _ => {
+                    Ok(_) => {
                         eprintln!("[otel] cnb auth token failed; skipping flush");
+                        return;
+                    }
+                    Err(_) => {
+                        eprintln!("[otel] cnb auth token timed out; skipping flush");
                         return;
                     }
                 }
@@ -274,29 +332,27 @@ impl Otel {
             eprintln!("[otel] cnb auth token failed; skipping flush");
             return;
         }
-        // Drain logs before export (matches TS splice(0): failed exports drop logs)
-        let (metrics, logs) = {
-            let mut st = self.state.lock().unwrap();
-            let records: Vec<Value> = st.logs.drain(..).collect();
+        let (metrics, logs, log_through_id) = {
+            let st = self.state.lock().unwrap();
+            let records: Vec<Value> = st.logs.iter().map(|(_, record)| record.clone()).collect();
             let metrics = self.metrics_payload(&st);
             let logs = json!({ "resourceLogs": [{
                 "resource": resource(true),
                 "scopeLogs": [{ "scope": { "name": "vaultr" }, "logRecords": records }],
             }] });
-            (metrics, logs)
+            (metrics, logs, st.logs.last().map(|(id, _)| *id))
         };
-        for (path, body) in [("/v1/metrics", metrics), ("/v1/logs", logs)] {
-            let res = client
-                .post(format!("{}{}", self.endpoint, path))
-                .header("content-type", "application/json")
-                .bearer_auth(&token)
-                .json(&body)
-                .send()
-                .await;
-            match res {
-                Ok(r) if r.status().is_success() => {}
-                Ok(r) => eprintln!("[otel] export failed: {path}: {}", r.status()),
-                Err(e) => eprintln!("[otel] export failed: {e}"),
+        let (_metrics_ok, logs_ok) = tokio::join!(
+            self.export(client, &token, "/v1/metrics", &metrics),
+            self.export(client, &token, "/v1/logs", &logs),
+        );
+        if logs_ok {
+            if let Some(through_id) = log_through_id {
+                self.state
+                    .lock()
+                    .unwrap()
+                    .logs
+                    .retain(|(id, _)| *id > through_id);
             }
         }
     }
