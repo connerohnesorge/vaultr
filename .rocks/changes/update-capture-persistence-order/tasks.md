@@ -43,3 +43,10 @@
 - [x] 6.5 Reject symlinked or escaping Session Capture traversal before recovery mutation
 - [x] 6.6 Run scheduled compression in the listener owner, gate manual compression on both listeners, and propagate Sealing failures
 - [x] 6.7 Prove graceful-drain append exclusion and scheduled failure recording with independent processes
+
+## 7. External review blockers
+
+- [x] 7.1 Replace bounded tail reconciliation with a typed backward classifier and cover large-prior and terminated-malformed evidence
+- [x] 7.2 Carry validated generation inventories and explicit kinds through learning, coverage, and pending Sealing
+- [x] 7.3 Assign compression a typed in-process action during job discovery and keep the wrapper manual-only
+- [x] 7.4 Correct graceful-drain ownership documentation and rerun the full two-repository verification matrix

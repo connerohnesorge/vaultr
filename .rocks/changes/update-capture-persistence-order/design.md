@@ -54,7 +54,12 @@ transaction. For each eligible sequence, while holding the session mutex:
 3. delete the private stage file.
 
 An exact crash prefix can end at any byte, including inside a multibyte UTF-8
-code point; no lossy text conversion participates in reconciliation. If the
+code point; no lossy text conversion participates in reconciliation. A typed
+backward tail classifier scans independently of the staged record size and
+distinguishes blank, valid terminated, malformed terminated, and unterminated
+evidence. A valid different request permits append, an identical request
+requires byte-exact equality, and only an exact staged prefix permits repair.
+Malformed terminated or conflicting evidence fails without mutation. If the
 append succeeds but the journal write fails, or the journal write succeeds but
 stage cleanup fails, retained evidence makes the next attempt converge to one
 record while propagating the failed operation.
@@ -116,14 +121,18 @@ fresh `turns.jsonl` without touching the detached generation.
 
 Vaultr owns one canonical capture-generation inventory that validates the
 sealed, raw, and digest-identified detached paths. Reconstruction, maintenance,
-and Plant Sealing all consume that inventory. Sealing regenerates the detached
-generation's zstd frame. The prior destination length identifies the commit
-boundary: a destination at that length is uncommitted; a destination whose
-exact suffix is the regenerated frame is the post-rename/pre-detached-removal
-state and only needs cleanup; any other state fails without deleting evidence.
-Reconstruction reads sealed, detached, and new live raw generations in order.
-It omits detached bytes only after decoding the sealed suffix at the recorded
-base and proving its raw digest; sealed length alone is never proof.
+and Plant Sealing all consume that inventory. Plant sweep retains the complete
+inventory in a typed session-generation selection with an explicit raw, sealed,
+or detached kind. Learning eligibility, pending-Sealing selection, and capture
+decoding use that kind and never re-derive evidence type from a filename or
+extension. Sealing regenerates the detached generation's zstd frame. The prior
+destination length identifies the commit boundary: a destination at that
+length is uncommitted; a destination whose exact suffix is the regenerated
+frame is the post-rename/pre-detached-removal state and only needs cleanup; any
+other state fails without deleting evidence. Reconstruction reads sealed,
+detached, and new live raw generations in order. It omits detached bytes only
+after decoding the sealed suffix at the recorded base and proving its raw
+digest; sealed length alone is never proof.
 
 Detached conflicts and scrubbing, compression, rename, or cleanup failures
 preserve the evidence and propagate as operational failures. Manual compression
@@ -191,7 +200,8 @@ preparation order differ in practice.
   invisible for dormant sessions.
 - Keep scheduled compression in the listener owner and make manual compression
   compete for both listeners, because a process-local session mutex cannot
-  coordinate a child process.
+  coordinate a child process. Job discovery assigns compression a typed
+  in-process action; scheduled dispatch never executes its manual wrapper.
 - Centralize generation parsing in Vaultr so every consumer makes the same
   evidence-preserving decision.
 - Do not abandon live gaps by timeout. Normal EOF, stream error, or disconnect

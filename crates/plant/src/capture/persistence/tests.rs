@@ -131,6 +131,55 @@ fn commit_stage_repairs_a_prefix_split_inside_utf8() {
 }
 
 #[test]
+fn commit_stage_finds_a_small_next_record_after_a_large_previous_record() {
+    let dir = test_dir("large-previous");
+    let sid = "00000000-0000-4000-8000-000000000048";
+    let staged = envelope(sid);
+    write_ordered_journal(&dir, sid, "/vault", &staged);
+    let mut previous = envelope(sid);
+    previous["request_id"] = json!("00000000-0000-4000-8000-000000000049");
+    previous["response"]["sse"] = json!("x".repeat(128 * 1024));
+    let mut expected = serde_json::to_vec(&previous).unwrap();
+    expected.push(b'\n');
+    fs::write(dir.join("turns.jsonl"), &expected).unwrap();
+    let stage = stage(&dir, staged.clone());
+    let mut journal = Journal::load(&dir, sid).unwrap();
+
+    commit_stage(&mut journal, &stage).unwrap();
+
+    expected.extend(serde_json::to_vec(&staged).unwrap());
+    expected.push(b'\n');
+    assert_eq!(fs::read(dir.join("turns.jsonl")).unwrap(), expected);
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn commit_stage_rejects_terminated_junk_without_mutation() {
+    let dir = test_dir("terminated-junk");
+    let sid = "00000000-0000-4000-8000-000000000050";
+    let envelope = envelope(sid);
+    write_ordered_journal(&dir, sid, "/vault", &envelope);
+    let before = b"{not-json}\n".to_vec();
+    fs::write(dir.join("turns.jsonl"), &before).unwrap();
+    let stage = stage(&dir, envelope);
+    let mut journal = Journal::load(&dir, sid).unwrap();
+
+    assert!(commit_stage(&mut journal, &stage).is_err());
+
+    assert_eq!(fs::read(dir.join("turns.jsonl")).unwrap(), before);
+    assert!(stage.path.exists());
+    assert_eq!(
+        Journal::load(&dir, sid)
+            .unwrap()
+            .require_order()
+            .unwrap()
+            .next_to_drain,
+        0
+    );
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn commit_stage_rejects_same_id_content_conflicts_without_mutation() {
     let dir = test_dir("content-conflict");
     let sid = "00000000-0000-4000-8000-000000000045";

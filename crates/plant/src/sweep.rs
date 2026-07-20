@@ -146,36 +146,126 @@ fn iso_to_epoch(s: &str) -> Option<u64> {
     u64::try_from(days * 86_400 + hh * 3600 + mm * 60 + ss).ok()
 }
 
-/// The sealed sibling (`turns.jsonl` -> `turns.jsonl.zst`) of a raw capture file.
-fn seal_sibling(raw: &Path) -> PathBuf {
-    let name = raw.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-    if name.starts_with("turns.jsonl.sealing-") {
-        raw.with_file_name("turns.jsonl.zst")
-    } else {
-        raw.with_file_name(format!("{name}.zst"))
-    }
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GenerationKind {
+    Raw,
+    Sealed,
+    Detached,
 }
 
-/// Has `learner` learned the *current* content behind `path`? Plain contains-check,
-/// except for a raw file with a sealed sibling — a session resumed after sealing —
-/// where the ledger entry only counts if it postdates the sealed content (zstd
-/// preserves the source mtime, so the .zst mtime is the last write of what was
-/// learned+sealed). Sealed-only and never-sealed paths keep the historic semantics:
-/// pre-existing ledger entries stay valid and history is never re-opened.
-fn learned_current(latest: &HashMap<String, u64>, sid: &str, path: &Path) -> bool {
-    let Some(&ts) = latest.get(sid) else {
-        return false;
-    };
-    if path.extension().and_then(|e| e.to_str()) == Some("zst") {
-        return true;
+#[derive(Clone, Debug)]
+struct SessionGeneration {
+    sid: String,
+    inventory: vaultr::vault::CaptureGenerations,
+    selected: GenerationKind,
+}
+
+impl SessionGeneration {
+    fn current(sid: String, inventory: vaultr::vault::CaptureGenerations) -> Option<Self> {
+        let selected = if inventory.raw.is_some() {
+            GenerationKind::Raw
+        } else if inventory.sealed.is_some() {
+            GenerationKind::Sealed
+        } else if inventory.detached.is_some() {
+            GenerationKind::Detached
+        } else {
+            return None;
+        };
+        Some(Self {
+            sid,
+            inventory,
+            selected,
+        })
     }
-    match std::fs::metadata(seal_sibling(path))
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-    {
-        None => true, // no prior seal: any entry covers the file
-        Some(sealed) => ts > sealed.as_secs(),
+
+    fn pending_seal(sid: String, inventory: vaultr::vault::CaptureGenerations) -> Option<Self> {
+        let selected = if inventory.detached.is_some() {
+            GenerationKind::Detached
+        } else if inventory.raw.is_some() {
+            GenerationKind::Raw
+        } else {
+            return None;
+        };
+        Some(Self {
+            sid,
+            inventory,
+            selected,
+        })
+    }
+
+    fn path(&self) -> &Path {
+        match self.selected {
+            GenerationKind::Raw => self.inventory.raw.as_deref(),
+            GenerationKind::Sealed => self.inventory.sealed.as_deref(),
+            GenerationKind::Detached => self
+                .inventory
+                .detached
+                .as_ref()
+                .map(|generation| generation.path.as_path()),
+        }
+        .expect("selected capture generation is present")
+    }
+
+    fn learned_current(&self, latest: &HashMap<String, u64>) -> bool {
+        let Some(&timestamp) = latest.get(&self.sid) else {
+            return false;
+        };
+        if self.selected != GenerationKind::Raw {
+            return true;
+        }
+        let previous = self
+            .inventory
+            .detached
+            .as_ref()
+            .map(|generation| generation.path.as_path())
+            .or(self.inventory.sealed.as_deref());
+        match previous
+            .and_then(|path| std::fs::metadata(path).ok())
+            .and_then(|metadata| metadata.modified().ok())
+            .and_then(|modified| modified.duration_since(std::time::UNIX_EPOCH).ok())
+        {
+            None => true,
+            Some(boundary) => timestamp > boundary.as_secs(),
+        }
+    }
+
+    fn idle_secs(&self) -> Option<u64> {
+        std::fs::metadata(self.path())
+            .and_then(|metadata| metadata.modified())
+            .ok()
+            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
+            .map(|duration| duration.as_secs())
+    }
+
+    fn idle_for(&self, idle: Duration) -> bool {
+        self.idle_secs()
+            .is_some_and(|seconds| seconds >= idle.as_secs())
+    }
+
+    fn substantive(&self) -> bool {
+        if self.selected != GenerationKind::Raw {
+            return true;
+        }
+        let size = std::fs::metadata(self.path())
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        size > 20_480
+            || std::fs::read_to_string(self.path())
+                .map(|text| text.trim_end().lines().count() > 5)
+                .unwrap_or(false)
+    }
+
+    fn ready_to_seal(
+        &self,
+        claude: &HashMap<String, u64>,
+        codex: &HashMap<String, u64>,
+        jobs: &HashSet<String>,
+        idle: Duration,
+    ) -> bool {
+        self.selected == GenerationKind::Detached
+            || ((self.learned_current(claude) && self.learned_current(codex)
+                || jobs.contains(&self.sid))
+                && self.idle_for(idle))
     }
 }
 
@@ -233,53 +323,29 @@ pub fn claim_inflight(vault: &Path, learner: &str, sids: &[String], expires_at: 
     let _ = std::fs::write(path, body.to_string());
 }
 
-fn capture_files(vault: &Path) -> Result<Vec<(String, PathBuf)>, String> {
-    turns_files(vault, true)
-}
-
-/// YYYY/MM/DD/<id>/turns.jsonl[.zst] under vault -> (session_id, path).
-/// Uses the shared digit-filtered walker, so non-date dirs (e.g. `.meta`) are skipped.
-fn turns_files(vault: &Path, include_compressed: bool) -> Result<Vec<(String, PathBuf)>, String> {
+/// Validated capture inventories under YYYY/MM/DD/<id>. The shared walker rejects
+/// symlinked numeric levels and the inventory validates every generation before selection.
+fn session_generations(
+    vault: &Path,
+    select: fn(String, vaultr::vault::CaptureGenerations) -> Option<SessionGeneration>,
+) -> Result<Vec<SessionGeneration>, String> {
     let mut out = vec![];
     for (sid, sess) in vaultr::vault::walk_session_dirs(vault).map_err(|e| e.to_string())? {
-        let generations =
+        let inventory =
             vaultr::vault::CaptureGenerations::load(&sess).map_err(|e| e.to_string())?;
-        let f = if include_compressed {
-            generations.capture_file()
-        } else {
-            generations.unsealed_file()
-        };
-        if let Some(f) = f {
-            out.push((sid, f.to_path_buf()));
+        if let Some(generation) = select(sid, inventory) {
+            out.push(generation);
         }
     }
     Ok(out)
 }
 
-fn idle_secs(path: &Path) -> Option<u64> {
-    std::fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| SystemTime::now().duration_since(t).ok())
-        .map(|d| d.as_secs())
+fn current_generations(vault: &Path) -> Result<Vec<SessionGeneration>, String> {
+    session_generations(vault, SessionGeneration::current)
 }
 
-fn idle_for(path: &Path, idle: Duration) -> bool {
-    idle_secs(path)
-        .map(|s| s >= idle.as_secs())
-        .unwrap_or(false)
-}
-
-/// Learn substance gate: >20KB, or >5 turns (only read small files to count).
-/// Compressed captures already cleared the legacy Claude pass before sealing.
-fn substantive(path: &Path) -> bool {
-    let compressed = path.extension().and_then(|e| e.to_str()) == Some("zst");
-    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    compressed
-        || size > 20_480
-        || std::fs::read_to_string(path)
-            .map(|t| t.trim_end().lines().count() > 5)
-            .unwrap_or(false)
+fn pending_generations(vault: &Path) -> Result<Vec<SessionGeneration>, String> {
+    session_generations(vault, SessionGeneration::pending_seal)
 }
 
 /// One raw Session Capture the cultivation pipeline should have sealed by now.
@@ -299,29 +365,29 @@ pub fn stuck_captures(vault: &Path, age: Duration) -> Result<Vec<StuckCapture>, 
     let codex = ledger_latest(vault, "codex");
     let mut out = vec![];
     let jobs = job_sids();
-    for (sid, path) in turns_files(vault, false)? {
-        let Some(idle) = idle_secs(&path) else {
+    for generation in pending_generations(vault)? {
+        let Some(idle) = generation.idle_secs() else {
             continue;
         };
         if idle < age.as_secs() {
             continue;
         }
-        let state = if jobs.contains(&sid) {
+        let state = if jobs.contains(&generation.sid) {
             "job-capture".to_string() // plant's own agent pane; informational like sub-threshold
         } else {
             match (
-                learned_current(&claude, &sid, &path),
-                learned_current(&codex, &sid, &path),
+                generation.learned_current(&claude),
+                generation.learned_current(&codex),
             ) {
                 (true, true) => "seal-blocked".to_string(),
                 (true, false) => "half-learned:codex".to_string(),
                 (false, true) => "half-learned:claude".to_string(),
-                (false, false) if substantive(&path) => "unlearned".to_string(),
+                (false, false) if generation.substantive() => "unlearned".to_string(),
                 (false, false) => "sub-threshold".to_string(),
             }
         };
         out.push(StuckCapture {
-            sid,
+            sid: generation.sid,
             state,
             idle_secs: idle,
         });
@@ -379,16 +445,16 @@ pub fn eligible_sessions(
     let inflight = inflight_sessions(vault, learner);
     let jobs = job_sids();
     let mut out = vec![];
-    for (sid, path) in capture_files(vault)? {
-        if jobs.contains(&sid)
-            || learned_current(&processed, &sid, &path)
-            || inflight.contains(&sid)
-            || !idle_for(&path, idle)
+    for generation in current_generations(vault)? {
+        if jobs.contains(&generation.sid)
+            || generation.learned_current(&processed)
+            || inflight.contains(&generation.sid)
+            || !generation.idle_for(idle)
         {
             continue;
         }
-        if substantive(&path) {
-            if let Some(dir) = path.parent() {
+        if generation.substantive() {
+            if let Some(dir) = generation.path().parent() {
                 out.push(dir.display().to_string());
             }
         }
@@ -401,7 +467,7 @@ pub fn eligible_sessions(
 /// clean (it is substituted into an agent prompt by the learn job).
 pub fn eligibility_stats(vault: &Path, learner: &str) -> Result<(usize, usize), String> {
     Ok((
-        capture_files(vault)?.len(),
+        current_generations(vault)?.len(),
         ledger_latest(vault, learner).len(),
     ))
 }
@@ -527,7 +593,7 @@ pub async fn scrub(path: &Path) -> bool {
 /// The destination mtime is set to the raw's mtime (as `zstd` itself would), because
 /// learned_current uses it as the generation boundary.
 async fn seal_file(raw: &Path) -> Result<(), String> {
-    let dest = seal_sibling(raw);
+    let dest = raw.with_extension("jsonl.zst");
     let raw_mtime = std::fs::metadata(raw)
         .and_then(|m| m.modified())
         .map_err(|e| format!("stat: {e}"))?;
@@ -716,15 +782,14 @@ pub async fn compress_sweep(vault: &Path, idle: Duration) -> Result<(), String> 
     let codex = ledger_latest(vault, "codex");
     let jobs = job_sids();
     let mut sealed = 0u32;
-    for (sid, path) in turns_files(vault, false)? {
-        let detached = path.file_name().and_then(|name| name.to_str()) != Some("turns.jsonl");
-        // job self-captures seal without waiting for learn — they are never dispatched
-        let learned = learned_current(&claude, &sid, &path) && learned_current(&codex, &sid, &path);
-        if !detached && (!(learned || jobs.contains(&sid)) || !idle_for(&path, idle)) {
+    for selected in pending_generations(vault)? {
+        if !selected.ready_to_seal(&claude, &codex, &jobs, idle) {
             continue;
         }
+        let sid = &selected.sid;
         let Some(generation) =
-            crate::capture::detach_generation(vault, &sid, path.parent().unwrap()).await?
+            crate::capture::detach_generation(vault, sid, selected.path().parent().unwrap())
+                .await?
         else {
             continue;
         };
@@ -788,17 +853,15 @@ pub async fn compress_sweep(vault: &Path, idle: Duration) -> Result<(), String> 
     Ok(())
 }
 
-/// Read a capture file's envelope lines, decompressing `.zst` transparently.
-/// ponytail: single-file only — the transient sealed+raw sibling pair (mid-resume)
-/// is chained by recon::reconstruct elsewhere; coverage is a point-in-time audit and
-/// reads whichever file `capture_file` returns. Unreadable => empty, never fatal.
-fn capture_lines(path: &Path) -> Vec<String> {
+/// Read the selected capture generation's envelope lines. Unreadable => empty,
+/// never fatal; the validated generation kind determines decoding.
+fn capture_lines(generation: &SessionGeneration) -> Vec<String> {
     use std::io::Read;
-    let Ok(file) = std::fs::File::open(path) else {
+    let Ok(file) = std::fs::File::open(generation.path()) else {
         return vec![];
     };
     let mut text = String::new();
-    let ok = if path.extension().and_then(|e| e.to_str()) == Some("zst") {
+    let ok = if generation.selected == GenerationKind::Sealed {
         zstd::Decoder::new(file)
             .and_then(|mut d| d.read_to_string(&mut text))
             .is_ok()
@@ -846,12 +909,14 @@ impl Coverage {
 pub fn coverage(vault: &Path, query: &str) -> Result<Coverage, String> {
     let session = vaultr::vault::resolve_id(vault, query).map_err(|e| e.to_string())?;
     let dir = vaultr::vault::session_dir(vault, &session).map_err(|e| e.to_string())?;
-    let cap = vaultr::vault::capture_file(&dir).map_err(|e| e.to_string())?;
+    let inventory = vaultr::vault::CaptureGenerations::load(&dir).map_err(|e| e.to_string())?;
+    let generation = SessionGeneration::current(session.id.clone(), inventory)
+        .ok_or_else(|| format!("no capture found for {}", session.id))?;
 
     // Captured side: distinct response request-ids, and the window start (min observed_at).
     let mut captured: HashSet<String> = HashSet::new();
     let mut window_start: Option<String> = None;
-    for line in capture_lines(&cap) {
+    for line in capture_lines(&generation) {
         let Ok(env) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
@@ -1070,6 +1135,7 @@ mod tests {
         let dated = sessions.join("2026/07/16").join(sid);
         std::fs::create_dir_all(&dated).unwrap();
         std::fs::write(dated.join("turns.jsonl"), "{}\n").unwrap();
+        std::fs::write(dated.join("turns.jsonl.zst"), "prior seal").unwrap();
         // Non-date dirs at various levels: must never be descended into.
         for bogus in [
             ".meta/2026/07",
@@ -1082,17 +1148,24 @@ mod tests {
             std::fs::write(d.join("turns.jsonl"), "{}\n").unwrap();
         }
 
-        let raw = turns_files(&sessions, false).unwrap();
+        let raw = pending_generations(&sessions).unwrap();
         assert_eq!(raw.len(), 1, "only the dated session, got {raw:?}");
-        assert_eq!(raw[0].0, sid);
-        assert_eq!(raw[0].1, dated.join("turns.jsonl"));
+        assert_eq!(raw[0].sid, sid);
+        assert_eq!(raw[0].selected, GenerationKind::Raw);
+        assert_eq!(raw[0].path(), dated.join("turns.jsonl"));
+        assert_eq!(
+            raw[0].inventory.sealed.as_deref(),
+            Some(dated.join("turns.jsonl.zst").as_path())
+        );
 
-        // include_compressed also picks up sealed sessions, still date-filtered.
+        // Current selection retains the same validated inventory and chooses the seal
+        // only after the raw generation is gone.
         std::fs::remove_file(dated.join("turns.jsonl")).unwrap();
-        std::fs::write(dated.join("turns.jsonl.zst"), "sealed").unwrap();
-        let all = turns_files(&sessions, true).unwrap();
+        let all = current_generations(&sessions).unwrap();
         assert_eq!(all.len(), 1);
-        assert_eq!(all[0].1, dated.join("turns.jsonl.zst"));
+        assert_eq!(all[0].selected, GenerationKind::Sealed);
+        assert_eq!(all[0].path(), dated.join("turns.jsonl.zst"));
+        assert!(pending_generations(&sessions).unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1260,12 +1333,12 @@ mod tests {
         assert!(claude.iter().any(|p| p.ends_with(sid)));
         assert!(!codex.iter().any(|p| p.ends_with(sid)));
 
-        // a sealed-only capture (no raw) keeps historic semantics: entry counts as-is
-        assert!(learned_current(
-            &ledger_latest(&sessions, "claude"),
-            sid,
-            &dir.join("turns.jsonl.zst")
-        ));
+        // a sealed-only capture keeps historic semantics: entry counts as-is
+        std::fs::remove_file(dir.join("turns.jsonl")).unwrap();
+        let inventory = vaultr::vault::CaptureGenerations::load(&dir).unwrap();
+        let sealed = SessionGeneration::current(sid.to_string(), inventory).unwrap();
+        assert_eq!(sealed.selected, GenerationKind::Sealed);
+        assert!(sealed.learned_current(&ledger_latest(&sessions, "claude")));
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1282,7 +1355,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         let raw = root.join("turns.jsonl");
-        let dest = seal_sibling(&raw);
+        let dest = raw.with_extension("jsonl.zst");
 
         std::fs::write(&raw, "gen1-line\n").unwrap();
         seal_file(&raw).await.expect("first seal");

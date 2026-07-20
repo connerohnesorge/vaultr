@@ -40,7 +40,11 @@ parsed Journal through application; require mandatory stage root, sequence,
 request, and Envelope identity; reconcile retired stages only against exact
 committed evidence; surface journal and cleanup failures; preserve every real
 request delta; and MUST NOT invent response output. Conflicting or malformed
-evidence MUST fail startup without altering persisted capture bytes. Durability
+evidence MUST fail startup without altering persisted capture bytes. Tail
+reconciliation MUST scan backward independently of the staged record size and
+classify blank, valid terminated, malformed terminated, and unterminated
+evidence. It MUST append after a valid different request, accept a same-request
+record only when byte-exact, and repair only an exact staged prefix. Durability
 under this requirement covers Plant process crashes, not sudden host power
 loss.
 
@@ -105,6 +109,16 @@ loss.
 - THEN the operation reports failure and preserves the stage
 - AND retry persists retirement and cleanup with exactly one Envelope record
 
+#### Scenario: A small stage follows a large valid record
+
+- WHEN the previous complete Envelope is larger than the staged Envelope by an arbitrary amount and has a different request identity
+- THEN reconciliation finds the complete previous record and appends the staged Envelope exactly once
+
+#### Scenario: Terminated tail is malformed
+
+- WHEN `turns.jsonl` ends in newline-terminated bytes that are not valid JSON
+- THEN reconciliation reports malformed evidence without appending, truncating, retiring the journal entry, or deleting its stage
+
 #### Scenario: Crash prefix splits a UTF-8 code point
 
 - WHEN the final live bytes are an exact staged-Envelope prefix ending inside a multibyte UTF-8 code point
@@ -124,11 +138,14 @@ digest-identified until its zstd frame is committed exactly once. A retry MUST
 distinguish an uncommitted destination from the exact post-rename,
 pre-detached-removal state. Vaultr MUST provide one validated canonical
 generation inventory consumed by Reconstruction, maintenance, and Plant
-Sealing. Detached evidence MUST be omitted only after the sealed suffix at the
-recorded base decodes to the detached digest. Detached conflicts and scrubbing,
-compression, rename, or cleanup failures MUST preserve evidence and propagate
-as operational failures. Existing Envelope and concatenated-zstd generation
-formats MUST remain readable.
+Sealing. Plant maintenance MUST retain that inventory in a typed selection with
+an explicit generation kind; learning, pending-Sealing, and decoding decisions
+MUST consume the typed selection without filename- or extension-based
+classification. Detached evidence MUST be omitted only after the sealed suffix
+at the recorded base decodes to the detached digest. Detached conflicts and
+scrubbing, compression, rename, or cleanup failures MUST preserve evidence and
+propagate as operational failures. Existing Envelope and concatenated-zstd
+generation formats MUST remain readable.
 
 #### Scenario: Capture finishes at the Sealing boundary
 
@@ -158,6 +175,12 @@ formats MUST remain readable.
 - THEN Sealing preserves both generations and reports operational failure
 - AND manual compression exits 2 while scheduled compression records failure
 
+#### Scenario: Maintenance selects a capture generation
+
+- WHEN sealed, detached, and raw generation paths are inventoried for learning, coverage, or Sealing
+- THEN maintenance carries the validated inventory and selected generation kind through the decision
+- AND it does not infer generation kind from a path extension or filename prefix
+
 ### Requirement: Complete daemon ownership before recovery
 
 Plant MUST bind and retain both configured harness listeners before capture
@@ -167,7 +190,9 @@ complete incumbent Plant; otherwise it MUST fail nonzero. Scheduled compression
 MUST run in-process in that listener-owning daemon. Manual compression MUST
 acquire and retain both listeners, recover capture persistence, and only then
 sweep or refuse to run. A gracefully draining daemon MUST retain both listeners
-until no in-flight task can append.
+until no in-flight task can append. Job discovery MUST assign compression an
+in-process action, and daemon dispatch MUST use that typed action rather than
+executing the manual wrapper.
 
 #### Scenario: Complete incumbent already owns both harnesses
 
@@ -188,7 +213,8 @@ until no in-flight task can append.
 #### Scenario: Scheduled compression is due
 
 - WHEN the compression cadence is due in the listener-owning daemon
-- THEN that daemon invokes the sweep directly without spawning a child Plant
+- THEN discovery and dispatch select the in-process compression action
+- AND that daemon invokes the sweep directly without spawning a child Plant or executing the manual wrapper
 - AND any operational failure is recorded as a failed job outcome
 
 ### Requirement: Complete Envelope record reconstruction

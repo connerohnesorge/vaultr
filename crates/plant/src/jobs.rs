@@ -10,9 +10,9 @@
 //! scheduling state (due when now - last.ts >= every). Exit code contract:
 //! 0 = success, 75 = retry next tick without recording (EX_TEMPFAIL, e.g. herdr down),
 //! anything else = failed. The job set is rescanned every tick — edits and interval
-//! renames take effect without a restart. The `compress` cadence marker runs
-//! its sweep directly in the listener-owning daemon; every other job executes
-//! its script.
+//! renames take effect without a restart. Discovery assigns the `compress`
+//! cadence marker an in-process action; the listener-owning daemon is the only
+//! scheduler that may run compression, and it never executes the marker script.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -63,11 +63,36 @@ impl Cfg {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum JobAction {
+    Script,
+    InProcessCompression,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Job {
     pub name: String,
     pub path: PathBuf,
     pub every: Duration,
+    action: JobAction,
+}
+
+impl Job {
+    fn discover(path: PathBuf) -> Option<Self> {
+        let file_name = path.file_name()?.to_str()?;
+        let (name, every) = parse_job_filename(file_name)?;
+        let action = if name == "compress" {
+            JobAction::InProcessCompression
+        } else {
+            JobAction::Script
+        };
+        Some(Self {
+            name,
+            path,
+            every,
+            action,
+        })
+    }
 }
 
 /// "90s" / "15m" / "2h" / "30d" — single number + unit.
@@ -128,12 +153,7 @@ pub fn load_jobs() -> Vec<Job> {
     };
     let mut jobs: Vec<Job> = entries
         .flatten()
-        .filter_map(|e| {
-            let path = e.path();
-            let file_name = path.file_name()?.to_str()?.to_string();
-            let (name, every) = parse_job_filename(&file_name)?;
-            Some(Job { name, path, every })
-        })
+        .filter_map(|entry| Job::discover(entry.path()))
         .collect();
     jobs.sort_by(|a, b| a.name.cmp(&b.name));
     jobs
@@ -254,6 +274,9 @@ const SCRIPT_BACKSTOP: Duration = Duration::from_secs(3 * 3600);
 
 pub async fn run_job(job: &Job) -> i32 {
     let started = SystemTime::now();
+    // This is also the explicit `plant jobs run <name>` path. In particular,
+    // running the compression marker manually executes its ownership-checking
+    // wrapper; scheduled dispatch below never reaches this function for it.
     // Exec the script directly: the shebang picks the interpreter. A missing
     // shebang or exec bit fails at spawn (ENOEXEC/EACCES) and is recorded below.
     let mut cmd = tokio::process::Command::new(&job.path);
@@ -361,10 +384,13 @@ pub async fn scheduler(cfg: Cfg, vault: PathBuf) {
             let vault = vault.clone();
             tokio::spawn(async move {
                 let _permit = sem.acquire().await;
-                if job.name == "compress" {
-                    run_compress_job(&job, &vault).await;
-                } else {
-                    run_job(&job).await;
+                match job.action {
+                    JobAction::Script => {
+                        run_job(&job).await;
+                    }
+                    JobAction::InProcessCompression => {
+                        run_compress_job(&job, &vault).await;
+                    }
                 }
                 running.lock().unwrap().remove(&job.name);
             });
@@ -414,6 +440,15 @@ mod tests {
         ] {
             assert_eq!(parse_job_filename(bad), None, "{bad} should not parse");
         }
+    }
+
+    #[test]
+    fn discovery_assigns_typed_scheduler_actions() {
+        let compress = Job::discover(PathBuf::from("compress.30m.sh")).unwrap();
+        let learn = Job::discover(PathBuf::from("learn.15m.sh")).unwrap();
+
+        assert_eq!(compress.action, JobAction::InProcessCompression);
+        assert_eq!(learn.action, JobAction::Script);
     }
 
     #[test]

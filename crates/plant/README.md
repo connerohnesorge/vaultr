@@ -23,14 +23,15 @@ server-side pieces make restarts actually safe:
    incumbent plant; partial or foreign ownership fails without mutating
    recovery state. Logs: `~/.local/state/plant/launchd.log`.
 
-2. **Listeners released before drain** — on SIGTERM/SIGINT, `main.rs` aborts
-   the accept loops (dropping the listeners) *before* the 30s in-flight drain
-   sleep. A replacement can bind immediately instead of hitting AddrInUse and
-   yielding to a dying instance. Per-connection tasks are independent spawns,
-   so in-flight streams still finish.
+2. **Listener ownership retained through drain** — on SIGTERM/SIGINT,
+   `main.rs` stops accepting new connections but keeps both listeners bound
+   while in-flight capture tasks drain for up to 30s. A replacement cannot
+   bind or run capture recovery/maintenance until the incumbent releases both
+   listeners after the drain, so no scrub/rename can overlap a final append.
+   launchd retries the replacement after the incumbent exits.
 
 Skipped: SO_REUSEPORT / fd handover for true zero-downtime — SDK retries
-already cover the sub-second gap; add only if retries observably fail during
+already cover the shutdown/restart gap; add only if retries observably fail during
 restarts.
 
 ### macOS setup (one-time, already done 2026-07-15)

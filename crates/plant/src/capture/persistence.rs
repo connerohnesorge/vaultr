@@ -437,10 +437,25 @@ fn append_record(path: &Path, serialized: &[u8]) -> Result<(), String> {
         .map_err(|error| format!("capture commit: append {}: {error}", path.display()))
 }
 
-fn final_record(path: &Path, window: usize) -> Result<Option<(Vec<u8>, bool, u64)>, String> {
+enum CaptureTail {
+    Blank,
+    ValidTerminated {
+        bytes: Vec<u8>,
+        request_id: Option<String>,
+    },
+    MalformedTerminated,
+    Unterminated {
+        bytes: Vec<u8>,
+        offset: u64,
+    },
+}
+
+fn capture_tail(path: &Path) -> Result<CaptureTail, String> {
     let mut file = match fs::File::open(path) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(CaptureTail::Blank);
+        }
         Err(error) => {
             return Err(format!("capture commit: open {}: {error}", path.display()));
         }
@@ -450,33 +465,64 @@ fn final_record(path: &Path, window: usize) -> Result<Option<(Vec<u8>, bool, u64
         .map_err(|error| format!("capture commit: stat {}: {error}", path.display()))?
         .len();
     if length == 0 {
-        return Ok(None);
+        return Ok(CaptureTail::Blank);
     }
-    let window = (window as u64).min(length);
-    let offset = length - window;
-    file.seek(SeekFrom::Start(offset))
+
+    file.seek(SeekFrom::End(-1))
         .map_err(|error| format!("capture commit: seek {}: {error}", path.display()))?;
-    let mut bytes = Vec::with_capacity(window as usize);
-    file.read_to_end(&mut bytes)
+    let mut last_byte = [0];
+    file.read_exact(&mut last_byte)
         .map_err(|error| format!("capture commit: read {}: {error}", path.display()))?;
-    let terminated = bytes.last() == Some(&b'\n');
-    let end = bytes.len() - usize::from(terminated);
-    let content = &bytes[..end];
-    let start = content
-        .iter()
-        .rposition(|byte| *byte == b'\n')
-        .map_or(0, |index| index + 1);
-    if start == 0 && offset > 0 {
-        return Err(format!(
-            "capture commit: final record exceeds reconciliation window at {}",
-            path.display()
-        ));
+    let terminated = last_byte[0] == b'\n';
+    let end = length - u64::from(terminated);
+    if end == 0 {
+        return Ok(CaptureTail::Blank);
     }
-    Ok(Some((
-        content[start..].to_vec(),
-        terminated,
-        offset + start as u64,
-    )))
+
+    const CHUNK_SIZE: usize = 64 * 1024;
+    let mut cursor = end;
+    let mut start = 0;
+    let mut chunk = vec![0; CHUNK_SIZE];
+    while cursor > 0 {
+        let chunk_start = cursor.saturating_sub(CHUNK_SIZE as u64);
+        let chunk_len = (cursor - chunk_start) as usize;
+        file.seek(SeekFrom::Start(chunk_start))
+            .map_err(|error| format!("capture commit: seek {}: {error}", path.display()))?;
+        file.read_exact(&mut chunk[..chunk_len])
+            .map_err(|error| format!("capture commit: read {}: {error}", path.display()))?;
+        if let Some(position) = chunk[..chunk_len].iter().rposition(|byte| *byte == b'\n') {
+            start = chunk_start + position as u64 + 1;
+            break;
+        }
+        cursor = chunk_start;
+    }
+
+    let mut bytes = vec![0; (end - start) as usize];
+    file.seek(SeekFrom::Start(start))
+        .map_err(|error| format!("capture commit: seek {}: {error}", path.display()))?;
+    file.read_exact(&mut bytes)
+        .map_err(|error| format!("capture commit: read {}: {error}", path.display()))?;
+
+    if !terminated {
+        return Ok(CaptureTail::Unterminated {
+            bytes,
+            offset: start,
+        });
+    }
+    if bytes.iter().all(u8::is_ascii_whitespace) {
+        return Ok(CaptureTail::Blank);
+    }
+
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(record) => Ok(CaptureTail::ValidTerminated {
+            request_id: record
+                .get("request_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            bytes,
+        }),
+        Err(_) => Ok(CaptureTail::MalformedTerminated),
+    }
 }
 
 fn truncate(path: &Path, offset: u64) -> Result<(), String> {
@@ -490,30 +536,38 @@ fn truncate(path: &Path, offset: u64) -> Result<(), String> {
 fn reconcile_append(path: &Path, envelope: &Value) -> Result<(), String> {
     let serialized = serde_json::to_vec(envelope).map_err(|error| error.to_string())?;
     let request_id = envelope.get("request_id").and_then(Value::as_str);
-    match final_record(path, serialized.len() + 4096)? {
-        None => append_record(path, &serialized),
-        Some((last, true, _)) => match serde_json::from_slice::<Value>(&last) {
-            Ok(value) if value.get("request_id").and_then(Value::as_str) == request_id => {
-                if last == serialized {
-                    Ok(())
-                } else {
-                    Err("capture commit: committed envelope conflicts with stage".into())
-                }
+    match capture_tail(path)? {
+        CaptureTail::Blank => append_record(path, &serialized),
+        CaptureTail::ValidTerminated {
+            bytes,
+            request_id: tail_request_id,
+        } if tail_request_id.as_deref() == request_id => {
+            if bytes == serialized {
+                Ok(())
+            } else {
+                Err("capture commit: committed envelope conflicts with stage".into())
             }
-            _ => append_record(path, &serialized),
-        },
-        Some((last, false, offset)) if serialized.starts_with(&last) => {
+        }
+        CaptureTail::ValidTerminated { .. } => append_record(path, &serialized),
+        CaptureTail::MalformedTerminated => {
+            Err("capture commit: malformed terminated capture tail".into())
+        }
+        CaptureTail::Unterminated { bytes, offset } if serialized.starts_with(&bytes) => {
             truncate(path, offset)?;
             append_record(path, &serialized)
         }
-        Some(_) => Err("capture commit: persisted tail conflicts with stage".into()),
+        CaptureTail::Unterminated { .. } => {
+            Err("capture commit: persisted tail conflicts with stage".into())
+        }
     }
 }
 
 fn committed_exactly(path: &Path, envelope: &Value) -> Result<bool, String> {
     let serialized = serde_json::to_vec(envelope).map_err(|error| error.to_string())?;
-    Ok(final_record(path, serialized.len() + 4096)?
-        .is_some_and(|(last, terminated, _)| terminated && last == serialized))
+    Ok(matches!(
+        capture_tail(path)?,
+        CaptureTail::ValidTerminated { bytes, .. } if bytes == serialized
+    ))
 }
 
 fn commit_stage(journal: &mut Journal, stage: &Stage) -> Result<(), String> {
