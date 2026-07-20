@@ -37,9 +37,12 @@ must reconcile that durable backlog before new capture or Sealing begins.
 
 - Affected specs: `capture-stewardship`
 - Affected code: `crates/plant/src/capture.rs`,
-  `crates/plant/src/capture/persistence.rs`, `crates/plant/src/proxy.rs`,
+  `crates/plant/src/capture/persistence.rs`,
+  `crates/plant/src/capture/session_fs.rs`,
+  `crates/plant/src/capture/generation.rs`, `crates/plant/src/proxy.rs`,
   `crates/plant/src/main.rs`, `crates/plant/src/jobs.rs`,
-  `crates/plant/src/sweep.rs`, `crates/vaultr/src/vault.rs`,
+  `crates/plant/src/process.rs`, `crates/plant/src/sweep.rs`,
+  `crates/plant/src/herdr.rs`, `crates/vaultr/src/vault.rs`,
   `crates/vaultr/src/recon.rs`, and focused tests
 - Issue traceability:
   - #19: immutable Capture and Herdr generation Sealing with exact-once retry

@@ -196,7 +196,11 @@ classification. Detached evidence MUST be omitted only after the sealed suffix
 at the recorded base decodes to the detached digest. Detached conflicts and
 scrubbing, compression, rename, or cleanup failures MUST preserve evidence and
 propagate as operational failures. Existing Envelope and concatenated-zstd
-generation formats MUST remain readable.
+generation formats MUST remain readable. Capture MUST own one
+readiness-to-detach-to-Sealing API: persistence MAY return only a strict,
+non-mutating readiness verdict, the neutral session-filesystem module MUST own
+the low-level descriptor operations, and sweep and Herdr MUST use narrow
+capture-owned APIs rather than mutating generations or rebuilding locks.
 
 #### Scenario: Capture finishes at the Sealing boundary
 
@@ -229,9 +233,15 @@ generation formats MUST remain readable.
 
 #### Scenario: A previous-version temp remains after upgrade
 
-- WHEN restart finds a regular file named exactly `turns.scrub-tmp`, `turns.jsonl.frame-tmp`, `turns.jsonl.zst-tmp`, `herdr.jsonl.frame-tmp`, or `herdr.jsonl.zst-tmp`
+- WHEN restart finds a regular file named exactly `turns.scrub-tmp`, `turns.jsonl.frame-tmp`, `turns.jsonl.zst-tmp`, `herdr.frame-tmp`, or `herdr.zst-tmp`
 - THEN maintenance removes that descriptor-opened legacy temp under the exclusive session lock
-- AND a symlink, non-regular entry, or near-miss name is preserved and causes maintenance to fail closed
+- AND `herdr.jsonl.frame-tmp`, `herdr.jsonl.zst-tmp`, any symlink or non-regular entry, and any other near-miss name are preserved and cause maintenance to fail closed
+
+#### Scenario: Capture maintenance ownership is entered
+
+- WHEN sweep selects a typed generation inventory or Herdr needs to append a sidecar snapshot
+- THEN it calls a narrow capture-owned API without opening, renaming, sealing, or locking the generation itself
+- AND strict journal and stage readiness is validated before any lower-level Capture detachment can occur
 
 #### Scenario: Power fails at the Sealing cleanup boundary
 

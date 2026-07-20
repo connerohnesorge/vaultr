@@ -489,7 +489,8 @@ async fn detached_generation_does_not_bypass_strict_journal_loading() {
     fs::write(&detached, body).unwrap();
     fs::write(dir.join("state.json"), b"{corrupt").unwrap();
 
-    assert!(detach_generation(&vault, sid, &dir).await.is_err());
+    let root_identity = canonical_root(&vault);
+    assert!(sealing_readiness(&root_identity, sid, &dir).is_err());
     assert_eq!(fs::read(&detached).unwrap(), body);
     fs::remove_dir_all(root).unwrap();
 }

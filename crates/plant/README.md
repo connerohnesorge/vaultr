@@ -8,6 +8,13 @@ and `~/.dotfiles/.claude/SESSIONS.md` for the behavioral contract.
 - Health: `curl http://127.0.0.1:18923/health`
 - Verify: `target/release/plant --self-test`
 
+## Capture maintenance ownership
+
+Sweep selects validated generation inventories and policy; the private capture
+maintenance module alone rechecks journal/stage readiness, detaches Capture and
+Herdr generations, and seals them through one retained no-follow
+session-directory boundary.
+
 ## Surviving restarts (launchd supervision)
 
 Clients (Claude Code's SDK) already retry failed API requests with backoff, so

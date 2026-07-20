@@ -73,3 +73,12 @@
 - [x] 10.2 Prove fresh and retried committed suffixes through the canonical decoded digest, accepting alternate valid frame representations and retaining corrupt output evidence
 - [x] 10.3 Kill and reap a timed-out compressor before descriptor-owned temp cleanup
 - [x] 10.4 Cover exact and near-miss temp migration, corrupt-success output, alternate valid frames, and timeout reaping
+
+## 11. Exact-tip ownership and upgrade repair
+
+- [x] 11.1 Reconcile only the actual parent-emitted Herdr legacy names `herdr.frame-tmp` and `herdr.zst-tmp`
+- [x] 11.2 Preserve the misclaimed `herdr.jsonl.*` names, symlinks, non-regular entries, and other near misses as fail-closed evidence
+- [x] 11.3 Extract one neutral capture session-filesystem boundary shared by persistence and generation maintenance
+- [x] 11.4 Move readiness, Capture and Herdr detachment, compressor lifecycle, and exact-once Sealing behind one capture-owned transaction API
+- [x] 11.5 Reduce sweep to typed inventory policy and orchestration, and route Herdr snapshot persistence through capture-owned APIs
+- [x] 11.6 Move transaction fixtures with the implementation and cover capture, Herdr, and cooperating compressor serialization

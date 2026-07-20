@@ -4,10 +4,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{Read, Write};
 use std::ops::Range;
-use std::os::fd::{AsRawFd, FromRawFd};
-use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+use super::session_fs::SessionDirectory;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct CaptureOrder {
@@ -464,65 +465,21 @@ fn read_stages(
 const IO_CHUNK: usize = 64 * 1024;
 
 struct RawGeneration {
-    _directory: fs::File,
+    _directory: SessionDirectory,
     file: fs::File,
     path: PathBuf,
 }
 
 impl RawGeneration {
     fn open(directory: &Path, create: bool) -> Result<Option<Self>, String> {
-        let directory_handle = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
-            .open(directory)
-            .map_err(|error| {
-                format!(
-                    "capture commit: open session directory {}: {error}",
-                    directory.display()
-                )
-            })?;
-        let name = b"turns.jsonl\0";
-        let mut flags = libc::O_RDWR | libc::O_APPEND | libc::O_CLOEXEC | libc::O_NOFOLLOW;
-        if create {
-            flags |= libc::O_CREAT;
-        }
-        // SAFETY: `name` is a static NUL-terminated path, the directory fd stays
-        // alive in this handle, and a successful fd is transferred into `File`.
-        let descriptor = unsafe {
-            libc::openat(
-                directory_handle.as_raw_fd(),
-                name.as_ptr().cast(),
-                flags,
-                0o666,
-            )
+        let directory_handle = SessionDirectory::open(directory)
+            .map_err(|error| format!("capture commit: {error}"))?;
+        let Some(file) = directory_handle
+            .open_append("turns.jsonl", create)
+            .map_err(|error| format!("capture commit: {error}"))?
+        else {
+            return Ok(None);
         };
-        if descriptor < 0 {
-            let error = std::io::Error::last_os_error();
-            if !create && error.kind() == std::io::ErrorKind::NotFound {
-                return Ok(None);
-            }
-            return Err(format!(
-                "capture commit: open {}: {error}",
-                directory.join("turns.jsonl").display()
-            ));
-        }
-        // SAFETY: `openat` returned a new owned descriptor.
-        let file = unsafe { fs::File::from_raw_fd(descriptor) };
-        if !file
-            .metadata()
-            .map_err(|error| {
-                format!(
-                    "capture commit: stat {}: {error}",
-                    directory.join("turns.jsonl").display()
-                )
-            })?
-            .is_file()
-        {
-            return Err(format!(
-                "capture commit: raw generation is not a regular file at {}",
-                directory.join("turns.jsonl").display()
-            ));
-        }
         Ok(Some(Self {
             _directory: directory_handle,
             file,
@@ -839,24 +796,29 @@ pub(super) async fn commit_completed(
     drain(root, sid, &mut journal)
 }
 
-pub(crate) async fn detach_generation(
-    vault: &Path,
+pub(super) enum SealReadiness {
+    Detached(vaultr::vault::DetachedGeneration),
+    Raw,
+}
+
+/// Validate the complete journal/stage boundary while the caller holds the
+/// capture session mutex. Generation mutation is intentionally owned by the
+/// sibling generation module and cannot enter below this gate.
+pub(super) fn sealing_readiness(
+    root: &str,
     sid: &str,
     dir: &Path,
-) -> Result<Option<vaultr::vault::DetachedGeneration>, String> {
-    let root = canonical_root(vault);
-    let lock = session_lock(&root, sid);
-    let _guard = lock.lock().await;
+) -> Result<Option<SealReadiness>, String> {
     let generations =
         vaultr::vault::CaptureGenerations::load(dir).map_err(|error| error.to_string())?;
     let journal = Journal::load(dir, sid)?;
     if let Some(detached) = generations.detached {
-        return Ok(Some(detached));
+        return Ok(Some(SealReadiness::Detached(detached)));
     }
 
-    let stage_dir = staging_dir(&root, sid);
+    let stage_dir = staging_dir(root, sid);
     let staged = if journal.order.is_some() {
-        !read_stages(&root, sid, &journal, false)?.is_empty()
+        !read_stages(root, sid, &journal, false)?.is_empty()
     } else {
         match fs::read_dir(&stage_dir) {
             Ok(mut entries) => entries
@@ -899,7 +861,7 @@ pub(crate) async fn detach_generation(
     if generations.raw.is_none() {
         return Ok(None);
     }
-    crate::sweep::detach_capture_generation(dir).map(Some)
+    Ok(Some(SealReadiness::Raw))
 }
 
 struct RecoverySession {

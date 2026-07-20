@@ -1,7 +1,13 @@
 ## Implementation Details
 
-Keep capture construction and response handling in `capture.rs`, persistence
-state in its private concrete submodule, and shared generation truth in Vaultr.
+Keep capture construction and response handling in `capture.rs`, journal and
+stage state in its private persistence submodule, and shared generation truth
+in Vaultr. One neutral private `capture/session_fs.rs` owns the retained
+directory, no-follow open, advisory lock, rename, unlink, and directory-sync
+primitives. A sibling `capture/generation.rs` owns the complete
+readiness-to-detach-to-Sealing transaction, Capture and Herdr maintenance, and
+the compressor lifecycle. Sweep owns inventory selection and policy only; it
+does not own generation mutation or a second filesystem boundary.
 
 ### Preparation journal
 
@@ -134,11 +140,15 @@ application consume that same value rather than reopening mutable evidence.
 
 ### Immutable generation Sealing
 
-`compress_sweep` enters a narrow crate-private Capture transaction. Under the
-session mutex it rechecks the strict journal and stage backlog, scrubs the
-closed raw file, hashes it, and renames it to
+`compress_sweep` selects a typed inventory and enters one narrow crate-private
+Capture transaction. The capture-owned transaction acquires the session mutex
+and retained directory flock before asking persistence for a strict,
+non-mutating readiness verdict. It then scrubs the closed raw file, hashes it,
+and renames it to
 `turns.jsonl.sealing-<prior-zstd-length>-<sha256>`. New captures then create a
-fresh `turns.jsonl` without touching the detached generation.
+fresh `turns.jsonl` without touching the detached generation. Persistence never
+calls sweep or mutates a generation; sweep and Herdr call only the narrow
+capture-owned transaction and sidecar-append APIs.
 
 Vaultr owns one canonical capture-generation inventory that validates the
 sealed, raw, and digest-identified detached paths. Reconstruction, maintenance,
@@ -189,10 +199,14 @@ but cannot durably lose both source evidence and the destination name.
 Restart cleanup recognizes only the current hidden UUIDv4 temp grammar plus the
 five exact deterministic names emitted by the immediately preceding version:
 `turns.scrub-tmp`, `turns.jsonl.frame-tmp`, `turns.jsonl.zst-tmp`,
-`herdr.jsonl.frame-tmp`, and `herdr.jsonl.zst-tmp`. It opens each entry
-no-follow and removes it only when regular; symlinks, non-regular entries, and
-near misses fail closed. A timed-out zstd child is explicitly killed and reaped
-before its retained output is cleaned.
+`herdr.frame-tmp`, and `herdr.zst-tmp`. The Herdr names are the actual
+`Path::with_extension("frame-tmp" | "zst-tmp")` results for the former
+`herdr.jsonl` source. The mistakenly inferred `herdr.jsonl.frame-tmp` and
+`herdr.jsonl.zst-tmp` names are unrecognized evidence, not migration debris.
+Cleanup opens each exact entry no-follow and removes it only when regular;
+symlinks, non-regular entries, forbidden names, and near misses fail closed. A
+timed-out zstd child is explicitly killed and reaped before its retained output
+is cleaned.
 
 The detached filename and location diagnostics contain no captured content.
 Legacy Envelope files and concatenated zstd frames remain unchanged.
@@ -261,6 +275,10 @@ preparation order differ in practice.
   compete for both listeners, because a process-local session mutex cannot
   coordinate a child process. Job discovery assigns compression a typed
   in-process action; scheduled dispatch never executes its manual wrapper.
+- Keep readiness validation in persistence, descriptor mechanics in one neutral
+  session-filesystem module, and every generation mutation in the capture-owned
+  generation module. Sweep can select policy without becoming a second
+  persistence or filesystem owner.
 - Centralize generation parsing in Vaultr so every consumer makes the same
   evidence-preserving decision.
 - Do not abandon live gaps by timeout. Normal EOF, stream error, or disconnect

@@ -7,6 +7,7 @@ mod capture;
 mod herdr;
 mod jobs;
 mod otel;
+mod process;
 mod proxy;
 mod selftest;
 mod sweep;

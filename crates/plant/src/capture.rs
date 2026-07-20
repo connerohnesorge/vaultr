@@ -1,8 +1,10 @@
-//! Vault capture — envelope writer, state.json, meta merge. Delta encoding
-//! lives in vaultr::recon next to its inverse.
-//! Ports capture/sessionDir/updateMeta (wireproxy.ts:122-422).
+//! Vault capture: envelope construction, private persistence, and immutable
+//! generation maintenance. Delta encoding lives in vaultr::recon next to its
+//! inverse. Sweep and Herdr enter capture-owned persistence APIs.
 
+mod generation;
 mod persistence;
+mod session_fs;
 
 use crate::adapter::{Adapter, Identity};
 use serde_json::{json, Map, Value};
@@ -14,7 +16,10 @@ use std::time::SystemTime;
 use vaultr::recon;
 use vaultr::vault::{dated_session_dir, Meta};
 
-pub(crate) use persistence::{canonical_root, detach_generation, recover_all, session_lock};
+pub(crate) use generation::{
+    append_herdr_snapshot, current_herdr_snapshot, scrub, seal_ready_generation,
+};
+pub(crate) use persistence::{canonical_root, recover_all};
 
 pub struct CapturedRequest {
     pub method: String,
@@ -853,6 +858,9 @@ mod tests {
 
     #[tokio::test]
     async fn detachment_rechecks_behind_a_finishing_capture() {
+        if !crate::process::which("zstd") {
+            return;
+        }
         let (_g, vault) = set_home();
         let adapter = claude_adapter();
         let sid = uuid::Uuid::new_v4().to_string();
@@ -868,7 +876,7 @@ mod tests {
         let detach_sid = sid.clone();
         let detach_dir = dir.clone();
         let detach = tokio::spawn(async move {
-            detach_generation(&detach_vault, &detach_sid, &detach_dir).await
+            seal_ready_generation(&detach_vault, &detach_sid, &detach_dir).await
         });
         tokio::task::yield_now().await;
         let finish_vault = vault.clone();
@@ -883,10 +891,10 @@ mod tests {
             "queued detachment must observe the open reservation"
         );
         finish.await.unwrap().unwrap();
-        let generation = detach_generation(&vault, &sid, &dir)
+        let generation = seal_ready_generation(&vault, &sid, &dir)
             .await
             .unwrap()
-            .expect("finished generation detaches");
+            .expect("finished generation seals");
         assert_eq!(
             recon::reconstruct(&generation.path).unwrap().envelopes,
             1,
