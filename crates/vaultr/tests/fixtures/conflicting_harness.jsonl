@@ -1,0 +1,2 @@
+{"schema_version":1,"harness":"claude-code","request":{"body_delta":{"history":{"key":"messages","prefix_length":0,"append":[{"role":"user","content":"first"}]}}},"response":{"complete":false}}
+{"schema_version":1,"harness":"codex","request":{"body_delta":{"history":{"key":"input","prefix_length":1,"append":[{"type":"message","role":"user","content":[{"type":"input_text","text":"CAPTURE_SECRET"}]}]}}},"response":{"complete":false}}

@@ -44,6 +44,21 @@ fn content_addressed_deltas() {
 }
 
 #[test]
+fn malformed_lineage_fails_with_location_only() {
+    for name in [
+        "malformed_prefix.jsonl",
+        "non_string_order.jsonl",
+        "missing_hash.jsonl",
+    ] {
+        let err = recon::reconstruct(&fixture(name)).unwrap_err();
+        let message = format!("{err:#}");
+        assert!(message.contains("reconstruct: raw record 1"), "{message}");
+        assert!(!message.contains("CAPTURE_SECRET"), "{message}");
+        assert!(!message.contains("opaque-missing-hash"), "{message}");
+    }
+}
+
+#[test]
 fn compaction_replaces_history() {
     let r = recon::reconstruct(&fixture("compaction.jsonl")).unwrap();
     // prefix_length 0 on the second envelope discards the pre-compaction turns
@@ -92,6 +107,62 @@ fn harness_envelope_field_outranks_key() {
     });
     let r = recon::reconstruct_reader(format!("{env}\n").as_bytes()).unwrap();
     assert_eq!(r.harness, Some(recon::Harness::Codex));
+}
+
+#[test]
+fn first_explicit_harness_is_authoritative() {
+    let envelope = |harness: Option<&str>, key: &str| {
+        json!({
+            "schema_version": 1,
+            "harness": harness,
+            "request": {"body_delta": {"history": {
+                "key": key, "prefix_length": 0, "append": []
+            }}},
+            "response": {"complete": false}
+        })
+    };
+
+    let repeated = format!(
+        "{}\n{}\n",
+        envelope(Some("claude-code"), "messages"),
+        envelope(Some("claude"), "messages")
+    );
+    assert_eq!(
+        recon::reconstruct_reader(repeated.as_bytes())
+            .unwrap()
+            .harness,
+        Some(recon::Harness::Claude)
+    );
+
+    let explicit_over_key = format!(
+        "{}\n{}\n",
+        envelope(None, "input"),
+        envelope(Some("claude-code"), "messages")
+    );
+    assert_eq!(
+        recon::reconstruct_reader(explicit_over_key.as_bytes())
+            .unwrap()
+            .harness,
+        Some(recon::Harness::Claude)
+    );
+
+    let unknown = format!(
+        "{}\n{}\n",
+        envelope(Some("unknown"), "messages"),
+        envelope(Some("codex"), "input")
+    );
+    assert_eq!(
+        recon::reconstruct_reader(unknown.as_bytes())
+            .unwrap()
+            .harness,
+        Some(recon::Harness::Codex)
+    );
+
+    let err = recon::reconstruct(&fixture("conflicting_harness.jsonl")).unwrap_err();
+    let message = format!("{err:#}");
+    assert!(message.contains("reconstruct: raw record 2"), "{message}");
+    assert!(message.contains("conflicting explicit harness labels"));
+    assert!(!message.contains("CAPTURE_SECRET"));
 }
 
 #[test]

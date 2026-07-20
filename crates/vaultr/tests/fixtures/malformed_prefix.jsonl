@@ -1,0 +1,1 @@
+{"schema_version":1,"harness":"claude-code","request":{"body_delta":{"history":{"key":"messages","prefix_length":1,"append":[{"role":"user","content":"CAPTURE_SECRET"}]}}},"response":{"complete":false}}

@@ -11,7 +11,7 @@ focused_pane() {
   printf '%s' "${HERDR_PANE_ID:?no pane context}"
 }
 
-# echoes: <session_id> <agent> <cwd>
+# emits NUL-delimited: <session_id> <agent> <cwd>
 pane_session() {
   local pane="$1"
   "$HERDR" pane list | python3 -c '
@@ -22,7 +22,8 @@ for p in json.load(sys.stdin)["result"]["panes"]:
         s = p.get("agent_session")
         if not s or s.get("kind") != "id":
             sys.exit(f"pane {pane} has no agent session id")
-        print(s["value"], s.get("agent", "?"), p.get("cwd", ""))
+        for value in (s["value"], s.get("agent", "?"), p.get("cwd", "")):
+            sys.stdout.buffer.write(value.encode() + b"\0")
         sys.exit(0)
 sys.exit(f"pane {pane} not found")
 ' "$pane"

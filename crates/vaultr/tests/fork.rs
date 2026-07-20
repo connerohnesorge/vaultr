@@ -6,7 +6,7 @@ use chrono::{Local, TimeZone};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use vaultr::fork::{self, ForkOptions, Target};
-use vaultr::{claude_writer, codex_writer};
+use vaultr::{claude_writer, codex_writer, recon};
 
 fn tmp() -> tempfile::TempDir {
     tempfile::tempdir().expect("tempdir")
@@ -19,8 +19,11 @@ fn sample_messages() -> Vec<Value> {
              "cache_control": {"type": "ephemeral"}}
         ]}),
         json!({"role": "assistant", "content": [
-            {"type": "text", "text": "hi"},
-            {"type": "tool_use", "id": "toolu_abc", "name": "Bash", "input": {"command": "ls"}}
+            {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}},
+            {"type": "tool_use", "id": "toolu_abc", "name": "Bash", "input": {
+                "command": "ls",
+                "cache_control": {"opaque": ["nested", 7]}
+            }}
         ]}),
         json!({"role": "user", "content": [
             {"type": "tool_result", "tool_use_id": "toolu_abc", "content": "a.txt"}
@@ -131,7 +134,8 @@ fn claude_empty_history_writes_nothing() {
 // Mirror the writer's stored-form normalization: cache_control stripped, and a
 // user message whose content is a single bare text block collapses to a string.
 fn stored_form(m: &Value) -> Value {
-    let v = claude_writer::strip_cache_control(m.clone());
+    let mut v = m.clone();
+    v["content"] = claude_writer::strip_cache_control(v["content"].clone());
     let is_user = v["role"] == "user";
     let content = &v["content"];
     if is_user {
@@ -167,6 +171,13 @@ fn claude_passthrough_strips_cache_control_only() {
     // system-reminder text preserved byte-for-byte in the stored (collapsed) record.
     let first = conv[0]["message"]["content"].as_str().unwrap();
     assert!(first.contains("<system-reminder>secret scaffolding</system-reminder>"));
+    assert!(conv[1]["message"]["content"][0]
+        .get("cache_control")
+        .is_none());
+    assert_eq!(
+        conv[1]["message"]["content"][1]["input"]["cache_control"],
+        json!({"opaque": ["nested", 7]})
+    );
 }
 
 // ---------- Codex writer ----------
@@ -299,6 +310,28 @@ fn codex_passthrough_prep_drops_scaffolding() {
     assert_eq!(items, codex_items(), "later developer messages are kept");
 }
 
+#[test]
+fn codex_passthrough_only_lifts_one_truly_leading_developer_message() {
+    let developer = |text: &str| {
+        json!({"type": "message", "role": "developer",
+               "content": [{"type": "input_text", "text": text}]})
+    };
+    let user = json!({"type": "message", "role": "user",
+                      "content": [{"type": "input_text", "text": "user"}]});
+
+    let (items, base) = fork::prepare_codex_passthrough(&[developer("first")]);
+    assert!(items.is_empty());
+    assert_eq!(base.as_deref(), Some("first"));
+
+    let (items, base) = fork::prepare_codex_passthrough(&[user.clone(), developer("later")]);
+    assert_eq!(items, vec![user.clone(), developer("later")]);
+    assert_eq!(base, None);
+
+    let (items, base) = fork::prepare_codex_passthrough(&[developer("first"), developer("second")]);
+    assert_eq!(items, vec![developer("second")]);
+    assert_eq!(base.as_deref(), Some("first"));
+}
+
 // ---------- fork() end-to-end over a fixture vault ----------
 
 fn fixture_vault(
@@ -371,6 +404,54 @@ fn opts(cwd: Option<PathBuf>, claude: &Path, codex: &Path) -> ForkOptions {
     }
 }
 
+fn set_fixture_model(root: &Path, id: &str, model: &str) {
+    let path = root.join(".meta").join(format!("{id}.json"));
+    let mut meta: Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    meta["model"] = json!(model);
+    std::fs::write(path, serde_json::to_string(&meta).unwrap()).unwrap();
+}
+
+fn fork_cli(
+    root: &Path,
+    id: &str,
+    target: Target,
+    cwd: &Path,
+    sandbox: &Path,
+    home: Option<&str>,
+    config: Option<(&str, &str)>,
+) -> std::process::Output {
+    let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_vaultr"));
+    command
+        .current_dir(sandbox)
+        .env_remove("CLAUDE_CONFIG_DIR")
+        .env_remove("CODEX_HOME")
+        .arg("--vault")
+        .arg(root)
+        .arg("session")
+        .arg("fork")
+        .arg(id)
+        .arg("--into")
+        .arg(match target {
+            Target::Claude => "claude",
+            Target::Codex => "codex",
+        })
+        .arg("--cwd")
+        .arg(cwd)
+        .arg("--no-launch");
+    match home {
+        Some(home) => {
+            command.env("HOME", home);
+        }
+        None => {
+            command.env_remove("HOME");
+        }
+    }
+    if let Some((name, value)) = config {
+        command.env(name, value);
+    }
+    command.output().unwrap()
+}
+
 #[test]
 fn fork_missing_cwd_fails_before_write() {
     let cfg = tmp();
@@ -388,6 +469,115 @@ fn fork_missing_cwd_fails_before_write() {
     .unwrap_err();
     assert!(err.to_string().contains("does not exist"));
     assert!(walk_files(cfg.path()).is_empty(), "nothing may be written");
+}
+
+#[test]
+fn fork_canonicalizes_relative_and_symlink_cwds() {
+    let cfg = tmp();
+    let current = std::env::current_dir().unwrap();
+    let relative = tempfile::Builder::new()
+        .prefix("vaultr-relative-")
+        .tempdir_in(&current)
+        .unwrap();
+    let relative_path = relative.path().strip_prefix(&current).unwrap();
+    let (root, id) = fixture_vault("claude-code", &sample_messages(), None);
+    let out = fork::fork(
+        root.path(),
+        &id,
+        Target::Claude,
+        &opts(Some(relative_path.to_path_buf()), cfg.path(), cfg.path()),
+    )
+    .unwrap();
+    let canonical = relative.path().canonicalize().unwrap();
+    assert_eq!(out.cwd, canonical);
+    assert_eq!(
+        out.path.parent().unwrap().file_name().unwrap(),
+        claude_writer::encode_project_dir(&canonical.to_string_lossy()).as_str()
+    );
+
+    #[cfg(unix)]
+    {
+        let real = tmp();
+        let links = tmp();
+        let link = links.path().join("linked-cwd");
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+        let (root, id) = fixture_vault("claude-code", &sample_messages(), None);
+        let out = fork::fork(
+            root.path(),
+            &id,
+            Target::Claude,
+            &opts(Some(link), cfg.path(), cfg.path()),
+        )
+        .unwrap();
+        let canonical = real.path().canonicalize().unwrap();
+        assert_eq!(out.cwd, canonical);
+        assert_eq!(
+            out.path.parent().unwrap().file_name().unwrap(),
+            claude_writer::encode_project_dir(&canonical.to_string_lossy()).as_str()
+        );
+    }
+}
+
+#[test]
+fn fork_rejects_missing_home_and_relative_config_roots_before_write() {
+    let workdir = tmp();
+    let (root, id) = fixture_vault("claude-code", &sample_messages(), None);
+    for target in [Target::Claude, Target::Codex] {
+        for home in [None, Some("")] {
+            let sandbox = tmp();
+            let output = fork_cli(
+                root.path(),
+                &id,
+                target,
+                workdir.path(),
+                sandbox.path(),
+                home,
+                None,
+            );
+            assert!(!output.status.success());
+            assert!(String::from_utf8_lossy(&output.stderr).contains("HOME is missing or empty"));
+            assert!(
+                walk_files(sandbox.path()).is_empty(),
+                "nothing may be written"
+            );
+        }
+
+        let sandbox = tmp();
+        let (name, value) = match target {
+            Target::Claude => ("CLAUDE_CONFIG_DIR", "relative-claude"),
+            Target::Codex => ("CODEX_HOME", "relative-codex"),
+        };
+        let output = fork_cli(
+            root.path(),
+            &id,
+            target,
+            workdir.path(),
+            sandbox.path(),
+            Some("/"),
+            Some((name, value)),
+        );
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("must be absolute"));
+        assert!(
+            walk_files(sandbox.path()).is_empty(),
+            "nothing may be written"
+        );
+
+        let sandbox = tmp();
+        let config = sandbox.path().join("absolute-config");
+        let config_text = config.to_string_lossy();
+        let output = fork_cli(
+            root.path(),
+            &id,
+            target,
+            workdir.path(),
+            sandbox.path(),
+            None,
+            Some((name, &config_text)),
+        );
+        assert!(output.status.success(), "{output:#?}");
+        assert!(!walk_files(&config).is_empty());
+    }
 }
 
 #[test]
@@ -421,6 +611,7 @@ fn fork_same_harness_claude_roundtrip() {
         &msgs,
         Some(&workdir.path().to_string_lossy()),
     );
+    set_fixture_model(root.path(), &id, "claude-source-model");
     let out = fork::fork(
         root.path(),
         &id,
@@ -442,6 +633,10 @@ fn fork_same_harness_claude_roundtrip() {
     for (got, exp) in contents.iter().zip(&expected) {
         assert_eq!(*got, exp);
     }
+    assert!(recs
+        .iter()
+        .filter(|r| r["type"] == "assistant")
+        .all(|r| r["message"]["model"] == "claude-source-model"));
 }
 
 #[test]
@@ -454,6 +649,7 @@ fn fork_cross_harness_codex_to_claude() {
     history.push(json!({"type": "custom_tool_call", "name": "totally_unknown", "input": "raw", "call_id": "call_9"}));
     history.push(json!({"type": "custom_tool_call_output", "call_id": "call_9", "output": "res", "status": "completed"}));
     let (root, id) = fixture_vault("codex", &history, Some(&workdir.path().to_string_lossy()));
+    set_fixture_model(root.path(), &id, "codex-source-model");
     let out = fork::fork(
         root.path(),
         &id,
@@ -475,6 +671,11 @@ fn fork_cross_harness_codex_to_claude() {
     for w in conv.windows(2) {
         assert_eq!(w[1]["parentUuid"], w[0]["uuid"]);
     }
+    assert!(recs
+        .iter()
+        .filter(|r| r["type"] == "assistant")
+        .all(|r| r["message"]["model"] == "claude-opus-4-8"));
+    assert!(!text.contains("codex-source-model"));
 }
 
 #[test]
@@ -487,6 +688,7 @@ fn fork_cross_harness_claude_to_codex() {
         &msgs,
         Some(&workdir.path().to_string_lossy()),
     );
+    set_fixture_model(root.path(), &id, "claude-source-model");
     let out = fork::fork(
         root.path(),
         &id,
@@ -498,6 +700,13 @@ fn fork_cross_harness_claude_to_codex() {
     assert_eq!(recs[0]["type"], "session_meta");
     let text = std::fs::read_to_string(&out.path).unwrap();
     assert!(text.contains("\"name\":\"shell\""));
+    let turn_context = recs.iter().find(|r| r["type"] == "turn_context").unwrap();
+    assert_eq!(turn_context["payload"]["model"], "gpt-5.6-sol");
+    assert_eq!(
+        turn_context["payload"]["collaboration_mode"]["settings"]["model"],
+        "gpt-5.6-sol"
+    );
+    assert!(!text.contains("claude-source-model"));
     assert_eq!(out.launch[0], "codex");
     // filename uuid == session_meta id == launch id
     let fname = out.path.file_stem().unwrap().to_string_lossy().to_string();
@@ -547,6 +756,83 @@ fn fork_envelope_harness_outranks_stale_meta() {
     assert_eq!(reasoning[0]["payload"]["encrypted_content"], "OPAQUE==");
 }
 
+#[test]
+fn fork_conflicting_explicit_harnesses_fails_before_write() {
+    let cfg = tmp();
+    let workdir = tmp();
+    let (root, id) = fixture_vault(
+        "claude-code",
+        &sample_messages(),
+        Some(&workdir.path().to_string_lossy()),
+    );
+    let capture = root.path().join("2026/07/01").join(&id).join("turns.jsonl");
+    let conflict = json!({
+        "schema_version": 1,
+        "harness": "codex",
+        "request": {"body_delta": {"history": {
+            "key": "input", "prefix_length": 4, "append": []
+        }}},
+        "response": {"complete": false}
+    });
+    use std::io::Write;
+    writeln!(
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(capture)
+            .unwrap(),
+        "{conflict}"
+    )
+    .unwrap();
+
+    let err = fork::fork(
+        root.path(),
+        &id,
+        Target::Claude,
+        &opts(None, cfg.path(), cfg.path()),
+    )
+    .unwrap_err();
+    assert!(format!("{err:#}").contains("conflicting explicit harness labels"));
+    assert!(walk_files(cfg.path()).is_empty(), "nothing may be written");
+}
+
+#[test]
+fn fork_impossible_prefix_fails_before_write() {
+    let cfg = tmp();
+    let workdir = tmp();
+    let (root, id) = fixture_vault(
+        "claude-code",
+        &sample_messages(),
+        Some(&workdir.path().to_string_lossy()),
+    );
+    let capture = root.path().join("2026/07/01").join(&id).join("turns.jsonl");
+    std::fs::write(
+        capture,
+        format!(
+            "{}\n",
+            json!({
+                "schema_version": 1,
+                "harness": "claude-code",
+                "request": {"body_delta": {"history": {
+                    "key": "messages", "prefix_length": 1,
+                    "append": [{"role": "user", "content": "CAPTURE_SECRET"}]
+                }}},
+                "response": {"complete": false}
+            })
+        ),
+    )
+    .unwrap();
+
+    let err = fork::fork(
+        root.path(),
+        &id,
+        Target::Claude,
+        &opts(None, cfg.path(), cfg.path()),
+    )
+    .unwrap_err();
+    assert!(!format!("{err:#}").contains("CAPTURE_SECRET"));
+    assert!(walk_files(cfg.path()).is_empty(), "nothing may be written");
+}
+
 fn walk_files(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir(dir) {
@@ -577,7 +863,10 @@ fn pick_session(root: &Path, harness: &str) -> Option<vaultr::vault::Session> {
         .find(|s| {
             s.meta.harness.as_deref() == Some(harness)
                 && s.meta.cwd.as_deref().is_some_and(|c| Path::new(c).is_dir())
-                && vaultr::vault::session_dir(root, s).is_ok()
+                && vaultr::vault::session_dir(root, s)
+                    .and_then(|dir| vaultr::vault::capture_file(&dir))
+                    .and_then(|capture| recon::reconstruct(&capture))
+                    .is_ok_and(|recon| !recon.messages.is_empty())
         })
 }
 

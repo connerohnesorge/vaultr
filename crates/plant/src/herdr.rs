@@ -422,7 +422,10 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
             match registered {
-                Some(sid) => println!("[herdr:{}] registered job self-capture {sid}", agent_run.label),
+                Some(sid) => println!(
+                    "[herdr:{}] registered job self-capture {sid}",
+                    agent_run.label
+                ),
                 None => eprintln!(
                     "[herdr:{}] no agent_session id for pane {pane}; self-capture may reach learn",
                     agent_run.label

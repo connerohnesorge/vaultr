@@ -70,33 +70,49 @@ pub fn fork(root: &Path, id: &str, target: Target, opts: &ForkOptions) -> Result
                 format!("session {} has no recorded cwd; pass --cwd", session.id)
             })?),
         };
-    if !cwd.is_dir() {
-        bail!(
-            "target cwd {} does not exist (nothing was written)",
+    let cwd = cwd.canonicalize().with_context(|| {
+        format!(
+            "target cwd {} does not exist or cannot be resolved (nothing was written)",
             cwd.display()
-        );
-    }
+        )
+    })?;
     let cwd_str = cwd.to_string_lossy().to_string();
     let git_branch = session.meta.git_branch.as_deref();
 
     let (new_id, path, launch) = match target {
         Target::Claude => {
+            let config_root = config_root(
+                opts.claude_config_dir.as_deref(),
+                "CLAUDE_CONFIG_DIR",
+                ".claude",
+                "Claude config root",
+            )?;
             let messages: Vec<Value> = if source == Harness::Claude {
                 recon.messages.clone()
             } else {
                 translate::to_anthropic(&normalize::normalize(&recon.messages))
             };
             let (id, path) = claude_writer::write(
-                &claude_config_dir(opts),
+                &config_root,
                 &cwd_str,
                 git_branch,
-                session.meta.model.as_deref(),
+                if source == Harness::Claude {
+                    session.meta.model.as_deref()
+                } else {
+                    None
+                },
                 &messages,
             )?;
             let launch = vec!["claude".into(), "--resume".into(), id.clone()];
             (id, path, launch)
         }
         Target::Codex => {
+            let config_root = config_root(
+                opts.codex_home.as_deref(),
+                "CODEX_HOME",
+                ".codex",
+                "Codex home",
+            )?;
             let (items, base_instructions) = if source == Harness::Codex {
                 prepare_codex_passthrough(&recon.messages)
             } else {
@@ -106,12 +122,16 @@ pub fn fork(root: &Path, id: &str, target: Target, opts: &ForkOptions) -> Result
                 )
             };
             let (id, path) = codex_writer::write(
-                &codex_home(opts),
+                &config_root,
                 &cwd_str,
                 git_branch,
                 &items,
                 base_instructions.as_deref(),
-                session.meta.model.as_deref(),
+                if source == Harness::Codex {
+                    session.meta.model.as_deref()
+                } else {
+                    None
+                },
             )?;
             let launch = vec!["codex".into(), "resume".into(), id.clone()];
             (id, path, launch)
@@ -146,32 +166,28 @@ pub fn launch(outcome: &ForkOutcome) -> Result<()> {
     }
 }
 
-fn claude_config_dir(opts: &ForkOptions) -> PathBuf {
-    if let Some(p) = &opts.claude_config_dir {
-        return p.clone();
+fn config_root(
+    override_root: Option<&Path>,
+    env_var: &str,
+    default_leaf: &str,
+    label: &str,
+) -> Result<PathBuf> {
+    let root = if let Some(root) = override_root {
+        root.to_path_buf()
+    } else if let Some(root) = std::env::var_os(env_var).filter(|value| !value.is_empty()) {
+        root.into()
+    } else {
+        PathBuf::from(
+            std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .context("HOME is missing or empty (nothing was written)")?,
+        )
+        .join(default_leaf)
+    };
+    if !root.is_absolute() {
+        bail!("{label} must be absolute (nothing was written)");
     }
-    if let Ok(v) = std::env::var("CLAUDE_CONFIG_DIR") {
-        if !v.is_empty() {
-            return PathBuf::from(v);
-        }
-    }
-    home().join(".claude")
-}
-
-fn codex_home(opts: &ForkOptions) -> PathBuf {
-    if let Some(p) = &opts.codex_home {
-        return p.clone();
-    }
-    if let Ok(v) = std::env::var("CODEX_HOME") {
-        if !v.is_empty() {
-            return PathBuf::from(v);
-        }
-    }
-    home().join(".codex")
-}
-
-fn home() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+    Ok(root)
 }
 
 /// Prepare a Codex->Codex passthrough: Codex regenerates the per-request
@@ -181,29 +197,23 @@ fn home() -> PathBuf {
 /// everything else (including reasoning items with encrypted_content) passes
 /// through opaquely.
 pub fn prepare_codex_passthrough(messages: &[Value]) -> (Vec<Value>, Option<String>) {
-    let mut base_instructions: Option<String> = None;
-    let mut items: Vec<Value> = Vec::new();
-    let mut dropped_dev = false;
-    for m in messages {
-        let ty = m.get("type").and_then(Value::as_str);
-        if ty == Some("additional_tools") {
-            continue;
-        }
-        if !dropped_dev
-            && ty == Some("message")
-            && m.get("role").and_then(Value::as_str) == Some("developer")
+    let mut items = messages
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) != Some("additional_tools"));
+    match items.next() {
+        Some(first)
+            if first.get("type").and_then(Value::as_str) == Some("message")
+                && first.get("role").and_then(Value::as_str) == Some("developer") =>
         {
-            dropped_dev = true;
-            base_instructions = m
+            let base_instructions = first
                 .get("content")
                 .and_then(Value::as_array)
                 .and_then(|a| a.first())
                 .and_then(|b| b.get("text"))
                 .and_then(Value::as_str)
                 .map(String::from);
-            continue;
+            (items.cloned().collect(), base_instructions)
         }
-        items.push(m.clone());
+        first => (first.into_iter().chain(items).cloned().collect(), None),
     }
-    (items, base_instructions)
 }

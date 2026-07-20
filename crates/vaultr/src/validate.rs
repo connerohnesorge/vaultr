@@ -368,16 +368,28 @@ pub fn scan(content_root: &Path) -> Result<Report> {
             continue;
         };
         let mut in_sources = false;
-        for line in &raw {
-            if !line.starts_with([' ', '\t', '-']) {
-                in_sources = line.split(':').next().map(str::trim) == Some("sources");
-                continue;
+        let source_values = raw.iter().filter_map(|line| {
+            if line.starts_with([' ', '\t', '-']) {
+                return in_sources.then(|| line.trim().trim_start_matches('-').trim());
             }
-            if !in_sources {
-                continue;
+            match line.split_once(':') {
+                Some((key, value)) => {
+                    in_sources = key.trim() == "sources";
+                    in_sources.then_some(value)
+                }
+                None => {
+                    in_sources = false;
+                    None
+                }
             }
-            let item = line.trim().trim_start_matches('-').trim();
-            if looks_like_uuid(item) && !meta_dir.join(format!("{item}.json")).is_file() {
+        });
+        for item in source_values
+            .flat_map(|value| {
+                value.split(|c: char| c.is_ascii_whitespace() || matches!(c, '[' | ']' | ','))
+            })
+            .filter_map(source_session_id)
+        {
+            if !meta_dir.join(format!("{item}.json")).is_file() {
                 report.findings.push(Finding {
                     severity: Severity::Warning,
                     kind: "sources",
@@ -405,6 +417,31 @@ fn looks_like_uuid(s: &str) -> bool {
             8 | 13 | 18 | 23 => c == '-',
             _ => c.is_ascii_hexdigit(),
         })
+}
+
+fn source_session_id(token: &str) -> Option<&str> {
+    let token = token.trim_matches(['"', '\'']);
+    if looks_like_uuid(token) {
+        return Some(token);
+    }
+    let mut parts = token.split('/');
+    let (Some("sessions"), Some(year), Some(month), Some(day), Some(id), None) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) else {
+        return None;
+    };
+    let valid_year = year.len() == 4 && year.bytes().all(|c| c.is_ascii_digit());
+    let valid_month = month.len() == 2
+        && month
+            .parse::<u8>()
+            .is_ok_and(|month| (1..=12).contains(&month));
+    let valid_day = day.len() == 2 && day.parse::<u8>().is_ok_and(|day| (1..=31).contains(&day));
+    (valid_year && valid_month && valid_day && looks_like_uuid(id)).then_some(id)
 }
 
 /// CLI entry: print report, return process exit code.
