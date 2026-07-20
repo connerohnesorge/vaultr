@@ -5,7 +5,7 @@ cd "$(dirname "$0")"
 . ./lib.sh
 
 pane=$(focused_pane)
-exec 3< <(pane_session "$pane" null)
+exec 3< <(pane_session "$pane")
 IFS= read -r -d '' sid <&3
 IFS= read -r -d '' _agent <&3
 IFS= read -r -d '' pcwd <&3
