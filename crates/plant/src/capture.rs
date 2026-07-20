@@ -562,6 +562,8 @@ fn drain(dir: &Path, root: &str, sid: &str) -> Result<(), String> {
 /// response output, and fails startup (leaving persisted bytes unchanged) on any
 /// journal / identity / persisted-tail conflict.
 pub fn recover_all(vault: &Path) -> Result<(), String> {
+    #[cfg(test)]
+    RECOVERY_CALLS.with(|calls| calls.set(calls.get() + 1));
     let root = canonical_root(vault);
     let mut sessions: BTreeSet<String> = BTreeSet::new();
 
@@ -596,6 +598,21 @@ pub fn recover_all(vault: &Path) -> Result<(), String> {
         recover_session(vault, &root, &sid)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static RECOVERY_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_recovery_calls() {
+    RECOVERY_CALLS.with(|calls| calls.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn recovery_calls() -> u32 {
+    RECOVERY_CALLS.with(std::cell::Cell::get)
 }
 
 fn recover_session(vault: &Path, root: &str, sid: &str) -> Result<(), String> {

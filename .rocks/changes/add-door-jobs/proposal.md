@@ -36,3 +36,12 @@ over the new files, so a message can start (and, through the existing
   jobs.
 - Not changed: the Herdr lifecycle stays implemented once, in Plant; doors
   never drive panes except through `plant agent run`.
+
+## Issue traceability
+
+- GitHub #24: durable pre-side-effect job attempt fencing, fallible final
+  recording, exit-75 re-arm, and fail-closed recovery.
+- GitHub #27: fail-closed, cross-process, crash-safe Door claims and durable
+  Plant Agent Run outcome lookup.
+- GitHub #35: verified native Claude/Codex readiness and lifecycle cleanup in
+  the single Plant-owned Herdr boundary.

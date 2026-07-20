@@ -7,18 +7,36 @@ from vault file changes (sync jobs are the ingestion layer), detection is
 poll-on-cadence rather than filesystem watching, and the door logic lives in
 typed code rather than bash or a bespoke declarative format.
 
+## Non-goals
+
+- Defending mail projector path publication against a hostile same-account
+  process that substitutes a directory within one individual Node path syscall
+  is out of scope. Stable Bun/Node exposes no portable `openat`/`linkat`/
+  `renameat` API, and experimental `bun:ffi` is not a production dependency.
+  The shipped held-directory fallback prevents static and pre-operation
+  substitution and fails closed under deterministic directory-swap tests.
+
 ## Decision summary
 
 - A door is a job. No door engine, no `vault/doors/*.toml`, no second
   scheduler: Plant's existing filename-cadence scanner runs door scripts like
   any other Cultivation Job, and outcomes land in the existing jobs ledger.
+- Scheduled dispatch holds one per-job attempt guard from the locked durable
+  cadence recheck through semaphore wait, typed execution, and exactly one
+  final or retryable transition. The process runner applies one deadline to
+  the direct child plus both output drains so an inherited descendant pipe
+  cannot strand the guard.
+- The daemon and offline compressor acquire both capture listeners before
+  recovery. Startup/offline recovery runs once under those leases; scheduled
+  compression only sweeps. Daemon accept loops retain the leases through the
+  shutdown drain, and a failed partial bind is dropped before any mutation.
 - The fragile parts — dedup fencing, watch-root policy, fire-rate breaking,
   agent launch — are written once in a shared TypeScript library, not
   re-authored per door.
 - Door state fails closed, is replaced atomically under a per-door
   cross-process lock, and carries a timestamp frontier with the paths already
   seen at that timestamp plus the exact ordered in-progress batch. The claim
-  includes a portable identity for the bounded bytes and deterministically
+  includes a portable full-content identity captured with bounded memory and deterministically
   supplies Plant's idempotency key, so process crashes or same-path
   replacement cannot create a second agent run with different content.
 - Loop prevention is structural first (doors may only watch ingestion roots
@@ -91,8 +109,8 @@ that lands later at the same timestamp with a lower-sorting path. Each door
 therefore serializes evaluation with a per-door cross-process lock, fails
 closed on unreadable or invalid state, and persists a timestamp frontier plus
 the sorted set of paths already seen at that timestamp. It atomically persists
-the exact batch ordered by `(mtime,path)`, including total size and SHA-256 of
-the exact bounded bytes read, before launch. That content-bound claim
+  the exact batch ordered by `(mtime,path)`, including total size and SHA-256 of
+  the entire stable descriptor, before launch. That content-bound claim
 determines the Plant idempotency key and survives both pre-launch and
 post-launch Door crashes. Hydration must reproduce the persisted mtime, size,
 and digest before launch. A retry resumes that claim; only a confirmed durable
@@ -106,10 +124,12 @@ The watch resolver selects one configured ingestion root and canonicalizes it.
 Both scanning and claim hydration open matches with no-follow semantics, verify
 the opened descriptor is a regular file beneath that root, and test frontier
 eligibility before reading content. Opens are nonblocking so matching FIFOs
-cannot stall a Door. One bounded 65,536-byte descriptor read is bracketed by
-`fstat`; device, inode, size, mtime, and ctime must remain identical. Traversal,
-symlink escapes, in-place writes, and pathname replacement therefore fail
-closed. Door tests run under pinned Bun on both Linux and macOS so the
+cannot stall a Door. The entire descriptor is streamed through SHA-256 with
+bounded memory while only the first 65,536 bytes are retained for filters and
+prompts; the read is bracketed by `fstat`, and device, inode, size, mtime, and
+ctime must remain identical. Traversal, symlink escapes, in-place writes,
+tail-only replacements, and pathname replacement therefore fail closed. Door
+tests run under pinned Bun on both Linux and macOS so the
 platform-specific lock and descriptor paths stay live. Hidden scanning is
 enabled only when the configured glob explicitly names a hidden segment, so
 the mail artifact watch can enter `.door` without broadening ordinary watches.
@@ -122,7 +142,13 @@ sources pass. Its machine-local, gitignored `mail/.door/` state durably records
 `initialized` plus each source's relative path, device, inode, and EOF offset.
 The `.door` and `summons` directories must be real no-follow directories;
 state and existing artifacts are read only through bounded, nonblocking,
-no-follow regular-file descriptors. The first true run snapshots all existing
+no-follow regular-file descriptors. Projection retains stable descriptor and
+identity leases for both directories, revalidates their lexical and canonical
+identity around every atomic temp/final publication, and proves each exclusive
+no-follow temp descriptor landed inside the held directory before writing.
+Hostile same-account substitution within one individual Node path syscall is
+outside the local trust model; static or pre-operation directory replacement
+fails closed without publishing outside the held directory. The first true run snapshots all existing
 EOFs and publishes nothing; a daily file discovered after initialization
 begins at offset zero. A tracked source that disappears, truncates, changes
 inode, or is replaced at its open pathname fails closed without advancing any

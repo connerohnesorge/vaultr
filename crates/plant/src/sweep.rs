@@ -7,40 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-/// How a subprocess run ended. Distinguishes the cases `ok: false` collapses:
-/// a timeout, a spawn error (binary missing from PATH), and a non-zero exit.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum RunEnd {
-    /// The process ran to completion; `None` code means killed by a signal.
-    Exited(Option<i32>),
-    TimedOut,
-    SpawnFailed,
-}
-
-pub struct RunResult {
-    pub ok: bool,
-    pub out: String,
-    pub stderr: String,
-    pub end: RunEnd,
-}
-
-impl RunResult {
-    /// One-line diagnostic for failure logs: how the run ended, plus a stderr tail.
-    pub fn failure_detail(&self) -> String {
-        let how = match self.end {
-            RunEnd::Exited(Some(code)) => format!("exit {code}"),
-            RunEnd::Exited(None) => "killed by signal".to_string(),
-            RunEnd::TimedOut => "timed out".to_string(),
-            RunEnd::SpawnFailed => "spawn failed".to_string(),
-        };
-        let err: String = self.stderr.trim().chars().take(200).collect();
-        if err.is_empty() {
-            how
-        } else {
-            format!("{how}: {err}")
-        }
-    }
-}
+pub(crate) use crate::process::RunResult;
 
 /// PATH that works no matter who spawned plant. The launchd KeepAlive agent hands us
 /// a bare /usr/bin:/bin PATH with no herdr/zstd/cnb — augment with plant's own dir and
@@ -63,30 +30,9 @@ pub fn augmented_path() -> String {
 }
 
 pub async fn run(cmd: &[&str], timeout: Duration) -> RunResult {
-    let fut = tokio::process::Command::new(cmd[0])
-        .args(&cmd[1..])
-        .env("PATH", augmented_path())
-        .output();
-    match tokio::time::timeout(timeout, fut).await {
-        Ok(Ok(o)) => RunResult {
-            ok: o.status.success(),
-            out: String::from_utf8_lossy(&o.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&o.stderr).into_owned(),
-            end: RunEnd::Exited(o.status.code()),
-        },
-        Ok(Err(e)) => RunResult {
-            ok: false,
-            out: String::new(),
-            stderr: e.to_string(),
-            end: RunEnd::SpawnFailed,
-        },
-        Err(_) => RunResult {
-            ok: false,
-            out: String::new(),
-            stderr: String::new(),
-            end: RunEnd::TimedOut,
-        },
-    }
+    let mut command = tokio::process::Command::new(cmd[0]);
+    command.args(&cmd[1..]).env("PATH", augmented_path());
+    crate::process::run_command(&mut command, timeout).await
 }
 
 pub async fn run30(cmd: &[&str]) -> RunResult {

@@ -20,7 +20,9 @@ import {
   door,
   agentRun,
   setIngestionStatHookForTest,
+  setMetadataStatHookForTest,
   setStaleRecoveryHookForTest,
+  setStatePublishHookForTest,
 } from "./index.ts";
 
 let tmp: string;
@@ -156,7 +158,9 @@ beforeEach(() => {
 
 afterEach(() => {
   setIngestionStatHookForTest();
+  setMetadataStatHookForTest();
   setStaleRecoveryHookForTest();
+  setStatePublishHookForTest();
   rmSync(tmp, { recursive: true, force: true });
 });
 
@@ -210,6 +214,93 @@ test("corrupt state fails closed without replacement or launch", async () => {
   expect(result.code).toBe(1);
   expect(result.detail).toContain("failed closed");
   expect(readFileSync(path, "utf8")).toBe("{");
+  expect(stubCalls()).toBe(0);
+});
+
+test("migration publication ENOENT retains the legacy state and never launches", async () => {
+  landFile("mail/a.md", 1000);
+  const path = join(tmp, "state", "migration.json");
+  mkdirSync(join(tmp, "state"), { recursive: true });
+  const legacy = JSON.stringify({
+    version: 1,
+    cursor: { mtimeMs: 0, path: "" },
+    fires: [],
+  });
+  writeFileSync(path, legacy);
+  setStatePublishHookForTest(() => {
+    throw Object.assign(new Error("injected migration publication ENOENT"), { code: "ENOENT" });
+  });
+
+  const result = await door({
+    name: "migration",
+    watch: "mail/*.md",
+    prompt: () => "must not launch",
+  });
+  expect(result.code).toBe(1);
+  expect(result.detail).toContain("injected migration publication ENOENT");
+  expect(readFileSync(path, "utf8")).toBe(legacy);
+  expect(stubCalls()).toBe(0);
+});
+
+test("state control reads reject FIFO, symlink, oversize, swap, and post-open removal", async () => {
+  landFile("mail/a.md", 1000);
+  const state = join(tmp, "state");
+  mkdirSync(state, { recursive: true });
+  const fresh = JSON.stringify({
+    version: 2,
+    frontier: { mtimeMs: 0, seen: [] },
+    fires: [],
+  });
+
+  const outside = join(tmp, "outside-state.json");
+  writeFileSync(outside, fresh);
+  symlinkSync(outside, join(state, "state-symlink.json"));
+  expect((await door({
+    name: "state-symlink",
+    watch: "mail/*.md",
+    prompt: () => "must not launch",
+  })).code).toBe(1);
+
+  expect(Bun.spawnSync(["mkfifo", join(state, "state-fifo.json")]).exitCode).toBe(0);
+  const fifo = await Promise.race([
+    door({ name: "state-fifo", watch: "mail/*.md", prompt: () => "must not launch" }),
+    Bun.sleep(1000).then(() => ({ code: -1 })),
+  ]);
+  expect(fifo.code).toBe(1);
+
+  writeFileSync(join(state, "state-huge.json"), "x".repeat(1_048_577));
+  const huge = await door({
+    name: "state-huge",
+    watch: "mail/*.md",
+    prompt: () => "must not launch",
+  });
+  expect(huge.code).toBe(1);
+  expect(huge.detail).toContain("1048576 byte limit");
+
+  for (const mode of ["swap", "missing"] as const) {
+    const name = `state-${mode}`;
+    const path = join(state, `${name}.json`);
+    writeFileSync(path, fresh);
+    let changed = false;
+    setMetadataStatHookForTest((relativePath) => {
+      if (relativePath !== `${name}.json` || changed) return;
+      changed = true;
+      if (mode === "swap") {
+        renameSync(path, `${path}.opened`);
+        symlinkSync(outside, path);
+      } else {
+        unlinkSync(path);
+      }
+    });
+    const result = await door({
+      name,
+      watch: "mail/*.md",
+      prompt: () => "must not launch",
+    });
+    expect(result.code).toBe(1);
+    expect(changed).toBe(true);
+    setMetadataStatHookForTest();
+  }
   expect(stubCalls()).toBe(0);
 });
 
@@ -471,6 +562,64 @@ test("an incomplete legacy lock is reread while its publisher finishes", async (
   expect(stubCalls()).toBe(0);
 });
 
+test("lock control reads reject FIFO, symlink, oversize, swap, and post-open removal", async () => {
+  landFile("mail/a.md", 1000);
+  const state = join(tmp, "state");
+  mkdirSync(state, { recursive: true });
+  const deadOwner = `${JSON.stringify({ pid: 2_147_483_647, token: "dead" })}\n`;
+
+  const outside = join(tmp, "outside-lock");
+  writeFileSync(outside, deadOwner);
+  symlinkSync(outside, join(state, "lock-symlink.lock"));
+  expect((await door({
+    name: "lock-symlink",
+    watch: "mail/*.md",
+    prompt: () => "must not launch",
+  })).code).toBe(1);
+
+  expect(Bun.spawnSync(["mkfifo", join(state, "lock-fifo.lock")]).exitCode).toBe(0);
+  const fifo = await Promise.race([
+    door({ name: "lock-fifo", watch: "mail/*.md", prompt: () => "must not launch" }),
+    Bun.sleep(1000).then(() => ({ code: -1 })),
+  ]);
+  expect(fifo.code).toBe(1);
+
+  writeFileSync(join(state, "lock-huge.lock"), "x".repeat(1_048_577));
+  const huge = await door({
+    name: "lock-huge",
+    watch: "mail/*.md",
+    prompt: () => "must not launch",
+  });
+  expect(huge.code).toBe(1);
+  expect(huge.detail).toContain("1048576 byte limit");
+
+  for (const mode of ["swap", "missing"] as const) {
+    const name = `lock-${mode}`;
+    const path = join(state, `${name}.lock`);
+    writeFileSync(path, deadOwner);
+    let changed = false;
+    setMetadataStatHookForTest((relativePath) => {
+      if (relativePath !== `${name}.lock` || changed) return;
+      changed = true;
+      if (mode === "swap") {
+        renameSync(path, `${path}.opened`);
+        symlinkSync(outside, path);
+      } else {
+        unlinkSync(path);
+      }
+    });
+    const result = await door({
+      name,
+      watch: "mail/*.md",
+      prompt: () => "must not launch",
+    });
+    expect(result.code).toBe(1);
+    expect(changed).toBe(true);
+    setMetadataStatHookForTest();
+  }
+  expect(stubCalls()).toBe(0);
+});
+
 test("a crash while preparing owner metadata leaves only an ignorable temp lock", async () => {
   landFile("mail/a.md", 1000);
   mkdirSync(join(tmp, "state"), { recursive: true });
@@ -515,6 +664,26 @@ test("a same-path same-mtime regular replacement cannot hydrate a persisted clai
 
   writeFileSync(join(vault, "mail", "a.md"), "changed of mail/a.md");
   utimesSync(join(vault, "mail", "a.md"), 1000, 1000);
+  const retried = spawnWorker();
+  expect(await retried.exited).toBe(1);
+  expect(stubCalls()).toBe(0);
+  const after = JSON.parse(readFileSync(statePath, "utf8"));
+  expect(after.claim.key).toBe(before.claim.key);
+  expect(after.claim.files).toEqual(before.claim.files);
+});
+
+test("a same-size same-mtime replacement after 64 KiB cannot hydrate a persisted claim", async () => {
+  const path = join(vault, "mail", "a.md");
+  const prefix = "a".repeat(65_536);
+  writeFileSync(path, `${prefix}original-tail`);
+  utimesSync(path, 1000, 1000);
+  const crashed = spawnWorker({ CRASH_IN_PROMPT: "1" });
+  expect(await crashed.exited).toBe(86);
+  const statePath = join(tmp, "state", "t.json");
+  const before = JSON.parse(readFileSync(statePath, "utf8"));
+
+  writeFileSync(path, `${prefix}replaced-tail`);
+  utimesSync(path, 1000, 1000);
   const retried = spawnWorker();
   expect(await retried.exited).toBe(1);
   expect(stubCalls()).toBe(0);
@@ -592,7 +761,7 @@ test("a scanned symlink escaping the ingestion root fails closed", async () => {
   symlinkSync(outside, join(vault, "mail", "escape.md"));
   const result = await door({ name: "t", watch: "mail/*.md", prompt: () => "go" });
   expect(result.code).toBe(1);
-  expect(result.detail).toContain("symlink escapes ingestion root");
+  expect(result.detail).toContain("symlink rejected beneath canonical root");
   expect(stubCalls()).toBe(0);
 });
 
@@ -686,15 +855,34 @@ test("large files contribute at most 65,536 bytes to the prompt", async () => {
 
 test("an explicitly watched hidden ingestion directory is scanned", async () => {
   landFile("mail/.door/summons/a.json", 1000);
+  landFile("mail/.door/summons/.hidden.json", 1001);
 
   const result = await door({
     name: "t",
     watch: "mail/.door/summons/*.json",
-    prompt: (files) => files[0]!.text,
+    prompt: (files) => files.map((file) => file.path).join("\n"),
   });
   expect(result.code).toBe(0);
   expect(stubCalls()).toBe(1);
   expect(readFileSync(stubLog, "utf8")).toContain("mail/.door/summons/a.json");
+  expect(readFileSync(stubLog, "utf8")).not.toContain(".hidden.json");
+});
+
+test("globstar cannot consume an unexpressed hidden directory or leaf", async () => {
+  landFile("mail/.door/visible/a.json", 1000);
+  landFile("mail/.door/.private/b.json", 1001);
+  landFile("mail/.door/visible/.leaf.json", 1002);
+
+  const result = await door({
+    name: "t",
+    watch: "mail/.door/**/*.json",
+    prompt: (files) => files.map((file) => file.path).join("\n"),
+  });
+  expect(result.code).toBe(0);
+  const log = readFileSync(stubLog, "utf8");
+  expect(log).toContain("mail/.door/visible/a.json");
+  expect(log).not.toContain("mail/.door/.private/b.json");
+  expect(log).not.toContain("mail/.door/visible/.leaf.json");
 });
 
 test("an ordinary watch does not broaden to hidden files", async () => {

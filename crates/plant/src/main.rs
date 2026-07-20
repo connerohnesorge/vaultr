@@ -8,6 +8,7 @@ mod capture;
 mod herdr;
 mod jobs;
 mod otel;
+mod process;
 mod proxy;
 mod selftest;
 mod state;
@@ -154,10 +155,28 @@ async fn subcommand(argv: &[String]) -> Option<i32> {
             )
         }
         (Some("compress"), Some("once")) => {
-            Some(if sweep::compress_sweep(&vault_root(), idle).await {
+            // Compression may mutate capture files only while this process owns
+            // both listener bindings. Retain the listeners through recovery and
+            // the full sweep so no daemon can capture concurrently.
+            let ownership = match ListenerOwnership::bind_all().await {
+                Ok(ownership) => ownership,
+                Err(error) => {
+                    eprintln!("compress once: listener ownership unavailable: {error}");
+                    return Some(2);
+                }
+            };
+            let vault = vault_root();
+            let _ownership = match ownership.recover(&vault) {
+                Ok(ownership) => ownership,
+                Err(error) => {
+                    eprintln!("compress once: capture recovery failed: {error}");
+                    return Some(2);
+                }
+            };
+            Some(if sweep::compress_sweep(&vault, idle).await {
                 0
             } else {
-                1
+                2
             })
         }
         (Some("jobs"), Some("run")) => {
@@ -271,6 +290,79 @@ pub fn http_client() -> reqwest::Client {
         .expect("reqwest client")
 }
 
+async fn complete_incumbent() -> bool {
+    let client = http_client();
+    for adapter in adapter::adapters() {
+        let url = format!("http://127.0.0.1:{}/health", adapter.port);
+        let response =
+            match tokio::time::timeout(Duration::from_secs(2), client.get(url).send()).await {
+                Ok(Ok(response)) if response.status().is_success() => response,
+                _ => return false,
+            };
+        let Ok(health) = response.json::<serde_json::Value>().await else {
+            return false;
+        };
+        if !health_matches(&health, &adapter) {
+            return false;
+        }
+    }
+    true
+}
+
+fn health_matches(health: &serde_json::Value, adapter: &adapter::Adapter) -> bool {
+    health.get("service").and_then(|value| value.as_str()) == Some("plant")
+        && health.get("ok").and_then(|value| value.as_bool()) == Some(true)
+        && health.get("harness").and_then(|value| value.as_str()) == Some(adapter.harness)
+        && health.get("upstream").and_then(|value| value.as_str())
+            == Some(adapter.upstream.trim_end_matches('/'))
+}
+
+type BoundServer = (tokio::net::TcpListener, u16, adapter::Adapter);
+
+struct ListenerOwnership {
+    servers: Vec<BoundServer>,
+}
+
+struct RecoveredListenerOwnership {
+    servers: Vec<BoundServer>,
+}
+
+impl ListenerOwnership {
+    async fn bind_all() -> std::io::Result<Self> {
+        let mut servers = Vec::new();
+        for adapter in adapter::adapters() {
+            match proxy::bind(adapter.port).await {
+                Ok((listener, port)) => servers.push((listener, port, adapter)),
+                Err(error) => {
+                    drop(servers);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(Self { servers })
+    }
+
+    fn recover(self, vault: &std::path::Path) -> Result<RecoveredListenerOwnership, String> {
+        self.recover_with(|| capture::recover_all(vault))
+    }
+
+    fn recover_with(
+        self,
+        recover: impl FnOnce() -> Result<(), String>,
+    ) -> Result<RecoveredListenerOwnership, String> {
+        recover()?;
+        Ok(RecoveredListenerOwnership {
+            servers: self.servers,
+        })
+    }
+}
+
+impl RecoveredListenerOwnership {
+    fn into_servers(self) -> Vec<BoundServer> {
+        self.servers
+    }
+}
+
 #[tokio::main]
 async fn main() {
     if std::env::args().any(|a| a == "--self-test") {
@@ -308,47 +400,54 @@ async fn main() {
 
     let vault = vault_root();
 
-    // Recover ordered-capture journals and staged Envelopes BEFORE binding ports
-    // or arming the scheduler (which may seal). Failing closed preserves evidence.
-    if let Err(e) = capture::recover_all(&vault) {
-        eprintln!("[plant] capture recovery failed: {e}");
-        record_exit(started, "exit:1");
-        std::process::exit(1);
-    }
-
-    let otel = Arc::new(otel::Otel::new());
-    let client = http_client();
-
-    // Bind both ports first: collision => yield to the live instance (exit 0).
-    let mut servers = vec![];
-    for a in adapter::adapters() {
-        match proxy::bind(a.port).await {
-            Ok((listener, port)) => {
-                println!("vaultr [{}] 127.0.0.1:{port} -> {}", a.harness, a.upstream);
-                servers.push((listener, a));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                println!("[vaultr] port already bound, another instance owns it — exiting 0");
+    // Own both harness listeners before recovery or scheduler work. A partial
+    // bind is dropped before deciding whether a complete daemon is incumbent.
+    let ownership = match ListenerOwnership::bind_all().await {
+        Ok(ownership) => ownership,
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            if complete_incumbent().await {
+                println!("[plant] complete incumbent owns both harnesses — exiting 0");
                 record_exit(started, "exit:0");
                 std::process::exit(0);
             }
-            Err(e) => {
-                record_exit(started, "exit:1");
-                panic!("bind failed: {e}");
-            }
+            eprintln!("[plant] incomplete listener ownership: {error}");
+            record_exit(started, "exit:1");
+            std::process::exit(1);
         }
+        Err(error) => {
+            eprintln!("[plant] bind failed: {error}");
+            record_exit(started, "exit:1");
+            std::process::exit(1);
+        }
+    };
+    for (_, port, adapter) in &ownership.servers {
+        println!(
+            "vaultr [{}] 127.0.0.1:{port} -> {}",
+            adapter.harness, adapter.upstream
+        );
     }
+
+    // With both capture endpoints unavailable to any competitor, recover all
+    // ordered journals and staged envelopes before scheduler work can seal.
+    let ownership = ownership.recover(&vault).unwrap_or_else(|error| {
+        eprintln!("[plant] capture recovery failed: {error}");
+        record_exit(started, "exit:1");
+        std::process::exit(1);
+    });
+
+    let otel = Arc::new(otel::Otel::new());
+    let client = http_client();
     println!("vault={}", vault.display());
 
-    let mut accept_loops = vec![];
-    for (listener, a) in servers {
+    let mut _accept_loops = vec![];
+    for (listener, _, a) in ownership.into_servers() {
         let ctx = Arc::new(ProxyCtx {
             adapter: a,
             vault: vault.clone(),
             client: client.clone(),
             otel: otel.clone(),
         });
-        accept_loops.push(tokio::spawn(proxy::serve(listener, ctx)));
+        _accept_loops.push(tokio::spawn(proxy::serve(listener, ctx)));
     }
 
     if otel.enabled {
@@ -363,7 +462,7 @@ async fn main() {
         });
     }
 
-    tokio::spawn(jobs::scheduler(jobs::Cfg::load(&vault)));
+    tokio::spawn(jobs::scheduler(jobs::Cfg::load(&vault), vault.clone()));
 
     // hourly RSS breadcrumb for the leak investigation
     tokio::spawn(async {
@@ -391,11 +490,9 @@ async fn main() {
         _ = usr2.recv() => "signal:SIGUSR2",
     };
     if why == "signal:SIGTERM" || why == "signal:SIGINT" {
-        // drop listeners first so a replacement can bind immediately; per-connection
-        // tasks are independent spawns, so in-flight streams still get the 30s drain
-        for h in &accept_loops {
-            h.abort();
-        }
+        // Retain both listener leases through the bounded drain. Releasing them
+        // early would let a replacement recover/seal while existing capture
+        // tasks can still commit.
         println!("[plant] {why}, draining up to 30s");
         tokio::time::sleep(Duration::from_secs(30)).await;
         record_exit(started, "exit:0");
@@ -403,4 +500,77 @@ async fn main() {
     }
     record_exit(started, why);
     std::process::exit(128);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incumbent_health_schema_matches_the_proxy_contract_exactly() {
+        for adapter in adapter::adapters() {
+            let health = proxy::health_body(&adapter);
+            assert_eq!(
+                health,
+                serde_json::json!({
+                    "service": "plant",
+                    "ok": true,
+                    "harness": adapter.harness,
+                    "upstream": adapter.upstream.trim_end_matches('/'),
+                })
+            );
+            assert!(health_matches(&health, &adapter));
+        }
+    }
+
+    #[tokio::test]
+    async fn listener_lease_survives_the_bounded_drain() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let drain = tokio::spawn(async move {
+            let _lease = listener;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        });
+        assert!(
+            tokio::net::TcpListener::bind(address).await.is_err(),
+            "replacement must not bind during drain"
+        );
+        drain.await.unwrap();
+        let replacement = tokio::net::TcpListener::bind(address).await.unwrap();
+        drop(replacement);
+    }
+
+    #[tokio::test]
+    async fn ownership_seam_requires_both_bindings_before_recovery_and_runtime() {
+        let mut servers = Vec::new();
+        let mut addresses = Vec::new();
+        for adapter in adapter::adapters() {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            addresses.push(address);
+            servers.push((listener, address.port(), adapter));
+        }
+        let ownership = ListenerOwnership { servers };
+        let recovered = ownership
+            .recover_with(|| {
+                for address in &addresses {
+                    assert!(
+                        std::net::TcpListener::bind(address).is_err(),
+                        "recovery runs only while both listener leases are held"
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            recovered.servers.len(),
+            2,
+            "only recovered dual ownership can enter proxy/scheduler startup"
+        );
+        drop(recovered);
+    }
 }

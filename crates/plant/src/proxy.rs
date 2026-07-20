@@ -93,7 +93,7 @@ async fn handle(req: Request<hyper::body::Incoming>, ctx: Arc<ProxyCtx>) -> Resp
         .unwrap_or_default();
 
     if path == "/health" {
-        let body = serde_json::json!({ "ok": true, "harness": adapter.harness, "upstream": upstream_base });
+        let body = health_body(adapter);
         return Response::builder()
             .header("content-type", "application/json")
             .body(full(body.to_string()))
@@ -289,6 +289,15 @@ async fn handle(req: Request<hyper::body::Incoming>, ctx: Arc<ProxyCtx>) -> Resp
     resp_builder
         .body(BodyExt::boxed(StreamBody::new(stream)))
         .unwrap()
+}
+
+pub(crate) fn health_body(adapter: &Adapter) -> serde_json::Value {
+    serde_json::json!({
+        "service": "plant",
+        "ok": true,
+        "harness": adapter.harness,
+        "upstream": adapter.upstream.trim_end_matches('/'),
+    })
 }
 
 pub fn decode_bytes(raw: &[u8], encoding: Option<&str>) -> std::io::Result<Vec<u8>> {

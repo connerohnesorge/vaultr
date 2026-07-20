@@ -9,12 +9,11 @@ import { dlopen, FFIType } from "bun:ffi";
 import {
   closeSync,
   constants,
-  fstatSync,
   fsyncSync,
   linkSync,
+  lstatSync,
   mkdirSync,
   openSync,
-  readFileSync,
   readSync,
   realpathSync,
   renameSync,
@@ -23,6 +22,13 @@ import {
   writeSync,
 } from "node:fs";
 import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
+import {
+  canonicalDirectory,
+  InitialFileMissingError,
+  readStableRegularFile,
+  validRelativeFilePath,
+  withStableRegularFile,
+} from "./safe-loader.ts";
 
 const HOME = process.env.HOME ?? "";
 const vaultRoot = () => process.env.DOOR_VAULT_ROOT ?? `${HOME}/.dotfiles/vault`;
@@ -33,6 +39,7 @@ const plantBin = () => process.env.PLANT_BIN ?? "plant";
 const allowedRoots = () => (process.env.DOOR_ROOTS ?? "mail,teams,tickets").split(",").map((r) => r.trim()).filter(Boolean);
 
 const WINDOW_MS = 3_600_000;
+const MAX_STATE_BYTES = 1_048_576;
 const LOCK_EX = 2;
 const LOCK_NB = 4;
 const LOCK_UN = 8;
@@ -51,12 +58,22 @@ const kernelLock = (() => {
 })();
 
 let afterIngestionStatForTest: ((path: string) => void) | undefined;
+let afterMetadataStatForTest: ((path: string) => void) | undefined;
+let beforeStatePublishForTest: (() => void) | undefined;
 let beforeStaleRecoveryForTest:
   | ((owner: { pid: number; token: string }) => void | Promise<void>)
   | undefined;
 
 export function setIngestionStatHookForTest(hook?: (path: string) => void): void {
   afterIngestionStatForTest = hook;
+}
+
+export function setMetadataStatHookForTest(hook?: (path: string) => void): void {
+  afterMetadataStatForTest = hook;
+}
+
+export function setStatePublishHookForTest(hook?: () => void): void {
+  beforeStatePublishForTest = hook;
 }
 
 export function setStaleRecoveryHookForTest(
@@ -403,16 +420,20 @@ function migrateLegacyState(name: string, value: unknown): DoorState {
 }
 
 function loadState(name: string): DoorState {
+  const bytes = readControlFile(`${name}.json`);
+  if (bytes === undefined) {
+    return { version: 2, frontier: { mtimeMs: 0, seen: [] }, fires: [] };
+  }
   try {
-    const value = JSON.parse(readFileSync(statePath(name), "utf8"));
+    const value = JSON.parse(bytes.toString("utf8"));
     if ((value as Record<string, unknown>)?.version === 2) return parseState(name, value);
     const state = parseState(name, migrateLegacyState(name, value));
     saveState(name, state);
     return state;
-  } catch (error: any) {
-    if (error?.code === "ENOENT") {
-      return { version: 2, frontier: { mtimeMs: 0, seen: [] }, fires: [] };
-    }
+  } catch (error) {
+    // Only the initial descriptor open may establish a fresh state. Migration
+    // parsing and publication errors, including ENOENT, retain the source bytes
+    // and fail closed.
     throw new Error(`cannot read supported ${statePath(name)}: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
@@ -431,7 +452,7 @@ function ensureDirectoryDurable(path: string): void {
   let cursor = resolve(path);
   while (true) {
     try {
-      if (!statSync(cursor).isDirectory()) throw new Error(`${cursor} is not a directory`);
+      if (!lstatSync(cursor).isDirectory()) throw new Error(`${cursor} is not a real directory`);
       break;
     } catch (error: any) {
       if (error?.code !== "ENOENT") throw error;
@@ -445,7 +466,7 @@ function ensureDirectoryDurable(path: string): void {
     try {
       mkdirSync(dir, { mode: 0o700 });
     } catch (error: any) {
-      if (error?.code !== "EEXIST" || !statSync(dir).isDirectory()) throw error;
+      if (error?.code !== "EEXIST" || !lstatSync(dir).isDirectory()) throw error;
     }
     syncDirectory(dir);
     syncDirectory(dirname(dir));
@@ -454,6 +475,7 @@ function ensureDirectoryDurable(path: string): void {
 
 function saveState(name: string, state: DoorState): void {
   ensureDirectoryDurable(stateDir());
+  beforeStatePublishForTest?.();
   const path = statePath(name);
   const tmp = `${path}.tmp-${randomUUID()}`;
   let fd: number | undefined;
@@ -474,21 +496,47 @@ function saveState(name: string, state: DoorState): void {
   }
 }
 
-function lockOwner(path: string): { pid: number; token: string } {
-  const owner = JSON.parse(readFileSync(path, "utf8"));
+class IncompleteLockOwner extends Error {}
+
+function readControlFile(fileName: string): Buffer | undefined {
+  const root = canonicalDirectory(stateDir());
+  try {
+    return readStableRegularFile(
+      root,
+      fileName,
+      MAX_STATE_BYTES,
+      afterMetadataStatForTest,
+    ).value;
+  } catch (error) {
+    if (error instanceof InitialFileMissingError) return undefined;
+    throw error;
+  }
+}
+
+function lockOwner(path: string): { pid: number; token: string } | undefined {
+  const bytes = readControlFile(basename(path));
+  if (bytes === undefined) return undefined;
+  let owner: any;
+  try {
+    owner = JSON.parse(bytes.toString("utf8"));
+  } catch {
+    throw new IncompleteLockOwner(`invalid door lock ${path}`);
+  }
   if (!Number.isInteger(owner?.pid) || owner.pid <= 0
     || typeof owner?.token !== "string" || owner.token.length === 0) {
-    throw new Error(`invalid door lock ${path}`);
+    throw new IncompleteLockOwner(`invalid door lock ${path}`);
   }
   return owner;
 }
 
-async function readPublishedLockOwner(path: string): Promise<{ pid: number; token: string }> {
+async function readPublishedLockOwner(
+  path: string,
+): Promise<{ pid: number; token: string } | undefined> {
   for (let attempt = 0; attempt < 4; attempt++) {
     try {
       return lockOwner(path);
     } catch (error: any) {
-      if (error?.code === "ENOENT") throw error;
+      if (!(error instanceof IncompleteLockOwner)) throw error;
       if (attempt < 3) await Bun.sleep(10);
     }
   }
@@ -512,13 +560,8 @@ async function recoverStaleLock(
     throw new Error(`stale lock recovery already in progress for ${path}`);
   }
   try {
-    let current: { pid: number; token: string };
-    try {
-      current = await readPublishedLockOwner(path);
-    } catch (error: any) {
-      if (error?.code === "ENOENT") return false;
-      throw error;
-    }
+    const current = await readPublishedLockOwner(path);
+    if (!current) return false;
     if (current.pid !== observed.pid || current.token !== observed.token || pidAlive(current.pid)) {
       return false;
     }
@@ -582,20 +625,15 @@ async function acquireLock(name: string): Promise<(() => void) | undefined> {
   for (let attempt = 0; attempt < 3; attempt++) {
     const token = randomUUID();
     if (!publishLock(path, { pid: process.pid, token })) {
-      let owner: { pid: number; token: string };
-      try {
-        owner = await readPublishedLockOwner(path);
-      } catch (error: any) {
-        if (error?.code === "ENOENT") continue;
-        throw error;
-      }
+      const owner = await readPublishedLockOwner(path);
+      if (!owner) continue;
       if (pidAlive(owner.pid)) return undefined;
       await beforeStaleRecoveryForTest?.(owner);
       await recoverStaleLock(path, owner);
       continue;
     }
     return () => {
-      if (lockOwner(path).token !== token) {
+      if (lockOwner(path)?.token !== token) {
         throw new Error(`door lock ownership changed for ${name}`);
       }
       unlinkSync(path);
@@ -624,6 +662,17 @@ function validRelativePath(path: string, allowGlob: boolean): boolean {
     && segment !== "."
     && segment !== ".."
     && (allowGlob || !/[*?[\]{}]/.test(segment)));
+}
+
+function isExplicitHiddenLiteral(segment: string): boolean {
+  return segment.startsWith(".") && !/[*?[\]{}]/.test(segment);
+}
+
+function hiddenSegmentsAllowed(pattern: string, path: string): boolean {
+  const expected = pattern.split("/").filter(isExplicitHiddenLiteral);
+  const actual = path.split("/").filter((segment) => segment.startsWith("."));
+  return expected.length === actual.length
+    && expected.every((segment, index) => segment === actual[index]);
 }
 
 /** Resolve one trusted ingestion root and the watch pattern beneath it. Every
@@ -659,78 +708,48 @@ interface LoadedIngestionFile {
   text: string;
 }
 
-function descriptorPath(fd: number): string {
-  if (process.platform === "darwin") return `/dev/fd/${fd}`;
-  if (process.platform === "linux") return `/proc/self/fd/${fd}`;
-  throw new Error("descriptor identity validation is unavailable");
-}
-
-function openedPathBeneath(root: IngestionRoot, fd: number, path: string): string {
-  const canonical = realpathSync(descriptorPath(fd));
-  if (!isBeneath(root.path, canonical)) {
-    throw new Error(`symlink escapes ingestion root: ${path}`);
-  }
-  return canonical;
-}
-
 function loadIngestionFile(
   root: IngestionRoot,
   path: string,
   shouldRead?: (mtimeMs: number) => boolean,
 ): LoadedIngestionFile | undefined {
-  if (!validRelativePath(path, true)) {
+  if (!validRelativeFilePath(path)) {
     throw new Error(`invalid path beneath ingestion root: ${path}`);
   }
-  const lexical = resolve(root.path, path);
-  if (!isBeneath(root.path, lexical)) {
-    throw new Error(`path escapes ingestion root: ${path}`);
-  }
-  if (typeof constants.O_NOFOLLOW !== "number" || typeof constants.O_NONBLOCK !== "number") {
-    throw new Error("nonblocking no-follow file opens are unavailable");
-  }
-  let fd: number;
-  try {
-    fd = openSync(
-      lexical,
-      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
-    );
-  } catch (error: any) {
-    if (error?.code === "ELOOP") throw new Error(`symlink escapes ingestion root: ${path}`);
-    throw error;
-  }
-  try {
-    const before = fstatSync(fd);
-    if (!before.isFile()) return undefined;
-    if (!Number.isSafeInteger(before.size) || before.size < 0) {
-      throw new Error(`file size cannot be represented safely: ${path}`);
-    }
-    openedPathBeneath(root, fd, path);
-    if (shouldRead && !shouldRead(before.mtimeMs)) return undefined;
-    afterIngestionStatForTest?.(path);
-    const buffer = Buffer.allocUnsafe(65_536);
-    const bytesRead = readSync(fd, buffer, 0, buffer.length, 0);
-    const after = fstatSync(fd);
-    if (
-      before.dev !== after.dev
-      || before.ino !== after.ino
-      || before.size !== after.size
-      || before.mtimeMs !== after.mtimeMs
-      || before.ctimeMs !== after.ctimeMs
-    ) {
-      throw new Error(`file changed while reading: ${path}`);
-    }
-    const abs = openedPathBeneath(root, fd, path);
-    const bytes = buffer.subarray(0, bytesRead);
-    return {
-      abs,
-      mtimeMs: before.mtimeMs,
-      size: before.size,
-      sha256: createHash("sha256").update(bytes).digest("hex"),
-      text: bytes.toString("utf8"),
-    };
-  } finally {
-    closeSync(fd);
-  }
+  const loaded = withStableRegularFile(
+    root.path,
+    path,
+    {},
+    (fd, before) => {
+      if (shouldRead && !shouldRead(before.mtimeMs)) return undefined;
+      afterIngestionStatForTest?.(path);
+      const prefix = Buffer.allocUnsafe(Math.min(65_536, before.size));
+      const chunk = Buffer.allocUnsafe(65_536);
+      const hash = createHash("sha256");
+      let position = 0;
+      while (position < before.size) {
+        const length = Math.min(chunk.length, before.size - position);
+        const bytesRead = readSync(fd, chunk, 0, length, position);
+        if (bytesRead === 0) throw new Error(`short ingestion read: ${path}`);
+        const bytes = chunk.subarray(0, bytesRead);
+        hash.update(bytes);
+        if (position < prefix.length) {
+          bytes.copy(prefix, position, 0, Math.min(bytes.length, prefix.length - position));
+        }
+        position += bytesRead;
+      }
+      return { prefix, sha256: hash.digest("hex") };
+    },
+  );
+  const content = loaded.value;
+  if (content === undefined) return undefined;
+  return {
+    abs: loaded.canonicalPath,
+    mtimeMs: loaded.stat.mtimeMs,
+    size: loaded.stat.size,
+    sha256: content.sha256,
+    text: content.prefix.toString("utf8"),
+  };
 }
 
 function claimRelativePath(root: IngestionRoot, path: string): string {
@@ -824,10 +843,11 @@ export async function door(spec: DoorSpec): Promise<DoorResult> {
       const files: DoorFile[] = [];
       for (const path of new Bun.Glob(root.pattern).scanSync({
         cwd: root.path,
-        dot: root.pattern.split("/").some((segment) => segment.startsWith(".")),
+        dot: root.pattern.split("/").some(isExplicitHiddenLiteral),
         followSymlinks: false,
         onlyFiles: false,
       })) {
+        if (!hiddenSegmentsAllowed(root.pattern, path)) continue;
         try {
           const vaultPath = `${root.prefix}/${path}`;
           const loaded = loadIngestionFile(
@@ -846,7 +866,7 @@ export async function door(spec: DoorSpec): Promise<DoorResult> {
             text: loaded.text,
           });
         } catch (error: any) {
-          if (error?.code === "ENOENT") continue; // raced away mid-scan
+          if (error instanceof InitialFileMissingError) continue; // raced away before open
           throw error;
         }
       }

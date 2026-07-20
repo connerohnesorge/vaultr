@@ -23,7 +23,7 @@ door's evaluation with a per-door cross-process lock. It MUST persist a
 timestamp frontier and the durable sorted set of paths already processed at
 that timestamp, select all unseen files in total `(mtime,path)` batch order,
 atomically persist the exact ordered in-progress batch plus a portable total
-size and SHA-256 identity for each file's exact bounded bytes before launch,
+size and SHA-256 identity for each file's entire stable descriptor before launch,
 and derive a stable Plant Agent Run idempotency key from that content-bound
 claim. Hydration MUST reproduce the claimed mtime, size, and digest before
 launch. A retry MUST resume the persisted claim. Only a machine-readable Plant
@@ -106,7 +106,7 @@ its first post-migration launch.
 
 #### Scenario: Claimed path is replaced without changing mtime
 
-- WHEN a claimed regular file is replaced with different bounded bytes at the same path and mtime before retry
+- WHEN a claimed regular file is replaced with different bytes at the same path, size, and mtime before retry, including bytes after the 65,536-byte prompt prefix
 - THEN hydration detects the size or digest mismatch and fails closed
 - AND the persisted claim and key remain unchanged
 - AND no Plant agent run is launched for the replacement
@@ -146,7 +146,8 @@ canonicalize the selected root. Every scanned or hydrated file MUST be opened
 with nonblocking no-follow semantics and MUST be verified as a regular file
 beneath that root. Scan eligibility against the timestamp frontier MUST be
 decided before content is read. At most 65,536 bytes of content MUST then be
-read from that same descriptor. Pre-read and post-read descriptor metadata
+retained and exposed to filters and prompts, while the entire descriptor MUST
+be streamed through SHA-256 with bounded memory. Pre-read and post-read descriptor metadata
 MUST match for device, inode, size, mtime, and ctime; any change MUST fail
 before launch. A real path outside the selected root, including a symlink
 escape, MUST be rejected before launch. A door whose watch glob falls outside
@@ -186,8 +187,8 @@ agent-written Vault Content.
 #### Scenario: Large match is bounded
 
 - WHEN a matching file exceeds 65,536 bytes
-- THEN the Door reads and exposes only its first 65,536 bytes
-- AND it does not read or decode the remainder
+- THEN the Door retains and exposes only its first 65,536 bytes
+- AND it streams but does not retain or decode the remainder while computing the full-file digest
 
 #### Scenario: Matching FIFO cannot block
 
@@ -205,6 +206,7 @@ agent-written Vault Content.
 - WHEN an ordinary glob such as `mail/*.md` is evaluated
 - THEN hidden matches such as `mail/.secret.md` are excluded
 - AND a glob explicitly naming `mail/.door/` can evaluate that hidden ingestion path
+- AND wildcard or globstar segments cannot consume an unexpressed hidden directory or leaf
 
 ### Requirement: Mail projection produces immutable Door inputs
 
@@ -217,7 +219,13 @@ initialization flag, and each source's relative path, device, inode, and EOF
 offset. `.door` and `summons` MUST be real non-symlink directories. Projector
 state and existing artifacts MUST be opened with no-follow, nonblocking
 semantics, verified as regular files, and read under small explicit size
-bounds before JSON parsing. The first true run MUST snapshot every existing
+bounds before JSON parsing. The producer MUST retain stable descriptor and
+identity leases for `.door` and `summons`, reprove their current lexical and
+canonical identity immediately around each temp/final path operation, and
+verify every exclusive no-follow temp descriptor landed inside the exact held
+directory before writing. Source callbacks MUST only read, parse, and stage
+artifact intents; no artifact may be published until descriptor and lexical
+source validation succeeds. The first true run MUST snapshot every existing
 source EOF and publish zero artifacts; a source first discovered after
 initialization MUST start at offset zero. A tracked source that disappears,
 truncates, changes inode, or no longer names the opened regular file MUST fail
@@ -282,6 +290,18 @@ stable duplicate. The mail Door MUST watch only
 - WHEN `.door` or `summons` is a symlink, or state or an existing artifact is a symlink, FIFO, non-regular file, or over its read bound
 - THEN projection rejects the object without blocking, following it, or parsing unbounded bytes
 - AND no source offset advances
+
+#### Scenario: Projector directory is replaced before publication
+
+- WHEN `.door` or `summons` no longer identifies the held canonical directory before a state or artifact path operation
+- THEN projection fails closed before publishing through the replacement
+- AND no file appears in an outside symlink target and no source offset advances
+
+#### Scenario: Source directory changes after read
+
+- WHEN a daily source's containing directory moves or becomes an outside-root symlink after the source descriptor is opened
+- THEN full descriptor and lexical validation fails before staged artifact intents are published
+- AND no artifact or offset side effect occurs
 
 #### Scenario: Many historical daily sources
 

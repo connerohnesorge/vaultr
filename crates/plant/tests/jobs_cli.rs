@@ -1,4 +1,5 @@
 use std::fs;
+use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output};
@@ -68,6 +69,16 @@ fn manual_jobs_propagate_normalized_statuses() {
     let output = run(&home, &sessions, "noshebang");
     assert_eq!(output.status.code(), Some(0));
 
+    // Exact-name compression discovery is typed for scheduler dispatch only.
+    // A manual jobs run must still execute the wrapper through the same fence.
+    write_job(
+        &jobs.join("compress.30m.sh"),
+        "#!/bin/sh\ntouch \"$HOME/compress-wrapper-called\"\n",
+    );
+    let output = run(&home, &sessions, "compress");
+    assert_eq!(output.status.code(), Some(0));
+    assert!(home.join("compress-wrapper-called").exists());
+
     // not executable at all: spawn fails and is recorded
     fs::write(jobs.join("nonexec.1h.sh"), "#!/bin/sh\nexit 0\n").unwrap();
     let output = run(&home, &sessions, "nonexec");
@@ -77,6 +88,21 @@ fn manual_jobs_propagate_normalized_statuses() {
     assert!(fs::read_to_string(ledger.join("success.jsonl"))
         .unwrap()
         .contains("\"outcome\":\"success\""));
+    let success: serde_json::Value = serde_json::from_str(
+        fs::read_to_string(ledger.join("success.jsonl"))
+            .unwrap()
+            .lines()
+            .next()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        success
+            .get("attempt_id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| !id.is_empty()),
+        "every durable record is tied to its pre-dispatch fence"
+    );
     assert!(fs::read_to_string(ledger.join("failure.jsonl"))
         .unwrap()
         .contains("\"outcome\":\"failed\""));
@@ -192,5 +218,88 @@ fn final_record_failure_keeps_attempt_fenced() {
         .join(".local/state/plant/job-attempts/record-fails.json")
         .exists());
 
+    fs::remove_dir_all(tmp).unwrap();
+}
+
+#[test]
+fn manual_compression_fails_with_maintenance_status_before_mutation_when_a_listener_is_unavailable()
+{
+    let tmp = std::env::temp_dir().join(format!(
+        "plant-compress-listener-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let home = tmp.join("home");
+    let sessions = tmp.join("vault/sessions");
+    fs::create_dir_all(home.join(".dotfiles")).unwrap();
+    fs::create_dir_all(&sessions).unwrap();
+    let sentinel = sessions.join("generation");
+    fs::write(&sentinel, "unchanged").unwrap();
+
+    let occupied = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let occupied_port = occupied.local_addr().unwrap().port();
+    let free = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let free_port = free.local_addr().unwrap().port();
+    drop(free);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_plant"))
+        .args(["compress", "once"])
+        .env("HOME", &home)
+        .env("VAULT_SESSIONS", &sessions)
+        .env("VAULTR_ANTHROPIC_PORT", occupied_port.to_string())
+        .env("VAULTR_CODEX_PORT", free_port.to_string())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("listener ownership unavailable"));
+    assert_eq!(fs::read_to_string(sentinel).unwrap(), "unchanged");
+
+    drop(occupied);
+    fs::remove_dir_all(tmp).unwrap();
+}
+
+#[test]
+fn second_listener_collision_releases_the_first_binding_before_any_mutation() {
+    let tmp = std::env::temp_dir().join(format!(
+        "plant-compress-second-listener-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let home = tmp.join("home");
+    let sessions = tmp.join("vault/sessions");
+    fs::create_dir_all(home.join(".dotfiles")).unwrap();
+    fs::create_dir_all(&sessions).unwrap();
+    let sentinel = sessions.join("generation");
+    fs::write(&sentinel, "unchanged").unwrap();
+
+    let first = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let first_port = first.local_addr().unwrap().port();
+    drop(first);
+    let second = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let second_port = second.local_addr().unwrap().port();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_plant"))
+        .args(["compress", "once"])
+        .env("HOME", &home)
+        .env("VAULT_SESSIONS", &sessions)
+        .env("VAULTR_ANTHROPIC_PORT", first_port.to_string())
+        .env("VAULTR_CODEX_PORT", second_port.to_string())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("listener ownership unavailable"));
+    assert_eq!(fs::read_to_string(sentinel).unwrap(), "unchanged");
+    drop(
+        TcpListener::bind(("127.0.0.1", first_port))
+            .expect("failed second bind releases the already-acquired first listener"),
+    );
+
+    drop(second);
     fs::remove_dir_all(tmp).unwrap();
 }
