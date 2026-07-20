@@ -114,19 +114,19 @@
       "id": "3.1",
       "section": "Production proof",
       "description": "Deploy the updated Plant binary under launchd supervision and verify both proxy health endpoints.",
-      "status": "in_progress"
+      "status": "completed"
     },
     {
       "id": "3.2",
       "section": "Production proof",
       "description": "Observe at least 15 minutes of active traffic and prove continuous token counter samples in both Prometheus replicas.",
-      "status": "pending"
+      "status": "completed"
     },
     {
       "id": "3.3",
       "section": "Production proof",
       "description": "Prove zero new Prometheus out-of-order rejects, Alloy non-recoverable remote-write failures, and Plant telemetry stalls after the cutover.",
-      "status": "pending"
+      "status": "completed"
     }
   ]
 }
