@@ -246,7 +246,7 @@ impl Otel {
             None => {
                 let out = tokio::process::Command::new("cnb")
                     .args(["auth", "token"])
-                    .env("PATH", crate::sweep::augmented_path())
+                    .env("PATH", crate::process::augmented_path())
                     .output()
                     .await;
                 match out {

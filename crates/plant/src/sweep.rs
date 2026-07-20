@@ -3,139 +3,50 @@
 //! eligible` / `plant compress once` subcommands and called directly by the built-in Rust jobs.
 //! Every failure path non-fatal: capture uptime is sacred. All heavy work shells out.
 
+use crate::process::{run, run30, which};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::{Duration, SystemTime};
 
-/// How a subprocess run ended. Distinguishes the cases `ok: false` collapses:
-/// a timeout, a spawn error (binary missing from PATH), and a non-zero exit.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum RunEnd {
-    /// The process ran to completion; `None` code means killed by a signal.
-    Exited(Option<i32>),
-    TimedOut,
-    SpawnFailed,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Learner {
+    Claude,
+    Codex,
 }
 
-pub struct RunResult {
-    pub ok: bool,
-    pub out: String,
-    pub stderr: String,
-    pub end: RunEnd,
-}
-
-impl RunResult {
-    /// One-line diagnostic for failure logs: how the run ended, plus a stderr tail.
-    pub fn failure_detail(&self) -> String {
-        let how = match self.end {
-            RunEnd::Exited(Some(code)) => format!("exit {code}"),
-            RunEnd::Exited(None) => "killed by signal".to_string(),
-            RunEnd::TimedOut => "timed out".to_string(),
-            RunEnd::SpawnFailed => "spawn failed".to_string(),
-        };
-        let err: String = self.stderr.trim().chars().take(200).collect();
-        if err.is_empty() {
-            how
-        } else {
-            format!("{how}: {err}")
+impl Learner {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
         }
     }
 }
 
-/// PATH that works no matter who spawned plant. The launchd KeepAlive agent hands us
-/// a bare /usr/bin:/bin PATH with no herdr/zstd/cnb — augment with plant's own dir and
-/// the usual user bin dirs (missing ones are harmless).
-pub fn augmented_path() -> String {
-    let home = std::env::var("HOME").unwrap_or_default();
-    let mut parts: Vec<String> = vec![];
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            parts.push(dir.display().to_string());
-        }
-    }
-    for d in [".nix-profile/bin", ".local/bin", ".bun/bin"] {
-        parts.push(format!("{home}/{d}"));
-    }
-    parts.push("/opt/homebrew/bin".into());
-    parts.push("/usr/local/bin".into());
-    parts.push(std::env::var("PATH").unwrap_or_default());
-    parts.join(":")
-}
-
-pub async fn run(cmd: &[&str], timeout: Duration) -> RunResult {
-    use tokio::io::AsyncReadExt;
-
-    let mut command = tokio::process::Command::new(cmd[0]);
-    command
-        .args(&cmd[1..])
-        .env("PATH", augmented_path())
-        .kill_on_drop(true)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(e) => {
-            return RunResult {
-                ok: false,
-                out: String::new(),
-                stderr: e.to_string(),
-                end: RunEnd::SpawnFailed,
-            };
-        }
-    };
-    let mut stdout = child.stdout.take().expect("piped stdout");
-    let mut stderr = child.stderr.take().expect("piped stderr");
-    let mut out = Vec::new();
-    let mut err = Vec::new();
-    let completed = async {
-        let (stdout, stderr, status) = tokio::join!(
-            stdout.read_to_end(&mut out),
-            stderr.read_to_end(&mut err),
-            child.wait()
-        );
-        stdout?;
-        stderr?;
-        status
-    };
-    match tokio::time::timeout(timeout, completed).await {
-        Ok(Ok(status)) => RunResult {
-            ok: status.success(),
-            out: String::from_utf8_lossy(&out).into_owned(),
-            stderr: String::from_utf8_lossy(&err).into_owned(),
-            end: RunEnd::Exited(status.code()),
-        },
-        Ok(Err(e)) => RunResult {
-            ok: false,
-            out: String::new(),
-            stderr: e.to_string(),
-            end: RunEnd::SpawnFailed,
-        },
-        Err(_) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            RunResult {
-                ok: false,
-                out: String::new(),
-                stderr: String::new(),
-                end: RunEnd::TimedOut,
-            }
-        }
+impl fmt::Display for Learner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
     }
 }
 
-pub async fn run30(cmd: &[&str]) -> RunResult {
-    run(cmd, Duration::from_secs(30)).await
-}
+impl FromStr for Learner {
+    type Err = ();
 
-fn which(bin: &str) -> bool {
-    augmented_path()
-        .split(':')
-        .any(|dir| Path::new(dir).join(bin).is_file())
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "claude" => Ok(Self::Claude),
+            "codex" => Ok(Self::Codex),
+            _ => Err(()),
+        }
+    }
 }
 
 /// sid -> latest `processed_at` (epoch secs; 0 when the entry has none) for `learner`.
 /// Entries without a `learner` key are the legacy Claude pass.
-fn ledger_latest(vault: &Path, learner: &str) -> HashMap<String, u64> {
+fn ledger_latest(vault: &Path, learner: Learner) -> HashMap<String, u64> {
     let mut processed = HashMap::new();
     let Ok(root) = vaultr::validate::content_root(vault) else {
         return processed; // rootless sessions path => nothing ledgered; non-fatal
@@ -144,7 +55,9 @@ fn ledger_latest(vault: &Path, learner: &str) -> HashMap<String, u64> {
         for line in text.lines() {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
                 let recorded = v.get("learner").and_then(|s| s.as_str());
-                if recorded == Some(learner) || (recorded.is_none() && learner == "claude") {
+                if recorded == Some(learner.as_str())
+                    || (recorded.is_none() && learner == Learner::Claude)
+                {
                     if let Some(sid) = v.get("session_id").and_then(|s| s.as_str()) {
                         let ts = v
                             .get("processed_at")
@@ -216,47 +129,34 @@ fn epoch_now() -> u64 {
         .unwrap_or(0)
 }
 
-fn inflight_path(vault: &Path, learner: &str) -> Result<PathBuf, String> {
-    if !matches!(learner, "claude" | "codex") {
-        return Err(format!("invalid learner {learner:?}"));
-    }
+fn inflight_path(vault: &Path, learner: Learner) -> Result<PathBuf, String> {
     let root = vaultr::validate::content_root(vault).map_err(|e| e.to_string())?;
     Ok(root
         .join("learnings")
         .join(format!(".inflight-{learner}.json")))
 }
 
-fn read_inflight(path: &Path) -> Result<Option<HashSet<String>>, String> {
+#[derive(Debug, Serialize, Deserialize)]
+struct InflightLease {
+    sids: Vec<String>,
+    expires_at: u64,
+}
+
+fn read_inflight(path: &Path) -> Result<Option<InflightLease>, String> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(format!("read {}: {e}", path.display())),
     };
-    let value: serde_json::Value =
+    let lease: InflightLease =
         serde_json::from_str(&text).map_err(|e| format!("parse {}: {e}", path.display()))?;
-    let expires_at = value
-        .get("expires_at")
-        .and_then(|e| e.as_u64())
-        .ok_or_else(|| format!("{} has no valid expires_at", path.display()))?;
-    if epoch_now() >= expires_at {
+    if epoch_now() >= lease.expires_at {
         return Ok(None);
     }
-    let values = value
-        .get("sids")
-        .and_then(|s| s.as_array())
-        .ok_or_else(|| format!("{} has no valid sids", path.display()))?;
-    if values.is_empty() {
+    if lease.sids.is_empty() {
         return Err(format!("{} has an empty active batch", path.display()));
     }
-    values
-        .iter()
-        .map(|sid| {
-            sid.as_str()
-                .map(String::from)
-                .ok_or_else(|| format!("{} has a non-string sid", path.display()))
-        })
-        .collect::<Result<HashSet<_>, _>>()
-        .map(Some)
+    Ok(Some(lease))
 }
 
 /// Sessions a still-running learn pass has claimed for `learner`, if the lease hasn't
@@ -264,23 +164,21 @@ fn read_inflight(path: &Path) -> Result<Option<HashSet<String>>, String> {
 /// scheduler tick re-selects the same not-yet-ledgered batch and double-learns it (the
 /// duplicate-prompt bug). ponytail: one file per learner, expiry self-heals a crashed or
 /// timed-out pass — no explicit release path to leak.
-fn inflight_sessions(vault: &Path, learner: &str) -> HashSet<String> {
+fn inflight_sessions(vault: &Path, learner: Learner) -> HashSet<String> {
     let Ok(path) = inflight_path(vault, learner) else {
         return HashSet::new();
     };
-    read_inflight(&path).ok().flatten().unwrap_or_default()
+    read_inflight(&path)
+        .ok()
+        .flatten()
+        .map(|lease| lease.sids.into_iter().collect())
+        .unwrap_or_default()
 }
 
-fn publish_inflight(path: &Path, sids: &[String], expires_at: u64) -> Result<(), String> {
-    let body = serde_json::json!({ "sids": sids, "expires_at": expires_at });
-    let tmp = path.with_extension("json.tmp");
-    let result = std::fs::write(&tmp, body.to_string())
-        .and_then(|_| std::fs::rename(&tmp, path))
-        .map_err(|e| format!("publish {}: {e}", path.display()));
-    if result.is_err() {
-        let _ = std::fs::remove_file(tmp);
-    }
-    result
+fn publish_inflight(path: &Path, lease: &InflightLease) -> Result<(), String> {
+    let body = serde_json::to_vec(lease).map_err(|e| e.to_string())?;
+    crate::fsutil::atomic_replace(path, &body)
+        .map_err(|e| format!("publish {}: {e}", path.display()))
 }
 
 fn capture_files(vault: &Path) -> Vec<(String, PathBuf)> {
@@ -332,24 +230,65 @@ fn substantive(path: &Path) -> bool {
 }
 
 /// One raw Session Capture the cultivation pipeline should have sealed by now.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StuckState {
+    SealBlocked,
+    HalfLearned(Learner),
+    Unlearned,
+    SubThreshold,
+    JobCapture,
+}
+
+impl StuckState {
+    const REPORT_ORDER: [Self; 6] = [
+        Self::SealBlocked,
+        Self::HalfLearned(Learner::Claude),
+        Self::HalfLearned(Learner::Codex),
+        Self::Unlearned,
+        Self::SubThreshold,
+        Self::JobCapture,
+    ];
+
+    pub fn is_actionable(self) -> bool {
+        matches!(
+            self,
+            Self::SealBlocked | Self::HalfLearned(_) | Self::Unlearned
+        )
+    }
+}
+
+impl fmt::Display for StuckState {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::SealBlocked => formatter.write_str("seal-blocked"),
+            Self::HalfLearned(learner) => write!(formatter, "half-learned:{learner}"),
+            Self::Unlearned => formatter.write_str("unlearned"),
+            Self::SubThreshold => formatter.write_str("sub-threshold"),
+            Self::JobCapture => formatter.write_str("job-capture"),
+        }
+    }
+}
+
 pub struct StuckCapture {
     pub sid: String,
-    /// seal-blocked | half-learned:<missing learner> | unlearned | sub-threshold | job-capture
-    pub state: String,
+    pub state: StuckState,
     pub idle_secs: u64,
 }
 
 pub fn stuck_summary(stuck: &[StuckCapture]) -> String {
-    let count = |state: &str| stuck.iter().filter(|s| s.state == state).count();
     format!(
-        "sessions-stuck summary: seal-blocked={} half-learned:claude={} \
-         half-learned:codex={} unlearned={} sub-threshold={} job-capture={}",
-        count("seal-blocked"),
-        count("half-learned:claude"),
-        count("half-learned:codex"),
-        count("unlearned"),
-        count("sub-threshold"),
-        count("job-capture"),
+        "sessions-stuck summary: {}",
+        StuckState::REPORT_ORDER
+            .iter()
+            .map(|state| format!(
+                "{state}={}",
+                stuck
+                    .iter()
+                    .filter(|capture| capture.state == *state)
+                    .count()
+            ))
+            .collect::<Vec<_>>()
+            .join(" ")
     )
 }
 
@@ -358,8 +297,8 @@ pub fn stuck_summary(stuck: &[StuckCapture]) -> String {
 /// under current rules (learn skips them, sealing needs both ledgers) — reported so the
 /// gap stays visible, but callers treat them as informational, not actionable.
 pub fn stuck_captures(vault: &Path, age: Duration) -> Vec<StuckCapture> {
-    let claude = ledger_latest(vault, "claude");
-    let codex = ledger_latest(vault, "codex");
+    let claude = ledger_latest(vault, Learner::Claude);
+    let codex = ledger_latest(vault, Learner::Codex);
     let mut out = vec![];
     let jobs = job_sids();
     for (sid, path) in turns_files(vault, false) {
@@ -370,17 +309,17 @@ pub fn stuck_captures(vault: &Path, age: Duration) -> Vec<StuckCapture> {
             continue;
         }
         let state = if jobs.contains(&sid) {
-            "job-capture".to_string() // plant's own agent pane; informational like sub-threshold
+            StuckState::JobCapture
         } else {
             match (
                 learned_current(&claude, &sid, &path),
                 learned_current(&codex, &sid, &path),
             ) {
-                (true, true) => "seal-blocked".to_string(),
-                (true, false) => "half-learned:codex".to_string(),
-                (false, true) => "half-learned:claude".to_string(),
-                (false, false) if substantive(&path) => "unlearned".to_string(),
-                (false, false) => "sub-threshold".to_string(),
+                (true, true) => StuckState::SealBlocked,
+                (true, false) => StuckState::HalfLearned(Learner::Codex),
+                (false, true) => StuckState::HalfLearned(Learner::Claude),
+                (false, false) if substantive(&path) => StuckState::Unlearned,
+                (false, false) => StuckState::SubThreshold,
             }
         };
         out.push(StuckCapture {
@@ -432,7 +371,12 @@ pub fn register_job_sid(sid: &str) {
     }
 }
 
-pub fn eligible_sessions(vault: &Path, idle: Duration, max: usize, learner: &str) -> Vec<String> {
+fn eligible_candidates(
+    vault: &Path,
+    idle: Duration,
+    max: usize,
+    learner: Learner,
+) -> Vec<(String, PathBuf)> {
     let processed = ledger_latest(vault, learner);
     let inflight = inflight_sessions(vault, learner);
     let jobs = job_sids();
@@ -447,12 +391,24 @@ pub fn eligible_sessions(vault: &Path, idle: Duration, max: usize, learner: &str
         }
         if substantive(&path) {
             if let Some(dir) = path.parent() {
-                out.push(dir.display().to_string());
+                out.push((sid, dir.to_path_buf()));
             }
         }
     }
     out.truncate(max);
     out
+}
+
+pub fn eligible_sessions(
+    vault: &Path,
+    idle: Duration,
+    max: usize,
+    learner: Learner,
+) -> Vec<PathBuf> {
+    eligible_candidates(vault, idle, max, learner)
+        .into_iter()
+        .map(|(_, path)| path)
+        .collect()
 }
 
 /// Select and atomically lease one batch while holding a learner-scoped cross-process
@@ -461,13 +417,14 @@ pub fn eligible_and_claim(
     vault: &Path,
     idle: Duration,
     max: usize,
-    learner: &str,
-    expires_at: u64,
-) -> Result<Vec<String>, String> {
+    learner: Learner,
+    duration: Duration,
+) -> Result<Vec<PathBuf>, String> {
     let path = inflight_path(vault, learner)?;
     let lock_path = path.with_extension("json.lock");
     let lock = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)
@@ -477,27 +434,23 @@ pub fn eligible_and_claim(
     if read_inflight(&path)?.is_some() {
         return Ok(Vec::new());
     }
-    let batch = eligible_sessions(vault, idle, max, learner);
+    let batch = eligible_candidates(vault, idle, max, learner);
     if batch.is_empty() {
-        return Ok(batch);
+        return Ok(Vec::new());
     }
-    let sids = batch
-        .iter()
-        .map(|dir| {
-            Path::new(dir)
-                .file_name()
-                .and_then(|sid| sid.to_str())
-                .map(String::from)
-                .ok_or_else(|| format!("eligible path has no session id: {dir}"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    publish_inflight(&path, &sids, expires_at)?;
-    Ok(batch)
+    let lease = InflightLease {
+        sids: batch.iter().map(|(sid, _)| sid.clone()).collect(),
+        expires_at: epoch_now()
+            .saturating_add(duration.as_secs())
+            .saturating_add(300),
+    };
+    publish_inflight(&path, &lease)?;
+    Ok(batch.into_iter().map(|(_, path)| path).collect())
 }
 
 /// Diagnostics for the `sessions eligible` subcommand's stderr — stdout must stay
 /// clean (it is substituted into an agent prompt by the learn job).
-pub fn eligibility_stats(vault: &Path, learner: &str) -> (usize, usize) {
+pub fn eligibility_stats(vault: &Path, learner: Learner) -> (usize, usize) {
     (
         capture_files(vault).len(),
         ledger_latest(vault, learner).len(),
@@ -713,8 +666,8 @@ pub async fn compress_sweep(vault: &Path, idle: Duration) -> bool {
         eprintln!("[compress] zstd not on PATH");
         return false;
     }
-    let claude = ledger_latest(vault, "claude");
-    let codex = ledger_latest(vault, "codex");
+    let claude = ledger_latest(vault, Learner::Claude);
+    let codex = ledger_latest(vault, Learner::Codex);
     let jobs = job_sids();
     let mut sealed = 0u32;
     for (sid, path) in turns_files(vault, false) {
@@ -937,41 +890,6 @@ pub fn coverage(vault: &Path, query: &str) -> Result<Coverage, String> {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn timeout_kills_and_reaps_direct_child_before_returning() {
-        let root = std::env::temp_dir().join(format!(
-            "plant-run-timeout-{}-{}",
-            std::process::id(),
-            epoch_now()
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        let pid_path = root.join("pid");
-        let marker = root.join("late-marker");
-        let script = format!(
-            "echo $$ > '{}'; sleep 1; echo late > '{}'",
-            pid_path.display(),
-            marker.display()
-        );
-
-        let result = run(&["/bin/sh", "-c", &script], Duration::from_millis(200)).await;
-        assert_eq!(result.end, RunEnd::TimedOut);
-        let pid: i32 = std::fs::read_to_string(&pid_path)
-            .expect("child published its pid before timeout")
-            .trim()
-            .parse()
-            .unwrap();
-        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::ESRCH),
-            "timed-out direct child must already be reaped"
-        );
-        tokio::time::sleep(Duration::from_millis(1100)).await;
-        assert!(!marker.exists(), "delayed child effect occurred");
-        let _ = std::fs::remove_dir_all(root);
-    }
-
     /// Build a minimal vault: meta index + dated session dir with turns.jsonl + a
     /// claude transcript. `envelopes` and `transcript` are raw file bodies.
     fn coverage_fixture(label: &str, resumed: bool, envelopes: &str, transcript: &str) -> PathBuf {
@@ -1086,8 +1004,8 @@ mod tests {
         )
         .unwrap();
 
-        let claude = eligible_sessions(&sessions, Duration::ZERO, 10, "claude");
-        let codex = eligible_sessions(&sessions, Duration::ZERO, 10, "codex");
+        let claude = eligible_sessions(&sessions, Duration::ZERO, 10, Learner::Claude);
+        let codex = eligible_sessions(&sessions, Duration::ZERO, 10, Learner::Codex);
         assert!(claude.iter().any(|p| p.ends_with(codex_id)));
         assert!(!claude.iter().any(|p| p.ends_with(claude_id)));
         assert!(codex.iter().any(|p| p.ends_with(claude_id)));
@@ -1172,7 +1090,7 @@ mod tests {
             stuck
                 .iter()
                 .find(|s| s.sid == sid)
-                .map(|s| s.state.clone())
+                .map(|s| s.state)
                 .unwrap_or_else(|| {
                     panic!(
                         "{sid} missing from {:?}",
@@ -1180,11 +1098,17 @@ mod tests {
                     )
                 })
         };
-        assert_eq!(state("both-ledgered"), "seal-blocked");
-        assert_eq!(state("claude-only"), "half-learned:codex");
-        assert_eq!(state("codex-only"), "half-learned:claude");
-        assert_eq!(state("nobody-big"), "unlearned");
-        assert_eq!(state("nobody-small"), "sub-threshold");
+        assert_eq!(state("both-ledgered"), StuckState::SealBlocked);
+        assert_eq!(
+            state("claude-only"),
+            StuckState::HalfLearned(Learner::Codex)
+        );
+        assert_eq!(
+            state("codex-only"),
+            StuckState::HalfLearned(Learner::Claude)
+        );
+        assert_eq!(state("nobody-big"), StuckState::Unlearned);
+        assert_eq!(state("nobody-small"), StuckState::SubThreshold);
         assert!(!stuck.iter().any(|s| s.sid == "already-sealed"));
 
         // freshly written files are idle ~0s: an age gate must exempt them all
@@ -1207,17 +1131,28 @@ mod tests {
         std::fs::create_dir_all(root.join("learnings")).unwrap();
 
         // tick 1: select and durably claim one batch before returning it
-        let first = eligible_and_claim(&sessions, Duration::ZERO, 10, "claude", epoch_now() + 3600)
-            .unwrap();
+        let first = eligible_and_claim(
+            &sessions,
+            Duration::ZERO,
+            10,
+            Learner::Claude,
+            Duration::from_secs(3600),
+        )
+        .unwrap();
         assert!(
             first.iter().any(|p| p.ends_with(sid)),
             "un-ledgered session should be eligible"
         );
 
         // tick 2 while the pass is still running: one active learner batch wins
-        let during =
-            eligible_and_claim(&sessions, Duration::ZERO, 10, "claude", epoch_now() + 3600)
-                .unwrap();
+        let during = eligible_and_claim(
+            &sessions,
+            Duration::ZERO,
+            10,
+            Learner::Claude,
+            Duration::from_secs(3600),
+        )
+        .unwrap();
         assert!(
             during.is_empty(),
             "in-flight session must NOT be re-dispatched (this was the duplicate-prompt bug)"
@@ -1225,12 +1160,20 @@ mod tests {
 
         // an expired lease (crashed/zombie pass) must self-heal, not wedge forever
         publish_inflight(
-            &inflight_path(&sessions, "claude").unwrap(),
-            &[sid.to_string()],
-            epoch_now().saturating_sub(1),
+            &inflight_path(&sessions, Learner::Claude).unwrap(),
+            &InflightLease {
+                sids: vec![sid.to_string()],
+                expires_at: epoch_now().saturating_sub(1),
+            },
         )
         .unwrap();
-        let after = eligible_and_claim(&sessions, Duration::ZERO, 10, "claude", epoch_now() + 3600);
+        let after = eligible_and_claim(
+            &sessions,
+            Duration::ZERO,
+            10,
+            Learner::Claude,
+            Duration::from_secs(3600),
+        );
         assert!(
             after.unwrap().iter().any(|p| p.ends_with(sid)),
             "expired lease must stop excluding"
@@ -1287,17 +1230,17 @@ mod tests {
         // watchdog: codex covered the resumed generation, claude did not
         let stuck = stuck_captures(&sessions, Duration::ZERO);
         let entry = stuck.iter().find(|s| s.sid == sid).expect("reported stuck");
-        assert_eq!(entry.state, "half-learned:claude");
+        assert_eq!(entry.state, StuckState::HalfLearned(Learner::Claude));
 
         // eligibility mirrors that: claude re-learns, codex does not
-        let claude = eligible_sessions(&sessions, Duration::ZERO, 10, "claude");
-        let codex = eligible_sessions(&sessions, Duration::ZERO, 10, "codex");
+        let claude = eligible_sessions(&sessions, Duration::ZERO, 10, Learner::Claude);
+        let codex = eligible_sessions(&sessions, Duration::ZERO, 10, Learner::Codex);
         assert!(claude.iter().any(|p| p.ends_with(sid)));
         assert!(!codex.iter().any(|p| p.ends_with(sid)));
 
         // a sealed-only capture (no raw) keeps historic semantics: entry counts as-is
         assert!(learned_current(
-            &ledger_latest(&sessions, "claude"),
+            &ledger_latest(&sessions, Learner::Claude),
             sid,
             &dir.join("turns.jsonl.zst")
         ));
