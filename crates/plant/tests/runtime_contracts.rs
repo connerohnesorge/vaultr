@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -25,7 +25,8 @@ fn write_executable(path: &Path, body: &str) {
 fn plant_output(
     home: &Path,
     sessions: &Path,
-    port: u16,
+    anthropic_port: u16,
+    codex_port: u16,
     args: &[&str],
     input: Option<&str>,
 ) -> Output {
@@ -34,8 +35,8 @@ fn plant_output(
         .args(args)
         .env("HOME", home)
         .env("VAULT_SESSIONS", sessions)
-        .env("VAULTR_ANTHROPIC_PORT", port.to_string())
-        .env("VAULTR_CODEX_PORT", port.to_string());
+        .env("VAULTR_ANTHROPIC_PORT", anthropic_port.to_string())
+        .env("VAULTR_CODEX_PORT", codex_port.to_string());
     if let Some(input) = input {
         command
             .stdin(Stdio::piped())
@@ -54,6 +55,32 @@ fn plant_output(
     }
 }
 
+fn health_server(
+    listener: TcpListener,
+    harness: &str,
+    upstream: &str,
+) -> std::thread::JoinHandle<()> {
+    let body = serde_json::json!({
+        "service": "plant",
+        "ok": true,
+        "harness": harness,
+        "upstream": upstream,
+    })
+    .to_string();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0_u8; 4096];
+        let _ = stream.read(&mut request);
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+    })
+}
+
 #[test]
 fn cli_grammar_subprocess_table_keeps_daemon_bare_and_rejects_every_other_miss() {
     let root = temp("cli-contract");
@@ -66,8 +93,12 @@ fn cli_grammar_subprocess_table_keeps_daemon_bare_and_rejects_every_other_miss()
         &home.join(".local/bin/herdr"),
         "#!/bin/sh\necho called >> \"$HOME/herdr-called\"\nexit 1\n",
     );
-    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
-    let port = listener.local_addr().unwrap().port();
+    let anthropic = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let anthropic_port = anthropic.local_addr().unwrap().port();
+    let codex = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let codex_port = codex.local_addr().unwrap().port();
+    let anthropic_server = health_server(anthropic, "claude-code", "https://api.anthropic.com");
+    let codex_server = health_server(codex, "codex", "https://chatgpt.com/backend-api/codex");
 
     struct Case<'a> {
         name: &'a str,
@@ -133,7 +164,14 @@ fn cli_grammar_subprocess_table_keeps_daemon_bare_and_rejects_every_other_miss()
     ];
 
     for case in cases {
-        let output = plant_output(&home, &sessions, port, case.args, case.input);
+        let output = plant_output(
+            &home,
+            &sessions,
+            anthropic_port,
+            codex_port,
+            case.args,
+            case.input,
+        );
         assert_eq!(
             output.status.code(),
             Some(case.code),
@@ -152,10 +190,13 @@ fn cli_grammar_subprocess_table_keeps_daemon_bare_and_rejects_every_other_miss()
             assert!(!home.join(".local/state/plant/job-sids.txt").exists());
         }
         if case.name == "bare daemon" {
-            assert!(String::from_utf8_lossy(&output.stdout).contains("another instance owns it"));
+            assert!(String::from_utf8_lossy(&output.stdout)
+                .contains("complete incumbent owns both harnesses"));
         }
     }
 
+    anthropic_server.join().unwrap();
+    codex_server.join().unwrap();
     fs::remove_dir_all(root).unwrap();
 }
 

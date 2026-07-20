@@ -1,5 +1,5 @@
 use crate::capture::{cached_session_ids, iso_now, session_dir};
-use crate::process::{run, run30};
+use crate::process::{run30, RunResult};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -126,6 +126,9 @@ pub struct AgentRun {
     pub prompt: String,
     pub timeout: Duration,
     pub cleanup: WorkspaceCleanup,
+    /// Claude session ids are minted with the launch command, but registration
+    /// waits until this run actually passes any idempotency lookup.
+    pub preset_session_id: Option<String>,
     /// Claude sids are preset + registered before launch; codex conversation ids are
     /// server-assigned, so for codex we read the id herdr reports for this pane once the
     /// run finishes and register it, keeping learn from dispatching on the self-capture.
@@ -184,22 +187,189 @@ pub(crate) async fn pane_list() -> Option<Vec<Pane>> {
     .flatten()
 }
 
-/// Herdr reports `idle` for a bare shell too. Trust only panes where it has
-/// recognized a running agent, or a failed CLI launch could receive shell input.
-async fn pane_has_agent(pane: &str) -> bool {
-    serde_json::from_str::<PaneListReply>(&run30(&["herdr", "pane", "list"]).await.out)
-        .ok()
-        .is_some_and(|reply| {
-            reply
-                .result
-                .panes
-                .iter()
-                .any(|p| p.pane_id == pane && p.agent.is_some())
+/// Herdr reports `idle` for a bare shell too. Only native Claude/Codex panes in
+/// a prompt-safe state may receive TUI input.
+fn pane_accepts_prompt(panes: &[Pane], pane: &str) -> bool {
+    ready_pane_identity(panes, pane).is_some()
+}
+
+#[derive(Debug, PartialEq)]
+struct PaneIdentity {
+    terminal_id: String,
+    agent_session: Option<String>,
+}
+
+fn ready_pane_identity(panes: &[Pane], pane: &str) -> Option<PaneIdentity> {
+    panes
+        .iter()
+        .find(|candidate| {
+            candidate.pane_id == pane
+                && matches!(candidate.agent.as_deref(), Some("claude" | "codex"))
+                && matches!(candidate.agent_status.as_str(), "idle" | "done")
+        })
+        .map(|candidate| PaneIdentity {
+            terminal_id: candidate.terminal_id.clone(),
+            agent_session: candidate
+                .agent_session
+                .as_ref()
+                .map(|session| session.value.clone()),
         })
 }
 
+fn same_pane_identity(expected: &PaneIdentity, panes: &[Pane], pane: &str) -> bool {
+    panes.iter().any(|candidate| {
+        candidate.pane_id == pane
+            && candidate.terminal_id == expected.terminal_id
+            && match &expected.agent_session {
+                None => true,
+                Some(session) => {
+                    candidate
+                        .agent_session
+                        .as_ref()
+                        .map(|current| &current.value)
+                        == Some(session)
+                }
+            }
+    })
+}
+
+async fn wait_for_prompt_ready(pane: &str, timeout: Duration) -> bool {
+    tokio::time::timeout(timeout, async {
+        loop {
+            if pane_list()
+                .await
+                .is_some_and(|panes| pane_accepts_prompt(&panes, pane))
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .unwrap_or(false)
+}
+
+struct AgentStartSubscription {
+    pane_id: String,
+    workspace_id: String,
+    reader: BufReader<UnixStream>,
+}
+
+async fn subscribe_agent_start_at(
+    path: &Path,
+    pane_id: &str,
+    workspace_id: &str,
+) -> Result<AgentStartSubscription, String> {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        let stream = UnixStream::connect(path)
+            .await
+            .map_err(|error| format!("connect: {error}"))?;
+        let mut reader = BufReader::new(stream);
+        let mut request = serde_json::to_vec(&serde_json::json!({
+            "id": "plant-agent-start",
+            "method": "events.subscribe",
+            "params": {
+                "subscriptions": [{
+                    "type": "pane.agent_status_changed",
+                    "pane_id": pane_id,
+                }],
+            },
+        }))
+        .map_err(|error| format!("encode: {error}"))?;
+        request.push(b'\n');
+        reader
+            .get_mut()
+            .write_all(&request)
+            .await
+            .map_err(|error| format!("subscribe: {error}"))?;
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .await
+            .map_err(|error| format!("subscribe acknowledgment: {error}"))?;
+        let reply: Value =
+            serde_json::from_str(&line).map_err(|error| format!("subscribe reply: {error}"))?;
+        if reply.pointer("/result/type").and_then(Value::as_str) != Some("subscription_started") {
+            return Err("Herdr did not acknowledge the agent-start subscription".to_string());
+        }
+        Ok(AgentStartSubscription {
+            pane_id: pane_id.to_string(),
+            workspace_id: workspace_id.to_string(),
+            reader,
+        })
+    })
+    .await
+    .map_err(|_| "agent-start subscription timed out".to_string())?
+}
+
+async fn subscribe_agent_start(
+    pane_id: &str,
+    workspace_id: &str,
+) -> Result<AgentStartSubscription, String> {
+    subscribe_agent_start_at(&socket_path(), pane_id, workspace_id).await
+}
+
+impl AgentStartSubscription {
+    async fn wait(self, timeout: Duration) -> Result<(), String> {
+        tokio::time::timeout(timeout, async {
+            let mut reader = self.reader;
+            let mut working = false;
+            loop {
+                let mut line = String::new();
+                let bytes = reader
+                    .read_line(&mut line)
+                    .await
+                    .map_err(|error| format!("agent-start event: {error}"))?;
+                if bytes == 0 && working {
+                    return Err("agent-start subscription closed before done".to_string());
+                }
+                if bytes == 0 {
+                    return Err("agent-start subscription closed before working".to_string());
+                }
+                let event: Value = serde_json::from_str(&line)
+                    .map_err(|error| format!("agent-start event: {error}"))?;
+                if event.get("event").and_then(Value::as_str) != Some("pane.agent_status_changed")
+                    || event.pointer("/data/pane_id").and_then(Value::as_str)
+                        != Some(self.pane_id.as_str())
+                    || event.pointer("/data/workspace_id").and_then(Value::as_str)
+                        != Some(self.workspace_id.as_str())
+                    || !matches!(
+                        event.pointer("/data/agent").and_then(Value::as_str),
+                        Some("claude" | "codex")
+                    )
+                {
+                    continue;
+                }
+                match event.pointer("/data/agent_status").and_then(Value::as_str) {
+                    Some("working") => working = true,
+                    Some("done") if working => return Ok(()),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .map_err(|_| "submitted prompt never completed a working-to-done transition".to_string())?
+    }
+}
+
+fn require_command(result: &RunResult, action: &str) -> Result<(), String> {
+    if result.ok {
+        Ok(())
+    } else {
+        Err(format!("{action} failed ({})", result.failure_detail()))
+    }
+}
+
 async fn workspaces() -> Option<Vec<Workspace>> {
-    serde_json::from_str::<WorkspaceListReply>(&run30(&["herdr", "workspace", "list"]).await.out)
+    let result = run30(&["herdr", "workspace", "list"]).await;
+    if !result.ok {
+        eprintln!(
+            "[herdr] workspace list failed ({})",
+            result.failure_detail()
+        );
+        return None;
+    }
+    serde_json::from_str::<WorkspaceListReply>(&result.out)
         .ok()
         .map(|reply| reply.result.workspaces)
 }
@@ -216,12 +386,48 @@ async fn focused_workspace() -> Option<String> {
 /// unfocused. Restore the user's prior focus when that happens.
 async fn close_workspace(id: &str) {
     let before = focused_workspace().await;
-    run30(&["herdr", "workspace", "close", id]).await;
-    if let Some(previous) = before {
-        if previous != id && focused_workspace().await.as_deref() != Some(previous.as_str()) {
-            run30(&["herdr", "workspace", "focus", &previous]).await;
-        }
+    let closed = run30(&["herdr", "workspace", "close", id]).await;
+    if !closed.ok {
+        eprintln!(
+            "[herdr] workspace close {id} failed ({})",
+            closed.failure_detail()
+        );
     }
+    let Some(previous) = before else {
+        return;
+    };
+    if previous == id || focused_workspace().await.as_deref() == Some(previous.as_str()) {
+        return;
+    }
+    let focused = run30(&["herdr", "workspace", "focus", &previous]).await;
+    if !focused.ok {
+        eprintln!(
+            "[herdr] workspace focus {previous} failed ({})",
+            focused.failure_detail()
+        );
+    }
+}
+
+async fn register_discovered_session_id(label: &str, pane: Option<&str>, discover: bool) {
+    if !discover {
+        return;
+    }
+    let Some(pane) = pane else {
+        return;
+    };
+    for _ in 0..3 {
+        let Some(sid) = pane_list()
+            .await
+            .and_then(|panes| pick_session_id(&panes, pane))
+        else {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        };
+        crate::sweep::register_job_sid(&sid);
+        println!("[herdr:{label}] registered job self-capture {sid}");
+        return;
+    }
+    eprintln!("[herdr:{label}] no agent_session id for pane {pane}; self-capture may reach learn");
 }
 
 /// Reclaim inactive workspaces left by interrupted or intentionally retained runs.
@@ -262,6 +468,9 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
         );
         return AgentRunOutcome::Unavailable;
     }
+    if let Some(session_id) = &agent_run.preset_session_id {
+        crate::sweep::register_job_sid(session_id);
+    }
     let stale = close_by_label(&agent_run.label).await;
     if stale > 0 {
         println!(
@@ -280,7 +489,10 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
         "--no-focus",
     ])
     .await;
-    let parsed = serde_json::from_str::<WorkspaceCreateReply>(&created.out).ok();
+    let parsed = created
+        .ok
+        .then(|| serde_json::from_str::<WorkspaceCreateReply>(&created.out).ok())
+        .flatten();
     let workspace_id = parsed
         .as_ref()
         .map(|reply| reply.result.workspace.workspace_id.clone());
@@ -289,10 +501,11 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
         .map(|reply| reply.result.root_pane.pane_id.clone());
 
     let outcome = async {
-        let (Some(pane), Some(_)) = (&pane_id, &workspace_id) else {
+        let (Some(pane), Some(workspace)) = (&pane_id, &workspace_id) else {
             eprintln!(
-                "[herdr:{}] workspace create failed: {}",
+                "[herdr:{}] workspace create failed ({}): {}",
                 agent_run.label,
+                created.failure_detail(),
                 created.out.chars().take(200).collect::<String>()
             );
             let orphans = close_by_label(&agent_run.label).await;
@@ -309,22 +522,8 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
                 launched.failure_detail()
             ));
         }
-        let ready = run(
-            &[
-                "herdr",
-                "wait",
-                "agent-status",
-                pane,
-                "--status",
-                "idle",
-                "--timeout",
-                "60000",
-            ],
-            Duration::from_secs(70),
-        )
-        .await;
-        if !ready.ok {
-            let detail = ready.failure_detail();
+        if !wait_for_prompt_ready(pane, Duration::from_secs(60)).await {
+            let detail = "native Claude/Codex pane did not reach idle or done";
             eprintln!(
                 "[herdr:{}] agent did not become ready in pane {pane} ({detail})",
                 agent_run.label
@@ -333,116 +532,101 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
         }
         // Agent detection precedes TUI input readiness by ~1-2 seconds.
         tokio::time::sleep(Duration::from_secs(3)).await;
-        if !pane_has_agent(pane).await {
-            return AgentRunOutcome::Failed("CLI never launched (pane has no agent)".to_string());
+        let Some(identity) = pane_list()
+            .await
+            .and_then(|panes| ready_pane_identity(&panes, pane))
+        else {
+            return AgentRunOutcome::Failed(
+                "CLI pane was not a ready native Claude/Codex agent after settle".to_string(),
+            );
+        };
+        // Herdr 0.7.4 pane.run atomically sends the text plus Enter. Arm and
+        // acknowledge one unfiltered status stream first so even a fast
+        // working→done turn is buffered on this same pane/workspace cursor.
+        let lifecycle = match subscribe_agent_start(pane, workspace).await {
+            Ok(subscription) => subscription,
+            Err(detail) => {
+                return AgentRunOutcome::Failed(format!(
+                    "could not observe submitted turn ({detail})"
+                ));
+            }
+        };
+        let submitted = run30(&["herdr", "pane", "run", pane, &agent_run.prompt]).await;
+        if let Err(detail) = require_command(&submitted, "prompt submission") {
+            return AgentRunOutcome::Failed(detail);
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let read = run30(&[
+            "herdr",
+            "pane",
+            "read",
+            pane,
+            "--source",
+            "recent-unwrapped",
+            "--lines",
+            "80",
+        ])
+        .await;
+        if let Err(detail) = require_command(&read, "prompt verification") {
+            return AgentRunOutcome::Failed(detail);
         }
         let needle: String = agent_run.prompt.chars().take(30).collect();
-        let mut landed = false;
-        let mut read_failure = None;
-        for _ in 0..3 {
-            run30(&["herdr", "pane", "run", pane, &agent_run.prompt]).await;
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            let read = run30(&[
-                "herdr",
-                "pane",
-                "read",
-                pane,
-                "--source",
-                "recent-unwrapped",
-                "--lines",
-                "80",
-            ])
-            .await;
-            if !read.ok {
-                read_failure = Some(read.failure_detail());
-                break;
-            }
-            // Claude collapses large pastes to this placeholder; it proves delivery.
-            if read.out.contains(&needle) || read.out.contains("[Pasted text") {
-                landed = true;
-                break;
-            }
+        // Claude collapses large pastes to this placeholder; it proves delivery.
+        if !read.out.contains(&needle) && !read.out.contains("[Pasted text") {
+            return AgentRunOutcome::Failed("submitted prompt was not visible in pane".to_string());
         }
-        if !landed {
-            return AgentRunOutcome::Failed(match read_failure {
-                Some(detail) => format!("prompt never landed in pane (pane read: {detail})"),
-                None => "prompt never landed in pane".to_string(),
-            });
+        if let Err(detail) = lifecycle
+            .wait(agent_run.timeout + Duration::from_secs(60))
+            .await
+        {
+            return AgentRunOutcome::Failed(format!(
+                "submitted prompt did not complete ({detail})"
+            ));
         }
-        run30(&["herdr", "pane", "send-keys", pane, "Enter"]).await;
-        run30(&["herdr", "pane", "send-keys", pane, "Enter"]).await;
-        let timeout_ms = agent_run.timeout.as_millis().to_string();
-        let done = run(
-            &[
-                "herdr",
-                "wait",
-                "agent-status",
-                pane,
-                "--status",
-                "done",
-                "--timeout",
-                &timeout_ms,
-            ],
-            agent_run.timeout + Duration::from_secs(60),
-        )
-        .await;
+        if !pane_list()
+            .await
+            .is_some_and(|panes| same_pane_identity(&identity, &panes, pane))
+        {
+            return AgentRunOutcome::Failed(
+                "pane terminal/session identity changed during submitted turn".to_string(),
+            );
+        }
         let tail = run30(&[
             "herdr", "pane", "read", pane, "--source", "recent", "--lines", "15",
         ])
         .await;
-        let detail = (!done.ok).then(|| done.failure_detail());
+        let tail_text = if tail.ok {
+            tail.out.trim().to_string()
+        } else {
+            format!("<tail read failed: {}>", tail.failure_detail())
+        };
         println!(
-            "[herdr:{}] agent {}; tail:\n{}",
-            agent_run.label,
-            match &detail {
-                None => "done".to_string(),
-                Some(d) => format!("FAILED ({d})"),
-            },
-            tail.out.trim()
+            "[herdr:{}] agent done; tail:\n{}",
+            agent_run.label, tail_text
         );
-        match detail {
-            None => AgentRunOutcome::Succeeded("agent done".to_string()),
-            Some(d) => AgentRunOutcome::Failed(format!("agent wait failed ({d})")),
-        }
+        AgentRunOutcome::Succeeded("agent done".to_string())
     }
     .await;
 
     // Register this pane's self-capture before cleanup can close it, so no learn pass
     // ever dispatches on plant's own housekeeping run. Claude preset its sid pre-launch;
     // codex ids are only knowable now, from what herdr reports for the pane.
-    if agent_run.discover_session_id {
-        if let Some(pane) = &pane_id {
-            let mut registered = None;
-            for _ in 0..3 {
-                if let Some(sid) = pane_list().await.and_then(|p| pick_session_id(&p, pane)) {
-                    crate::sweep::register_job_sid(&sid);
-                    registered = Some(sid);
-                    break;
-                }
-                tokio::time::sleep(Duration::from_secs(2)).await;
-            }
-            match registered {
-                Some(sid) => println!(
-                    "[herdr:{}] registered job self-capture {sid}",
-                    agent_run.label
-                ),
-                None => eprintln!(
-                    "[herdr:{}] no agent_session id for pane {pane}; self-capture may reach learn",
-                    agent_run.label
-                ),
-            }
-        }
-    }
-
-    if should_cleanup(agent_run.cleanup, &outcome) {
-        if let Some(id) = &workspace_id {
-            close_workspace(id).await;
-        }
-    } else if workspace_id.is_some() {
-        println!(
+    register_discovered_session_id(
+        &agent_run.label,
+        pane_id.as_deref(),
+        agent_run.discover_session_id,
+    )
+    .await;
+    match (
+        should_cleanup(agent_run.cleanup, &outcome),
+        workspace_id.as_deref(),
+    ) {
+        (true, Some(id)) => close_workspace(id).await,
+        (false, Some(_)) => println!(
             "[herdr:{}] pane kept open (cleanup: {:?})",
             agent_run.label, agent_run.cleanup
-        );
+        ),
+        _ => {}
     }
     outcome
 }
@@ -578,6 +762,47 @@ pub fn maybe_snapshot(vault: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::process::RunEnd;
+
+    async fn subscription_server(
+        path: PathBuf,
+        statuses: Vec<&'static str>,
+    ) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut request = String::new();
+            reader.read_line(&mut request).await.unwrap();
+            let request: Value = serde_json::from_str(&request).unwrap();
+            assert_eq!(
+                request.pointer("/params/subscriptions/0"),
+                Some(&serde_json::json!({
+                    "type": "pane.agent_status_changed",
+                    "pane_id": "w1:p1",
+                }))
+            );
+            reader
+                .get_mut()
+                .write_all(b"{\"id\":\"plant-agent-start\",\"result\":{\"type\":\"subscription_started\"}}\n")
+                .await
+                .unwrap();
+            for status in statuses {
+                let mut event = serde_json::to_vec(&serde_json::json!({
+                    "event": "pane.agent_status_changed",
+                    "data": {
+                        "pane_id": "w1:p1",
+                        "workspace_id": "w1",
+                        "agent_status": status,
+                        "agent": "codex",
+                    },
+                }))
+                .unwrap();
+                event.push(b'\n');
+                reader.get_mut().write_all(&event).await.unwrap();
+            }
+        })
+    }
 
     #[test]
     fn decodes_typed_panes_and_workspaces() {
@@ -614,6 +839,51 @@ mod tests {
     }
 
     #[test]
+    fn prompt_readiness_requires_native_idle_or_done_agent() {
+        let pane = |agent: Option<&str>, status: &str| Pane {
+            workspace_id: "w1".to_string(),
+            tab_id: "w1:t1".to_string(),
+            pane_id: "w1:p1".to_string(),
+            terminal_id: "t1".to_string(),
+            cwd: "/tmp".to_string(),
+            focused: false,
+            agent_status: status.to_string(),
+            agent: agent.map(str::to_string),
+            agent_session: None,
+        };
+        for (agent, status, expected) in [
+            (Some("claude"), "idle", true),
+            (Some("claude"), "done", true),
+            (Some("codex"), "idle", true),
+            (Some("codex"), "done", true),
+            (Some("claude"), "working", false),
+            (Some("codex"), "blocked", false),
+            (Some("codex"), "unknown", false),
+            (Some("unknown"), "idle", false),
+            (None, "idle", false),
+        ] {
+            assert_eq!(
+                pane_accepts_prompt(&[pane(agent, status)], "w1:p1"),
+                expected,
+                "{agent:?}/{status}"
+            );
+        }
+        assert!(!pane_accepts_prompt(
+            &[pane(Some("codex"), "done")],
+            "other"
+        ));
+
+        let mut original = pane(Some("codex"), "done");
+        original.agent_session = Some(AgentSession {
+            value: "session-1".to_string(),
+        });
+        let identity = ready_pane_identity(&[original.clone()], "w1:p1").unwrap();
+        assert!(same_pane_identity(&identity, &[original.clone()], "w1:p1"));
+        original.terminal_id = "replacement".to_string();
+        assert!(!same_pane_identity(&identity, &[original], "w1:p1"));
+    }
+
+    #[test]
     fn cleanup_follows_policy_and_outcome() {
         let succeeded = AgentRunOutcome::Succeeded("done".into());
         let failed = AgentRunOutcome::Failed("timeout".into());
@@ -627,11 +897,78 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn failed_atomic_pane_run_is_a_terminal_submission_error() {
+        let failed = RunResult {
+            ok: false,
+            out: String::new(),
+            stderr: "pane rejected keys".to_string(),
+            end: RunEnd::Exited(Some(1)),
+        };
+        assert_eq!(
+            require_command(&failed, "prompt submission").unwrap_err(),
+            "prompt submission failed (exit 1: pane rejected keys)"
+        );
+    }
+
+    #[tokio::test]
+    async fn preexisting_done_without_post_submit_working_is_not_success() {
+        let path = PathBuf::from("/tmp").join(format!("ph-{}.sock", uuid::Uuid::new_v4()));
+        let server = subscription_server(path.clone(), vec!["done"]).await;
+        let subscription = subscribe_agent_start_at(&path, "w1:p1", "w1")
+            .await
+            .unwrap();
+        let error = subscription
+            .wait(Duration::from_millis(100))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error, "agent-start subscription closed before working",
+            "a pre-submit done observation must not complete this run"
+        );
+        server.await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn acknowledged_working_event_survives_a_fast_turn() {
+        let path = PathBuf::from("/tmp").join(format!("ph-{}.sock", uuid::Uuid::new_v4()));
+        let server = subscription_server(path.clone(), vec!["working", "done"]).await;
+        let subscription = subscribe_agent_start_at(&path, "w1:p1", "w1")
+            .await
+            .unwrap();
+        subscription.wait(Duration::from_millis(100)).await.unwrap();
+        server.await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[tokio::test]
     #[ignore = "requires a live Herdr session and signed-in Codex CLI"]
     async fn live_agent_lifecycle_preserves_focus_and_cleans_up() {
-        let focused_before = focused_workspace().await.expect("focused Herdr workspace");
         let label = format!("plant-lifecycle-smoke-{}", std::process::id());
+        let monitoring_label = label.clone();
+        let monitor = tokio::spawn(async move {
+            let mut seen = false;
+            for _ in 0..300 {
+                let Some(workspaces) = workspaces().await else {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                };
+                let matching: Vec<_> = workspaces
+                    .iter()
+                    .filter(|workspace| workspace.label.as_deref() == Some(&monitoring_label))
+                    .collect();
+                if matching.iter().any(|workspace| workspace.focused) {
+                    return true;
+                }
+                if matching.is_empty() && seen {
+                    return false;
+                }
+                seen |= !matching.is_empty();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            false
+        });
         let outcome = run_agent(AgentRun {
             label: label.clone(),
             cwd: std::env::current_dir().unwrap().display().to_string(),
@@ -639,6 +976,7 @@ mod tests {
             prompt: "Reply with exactly HERDR_LIFECYCLE_SMOKE_OK and do not use tools.".into(),
             timeout: Duration::from_secs(120),
             cleanup: WorkspaceCleanup::Always,
+            preset_session_id: None,
             discover_session_id: false,
         })
         .await;
@@ -647,10 +985,7 @@ mod tests {
             matches!(outcome, AgentRunOutcome::Succeeded(_)),
             "{outcome:?}"
         );
-        assert_eq!(
-            focused_workspace().await.as_deref(),
-            Some(focused_before.as_str())
-        );
+        assert!(!monitor.await.unwrap(), "smoke workspace stole focus");
         assert!(
             workspaces()
                 .await

@@ -3,6 +3,7 @@
 //! and the original ~/.dotfiles/.config/wireproxy/wireproxy.ts.
 
 mod adapter;
+mod agent_run;
 mod capture;
 mod cli;
 mod coverage;
@@ -14,6 +15,7 @@ mod otel;
 mod process;
 mod proxy;
 mod selftest;
+mod state;
 mod sweep;
 
 use cli::Command;
@@ -24,15 +26,15 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 fn crash_log() -> PathBuf {
-    let dir = jobs::state_dir();
-    let _ = std::fs::create_dir_all(&dir);
+    let dir = state::dir();
+    let _ = state::ensure_dir_durable(&dir);
     dir.join("crash.log")
 }
 
 /// Sessions root via the shared vaultr resolver ($VAULT_SESSIONS > ~/.dotfiles/vault/sessions).
 fn vault_root() -> PathBuf {
-    vaultr::vault::root(None).unwrap_or_else(|e| {
-        eprintln!("[plant] cannot resolve vault sessions root: {e}");
+    vaultr::vault::root(None).unwrap_or_else(|error| {
+        eprintln!("[plant] cannot resolve vault sessions root: {error}");
         std::process::exit(1);
     })
 }
@@ -67,8 +69,8 @@ async fn dispatch(command: Command) -> i32 {
                     lease,
                 ) {
                     Ok(list) => list,
-                    Err(e) => {
-                        eprintln!("sessions eligible: claim failed: {e}");
+                    Err(error) => {
+                        eprintln!("sessions eligible: claim failed: {error}");
                         return 2;
                     }
                 },
@@ -93,37 +95,37 @@ async fn dispatch(command: Command) -> i32 {
             0
         }
         Command::SessionsCoverage(sid) => match coverage::coverage(&vault_root(), &sid) {
-            Ok(c) => {
-                let tag = if c.resumed { " (resumed)" } else { "" };
+            Ok(coverage) => {
+                let tag = if coverage.resumed { " (resumed)" } else { "" };
                 println!(
                     "{} coverage {:.1}% ({}/{} in-window){tag}",
-                    c.sid,
-                    c.pct(),
-                    c.in_window_native - c.missing.len(),
-                    c.in_window_native,
+                    coverage.sid,
+                    coverage.pct(),
+                    coverage.in_window_native - coverage.missing.len(),
+                    coverage.in_window_native,
                 );
                 println!(
                     "  window_start={} carryover={}",
-                    c.window_start, c.carryover
+                    coverage.window_start, coverage.carryover
                 );
-                if c.captured > c.in_window_native {
-                    // Captured envelopes with no in-window native match (for
-                    // example a pre-window boundary call) are informational.
-                    println!("  captured={} (>= in-window native)", c.captured);
+                if coverage.captured > coverage.in_window_native {
+                    println!("  captured={} (>= in-window native)", coverage.captured);
                 }
-                if c.missing.is_empty() {
+                if coverage.missing.is_empty() {
                     println!("  no in-window gap");
-                    0
-                } else {
-                    println!("  missing {} in-window request-id(s):", c.missing.len());
-                    for rid in &c.missing {
-                        println!("    {rid}");
-                    }
-                    1
+                    return 0;
                 }
+                println!(
+                    "  missing {} in-window request-id(s):",
+                    coverage.missing.len()
+                );
+                for request_id in &coverage.missing {
+                    println!("    {request_id}");
+                }
+                1
             }
-            Err(e) => {
-                eprintln!("sessions coverage: {e}");
+            Err(error) => {
+                eprintln!("sessions coverage: {error}");
                 1
             }
         },
@@ -140,7 +142,24 @@ async fn dispatch(command: Command) -> i32 {
             println!("{}", sweep::stuck_summary(&stuck));
             i32::from(stuck.iter().any(|capture| capture.state.is_actionable()))
         }
-        Command::CompressOnce(idle) => i32::from(!sweep::compress_sweep(&vault_root(), idle).await),
+        Command::CompressOnce(idle) => {
+            let ownership = match ListenerOwnership::bind_all().await {
+                Ok(ownership) => ownership,
+                Err(error) => {
+                    eprintln!("compress once: listener ownership unavailable: {error}");
+                    return 2;
+                }
+            };
+            let vault = vault_root();
+            let _ownership = match ownership.recover(&vault) {
+                Ok(ownership) => ownership,
+                Err(error) => {
+                    eprintln!("compress once: capture recovery failed: {error}");
+                    return 2;
+                }
+            };
+            i32::from(!sweep::compress_sweep(&vault, idle).await)
+        }
         Command::JobsRun(name) => {
             match jobs::load_jobs().into_iter().find(|job| job.name == name) {
                 Some(job) => jobs::run_job(&job).await,
@@ -164,12 +183,14 @@ async fn dispatch(command: Command) -> i32 {
                 eprintln!("agent run: prompt expected on stdin");
                 return 1;
             }
+
             let mut launch =
                 jobs::launch_line(args.cli, args.model.as_deref(), args.args.as_deref());
+            let mut preset_session_id = None;
             if args.cli == Harness::ClaudeCode {
-                let sid = uuid::Uuid::new_v4().to_string();
-                sweep::register_job_sid(&sid);
-                launch.push_str(&format!(" --session-id '{sid}'"));
+                let session_id = uuid::Uuid::new_v4().to_string();
+                launch.push_str(&format!(" --session-id '{session_id}'"));
+                preset_session_id = Some(session_id);
             }
             let vault = vault_root();
             let run = herdr::AgentRun {
@@ -181,22 +202,33 @@ async fn dispatch(command: Command) -> i32 {
                 prompt: prompt.trim().to_string(),
                 timeout: args.timeout,
                 cleanup: jobs::cleanup_policy(args.cleanup, &jobs::Cfg::load(&vault)),
+                preset_session_id,
                 discover_session_id: args.cli == Harness::Codex,
             };
+            if let Some(key) = args.idempotency_key {
+                let receipt = agent_run::run_idempotent(run, &key).await;
+                println!(
+                    "{}",
+                    serde_json::to_string(&receipt).expect("receipt serializes")
+                );
+                return receipt.exit_code();
+            }
+
             let label = run.label.clone();
-            match herdr::run_agent(run).await {
-                herdr::AgentRunOutcome::Succeeded(detail) => {
+            match agent_run::AgentRunReceipt::untracked(herdr::run_agent(run).await) {
+                agent_run::AgentRunReceipt::UntrackedSucceeded { detail } => {
                     println!("[agent:{label}] succeeded: {detail}");
                     0
                 }
-                herdr::AgentRunOutcome::Unavailable => {
+                agent_run::AgentRunReceipt::Retryable { .. } => {
                     println!("[agent:{label}] herdr unavailable");
                     75
                 }
-                herdr::AgentRunOutcome::Failed(detail) => {
+                agent_run::AgentRunReceipt::UntrackedFailed { detail } => {
                     println!("[agent:{label}] failed: {detail}");
                     1
                 }
+                _ => unreachable!("untracked run produced a durable receipt"),
             }
         }
     }
@@ -241,11 +273,84 @@ pub fn http_client() -> reqwest::Client {
         .expect("reqwest client")
 }
 
+async fn complete_incumbent() -> bool {
+    let client = http_client();
+    for adapter in adapter::adapters() {
+        let url = format!("http://127.0.0.1:{}/health", adapter.port);
+        let response =
+            match tokio::time::timeout(Duration::from_secs(2), client.get(url).send()).await {
+                Ok(Ok(response)) if response.status().is_success() => response,
+                _ => return false,
+            };
+        let Ok(health) = response.json::<serde_json::Value>().await else {
+            return false;
+        };
+        if !health_matches(&health, &adapter) {
+            return false;
+        }
+    }
+    true
+}
+
+fn health_matches(health: &serde_json::Value, adapter: &adapter::Adapter) -> bool {
+    health.get("service").and_then(|value| value.as_str()) == Some("plant")
+        && health.get("ok").and_then(|value| value.as_bool()) == Some(true)
+        && health.get("harness").and_then(|value| value.as_str())
+            == Some(adapter.harness.capture_label())
+        && health.get("upstream").and_then(|value| value.as_str())
+            == Some(adapter.upstream.trim_end_matches('/'))
+}
+
+type BoundServer = (tokio::net::TcpListener, u16, adapter::Adapter);
+
+struct ListenerOwnership {
+    servers: Vec<BoundServer>,
+}
+
+struct RecoveredListenerOwnership {
+    servers: Vec<BoundServer>,
+}
+
+impl ListenerOwnership {
+    async fn bind_all() -> std::io::Result<Self> {
+        let mut servers = Vec::new();
+        for adapter in adapter::adapters() {
+            match proxy::bind(adapter.port).await {
+                Ok((listener, port)) => servers.push((listener, port, adapter)),
+                Err(error) => {
+                    drop(servers);
+                    return Err(error);
+                }
+            }
+        }
+        Ok(Self { servers })
+    }
+
+    fn recover(self, vault: &std::path::Path) -> Result<RecoveredListenerOwnership, String> {
+        self.recover_with(|| capture::recover_all(vault))
+    }
+
+    fn recover_with(
+        self,
+        recover: impl FnOnce() -> Result<(), String>,
+    ) -> Result<RecoveredListenerOwnership, String> {
+        recover()?;
+        Ok(RecoveredListenerOwnership {
+            servers: self.servers,
+        })
+    }
+}
+
+impl RecoveredListenerOwnership {
+    fn into_servers(self) -> Vec<BoundServer> {
+        self.servers
+    }
+}
+
 async fn run_daemon() {
     let started = SystemTime::now();
-
     std::panic::set_hook(Box::new(move |info| {
-        let msg = format!(
+        let message = format!(
             "\n===== panic {} pid={} =====\n{info}\n",
             capture::iso_now(),
             std::process::id()
@@ -256,7 +361,7 @@ async fn run_daemon() {
             .append(true)
             .open(crash_log())
         {
-            let _ = file.write_all(msg.as_bytes());
+            let _ = file.write_all(message.as_bytes());
         }
         eprintln!("[plant] {info}");
         record_exit(started, "panic");
@@ -264,47 +369,57 @@ async fn run_daemon() {
     }));
 
     let vault = vault_root();
-    if let Err(e) = capture::recover_all(&vault) {
-        eprintln!("[plant] capture recovery failed: {e}");
-        record_exit(started, "exit:1");
-        std::process::exit(1);
-    }
-
-    let otel = Arc::new(otel::Otel::new());
-    let client = http_client();
-    let mut servers = vec![];
-    for adapter in adapter::adapters() {
-        match proxy::bind(adapter.port).await {
-            Ok((listener, port)) => {
-                println!(
-                    "vaultr [{}] 127.0.0.1:{port} -> {}",
-                    adapter.harness.capture_label(),
-                    adapter.upstream
-                );
-                servers.push((listener, adapter));
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                println!("[vaultr] port already bound, another instance owns it — exiting 0");
+    let ownership = match ListenerOwnership::bind_all().await {
+        Ok(ownership) => ownership,
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            if complete_incumbent().await {
+                println!("[plant] complete incumbent owns both harnesses — exiting 0");
                 record_exit(started, "exit:0");
                 std::process::exit(0);
             }
-            Err(e) => {
-                record_exit(started, "exit:1");
-                panic!("bind failed: {e}");
-            }
+            eprintln!("[plant] incomplete listener ownership: {error}");
+            record_exit(started, "exit:1");
+            std::process::exit(1);
         }
+        Err(error) => {
+            eprintln!("[plant] bind failed: {error}");
+            record_exit(started, "exit:1");
+            std::process::exit(1);
+        }
+    };
+    for (_, port, adapter) in &ownership.servers {
+        println!(
+            "vaultr [{}] 127.0.0.1:{port} -> {}",
+            adapter.harness.capture_label(),
+            adapter.upstream
+        );
     }
+
+    let ownership = ownership.recover(&vault).unwrap_or_else(|error| {
+        eprintln!("[plant] capture recovery failed: {error}");
+        record_exit(started, "exit:1");
+        std::process::exit(1);
+    });
+
+    let otel = Arc::new(otel::Otel::new());
+    let client = http_client();
     println!("vault={}", vault.display());
 
-    let mut accept_loops = vec![];
-    for (listener, adapter) in servers {
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut accept_loops = tokio::task::JoinSet::new();
+    for (listener, _, adapter) in ownership.into_servers() {
         let ctx = Arc::new(ProxyCtx {
             adapter,
             vault: vault.clone(),
             client: client.clone(),
             otel: otel.clone(),
         });
-        accept_loops.push(tokio::spawn(proxy::serve(listener, ctx)));
+        accept_loops.spawn(proxy::serve_until_shutdown(
+            listener,
+            ctx,
+            shutdown_rx.clone(),
+            Duration::from_secs(30),
+        ));
     }
 
     if otel.enabled {
@@ -319,7 +434,7 @@ async fn run_daemon() {
         });
     }
 
-    tokio::spawn(jobs::scheduler(jobs::Cfg::load(&vault)));
+    tokio::spawn(jobs::scheduler(jobs::Cfg::load(&vault), vault.clone()));
     tokio::spawn(async {
         loop {
             tokio::time::sleep(Duration::from_secs(3600)).await;
@@ -343,11 +458,20 @@ async fn run_daemon() {
         _ = usr2.recv() => "signal:SIGUSR2",
     };
     if matches!(why, "signal:SIGTERM" | "signal:SIGINT") {
-        for handle in &accept_loops {
-            handle.abort();
-        }
         println!("[plant] {why}, draining up to 30s");
-        tokio::time::sleep(Duration::from_secs(30)).await;
+        let _ = shutdown_tx.send(true);
+        let mut listener_leases = Vec::with_capacity(accept_loops.len());
+        while let Some(result) = accept_loops.join_next().await {
+            match result {
+                Ok(listener) => listener_leases.push(listener),
+                Err(error) => {
+                    eprintln!("[plant] accept loop failed during shutdown: {error}");
+                    record_exit(started, "exit:1");
+                    std::process::exit(1);
+                }
+            }
+        }
+        drop(listener_leases);
         record_exit(started, "exit:0");
         std::process::exit(0);
     }
@@ -361,5 +485,59 @@ async fn main() {
     match cli::parse_command(&argv) {
         Ok(command) => std::process::exit(dispatch(command).await),
         Err(error) => std::process::exit(usage(&error)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incumbent_health_schema_matches_the_proxy_contract_exactly() {
+        for adapter in adapter::adapters() {
+            let health = proxy::health_body(&adapter);
+            assert_eq!(
+                health,
+                serde_json::json!({
+                    "service": "plant",
+                    "ok": true,
+                    "harness": adapter.harness.capture_label(),
+                    "upstream": adapter.upstream.trim_end_matches('/'),
+                })
+            );
+            assert!(health_matches(&health, &adapter));
+        }
+    }
+
+    #[tokio::test]
+    async fn ownership_seam_requires_both_bindings_before_recovery_and_runtime() {
+        let mut servers = Vec::new();
+        let mut addresses = Vec::new();
+        for adapter in adapter::adapters() {
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                .await
+                .unwrap();
+            let address = listener.local_addr().unwrap();
+            addresses.push(address);
+            servers.push((listener, address.port(), adapter));
+        }
+        let ownership = ListenerOwnership { servers };
+        let recovered = ownership
+            .recover_with(|| {
+                for address in &addresses {
+                    assert!(
+                        std::net::TcpListener::bind(address).is_err(),
+                        "recovery runs only while both listener leases are held"
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            recovered.servers.len(),
+            2,
+            "only recovered dual ownership can enter proxy/scheduler startup"
+        );
+        drop(recovered);
     }
 }

@@ -1,46 +1,49 @@
 use std::path::Path;
+use std::process::Stdio;
 use std::time::Duration;
 
-/// How a subprocess run ended. Distinguishes the cases `ok: false` collapses.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum RunEnd {
+pub(crate) enum RunEnd {
     Exited(Option<i32>),
     TimedOut,
     SpawnFailed,
+    WaitFailed,
 }
 
-pub struct RunResult {
-    pub ok: bool,
-    pub out: String,
-    pub stderr: String,
-    pub end: RunEnd,
+pub(crate) struct RunResult {
+    pub(crate) ok: bool,
+    pub(crate) out: String,
+    pub(crate) stderr: String,
+    pub(crate) end: RunEnd,
 }
 
 impl RunResult {
-    pub fn failure_detail(&self) -> String {
+    pub(crate) fn failure_detail(&self) -> String {
         let how = match self.end {
             RunEnd::Exited(Some(code)) => format!("exit {code}"),
             RunEnd::Exited(None) => "killed by signal".to_string(),
             RunEnd::TimedOut => "timed out".to_string(),
             RunEnd::SpawnFailed => "spawn failed".to_string(),
+            RunEnd::WaitFailed => "wait failed".to_string(),
         };
-        let err: String = self.stderr.trim().chars().take(200).collect();
-        if err.is_empty() {
+        let error: String = self.stderr.trim().chars().take(200).collect();
+        if error.is_empty() {
             how
         } else {
-            format!("{how}: {err}")
+            format!("{how}: {error}")
         }
     }
 }
 
 /// PATH that works no matter who spawned Plant.
-pub fn augmented_path() -> String {
+pub(crate) fn augmented_path() -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     let mut parts = vec![];
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            parts.push(dir.display().to_string());
-        }
+    let executable_dir = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(Path::to_path_buf));
+    if let Some(dir) = executable_dir {
+        parts.push(dir.display().to_string());
     }
     for dir in [".nix-profile/bin", ".local/bin", ".bun/bin"] {
         parts.push(format!("{home}/{dir}"));
@@ -51,72 +54,162 @@ pub fn augmented_path() -> String {
     parts.join(":")
 }
 
-pub async fn run(cmd: &[&str], timeout: Duration) -> RunResult {
-    use tokio::io::AsyncReadExt;
+fn output_task<T>(stream: Option<T>) -> Option<tokio::task::JoinHandle<std::io::Result<Vec<u8>>>>
+where
+    T: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    stream.map(|mut stream| {
+        tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut bytes)
+                .await
+                .map(|_| bytes)
+        })
+    })
+}
 
+async fn output(
+    task: &mut Option<tokio::task::JoinHandle<std::io::Result<Vec<u8>>>>,
+) -> (Vec<u8>, Option<String>) {
+    let Some(task) = task else {
+        return (Vec::new(), None);
+    };
+    match task.await {
+        Ok(Ok(bytes)) => (bytes, None),
+        Ok(Err(error)) => (Vec::new(), Some(error.to_string())),
+        Err(error) => (Vec::new(), Some(error.to_string())),
+    }
+}
+
+fn abort_output(task: &Option<tokio::task::JoinHandle<std::io::Result<Vec<u8>>>>) {
+    if let Some(task) = task {
+        task.abort();
+    }
+}
+
+async fn kill_and_reap(child: &mut tokio::process::Child) -> String {
+    let kill = child
+        .start_kill()
+        .err()
+        .map(|error| format!("kill: {error}"));
+    let reap = child
+        .wait()
+        .await
+        .err()
+        .map(|error| format!("reap: {error}"));
+    [kill, reap]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn failed(end: RunEnd, stderr: String) -> RunResult {
+    RunResult {
+        ok: false,
+        out: String::new(),
+        stderr,
+        end,
+    }
+}
+
+/// Run an already-configured command. Piped streams are drained; inherited or
+/// null streams stay as configured by the caller. Every post-spawn failure path
+/// kills and reaps the direct child before returning.
+pub(crate) async fn run_command(
+    command: &mut tokio::process::Command,
+    timeout: Duration,
+) -> RunResult {
+    command.kill_on_drop(true);
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(error) => return failed(RunEnd::SpawnFailed, error.to_string()),
+    };
+    let mut stdout_task = output_task(child.stdout.take());
+    let mut stderr_task = output_task(child.stderr.take());
+    let deadline = tokio::time::Instant::now() + timeout;
+
+    let end = match tokio::time::timeout_at(deadline, child.wait()).await {
+        Ok(Ok(status)) => RunEnd::Exited(status.code()),
+        Ok(Err(error)) => {
+            abort_output(&stdout_task);
+            abort_output(&stderr_task);
+            let cleanup = kill_and_reap(&mut child).await;
+            let detail = [format!("wait: {error}"), cleanup]
+                .into_iter()
+                .filter(|part| !part.is_empty())
+                .collect::<Vec<_>>()
+                .join("; ");
+            return failed(RunEnd::WaitFailed, detail);
+        }
+        Err(_) => {
+            abort_output(&stdout_task);
+            abort_output(&stderr_task);
+            let cleanup = kill_and_reap(&mut child).await;
+            return failed(RunEnd::TimedOut, cleanup);
+        }
+    };
+
+    let drains = async { tokio::join!(output(&mut stdout_task), output(&mut stderr_task)) };
+    let ((out, out_error), (stderr, stderr_error)) =
+        match tokio::time::timeout_at(deadline, drains).await {
+            Ok(output) => output,
+            Err(_) => {
+                abort_output(&stdout_task);
+                abort_output(&stderr_task);
+                return failed(RunEnd::TimedOut, "output drain timed out".to_string());
+            }
+        };
+    let diagnostics = [out_error, stderr_error]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("; ");
+    let mut stderr = String::from_utf8_lossy(&stderr).into_owned();
+    if !diagnostics.is_empty() && !stderr.is_empty() {
+        stderr.push_str("; ");
+    }
+    if !diagnostics.is_empty() {
+        stderr.push_str(&diagnostics);
+    }
+    let end = if diagnostics.is_empty() {
+        end
+    } else {
+        RunEnd::WaitFailed
+    };
+    RunResult {
+        ok: matches!(end, RunEnd::Exited(Some(0))),
+        out: String::from_utf8_lossy(&out).into_owned(),
+        stderr,
+        end,
+    }
+}
+
+pub(crate) async fn run(cmd: &[&str], timeout: Duration) -> RunResult {
     let mut command = tokio::process::Command::new(cmd[0]);
     command
         .args(&cmd[1..])
         .env("PATH", augmented_path())
-        .kill_on_drop(true)
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let mut child = match command.spawn() {
-        Ok(child) => child,
-        Err(e) => {
-            return RunResult {
-                ok: false,
-                out: String::new(),
-                stderr: e.to_string(),
-                end: RunEnd::SpawnFailed,
-            };
-        }
-    };
-    let mut stdout = child.stdout.take().expect("piped stdout");
-    let mut stderr = child.stderr.take().expect("piped stderr");
-    let mut out = Vec::new();
-    let mut err = Vec::new();
-    let completed = async {
-        let (stdout, stderr, status) = tokio::join!(
-            stdout.read_to_end(&mut out),
-            stderr.read_to_end(&mut err),
-            child.wait()
-        );
-        stdout?;
-        stderr?;
-        status
-    };
-    match tokio::time::timeout(timeout, completed).await {
-        Ok(Ok(status)) => RunResult {
-            ok: status.success(),
-            out: String::from_utf8_lossy(&out).into_owned(),
-            stderr: String::from_utf8_lossy(&err).into_owned(),
-            end: RunEnd::Exited(status.code()),
-        },
-        Ok(Err(e)) => RunResult {
-            ok: false,
-            out: String::new(),
-            stderr: e.to_string(),
-            end: RunEnd::SpawnFailed,
-        },
-        Err(_) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            RunResult {
-                ok: false,
-                out: String::new(),
-                stderr: String::new(),
-                end: RunEnd::TimedOut,
-            }
-        }
-    }
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    run_command(&mut command, timeout).await
 }
 
-pub async fn run30(cmd: &[&str]) -> RunResult {
+pub(crate) async fn run_inherit_stderr(cmd: &[&str], timeout: Duration) -> RunResult {
+    let mut command = tokio::process::Command::new(cmd[0]);
+    command
+        .args(&cmd[1..])
+        .env("PATH", augmented_path())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    run_command(&mut command, timeout).await
+}
+
+pub(crate) async fn run30(cmd: &[&str]) -> RunResult {
     run(cmd, Duration::from_secs(30)).await
 }
 
-pub fn which(bin: &str) -> bool {
+pub(crate) fn which(bin: &str) -> bool {
     augmented_path()
         .split(':')
         .any(|dir| Path::new(dir).join(bin).is_file())
@@ -125,7 +218,7 @@ pub fn which(bin: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
     #[tokio::test]
     async fn timeout_kills_and_reaps_direct_child_before_returning() {
@@ -163,5 +256,37 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1100)).await;
         assert!(!marker.exists(), "delayed child effect occurred");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn descendant_inheriting_a_pipe_cannot_extend_the_deadline() {
+        let root =
+            std::env::temp_dir().join(format!("plant-process-pipe-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let pid_path = root.join("descendant.pid");
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(format!("sleep 10 & echo $! > '{}'", pid_path.display()))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let started = Instant::now();
+        let result = run_command(&mut command, Duration::from_millis(100)).await;
+        assert_eq!(result.end, RunEnd::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "an inherited pipe must not keep the runner alive"
+        );
+
+        let descendant_pid = std::fs::read_to_string(&pid_path)
+            .ok()
+            .and_then(|pid| pid.trim().parse::<i32>().ok());
+        if let Some(pid) = descendant_pid {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -15,10 +15,11 @@ over the new files, so a message can start (and, through the existing
   being forced through `/bin/bash`, so a door can be a TypeScript job run by
   Bun with no interpreter special-casing in Plant.
 - A new Bun/TypeScript library in this workspace (`ts/`) owns the door
-  routine: new-file detection against a per-door high-water mark, an
-  ingestion-only allowlist of watchable roots, a rolling-window fire breaker,
-  and a typed wrapper over `plant agent run` mirroring the
-  `Unavailable`/`Failed`/`Succeeded` outcome contract.
+  routine: new-file detection against a timestamp frontier with durable seen
+  paths, a durable in-progress batch claim under a cross-process lock, a
+  canonical ingestion-root allowlist, a rolling-window fire breaker, and a
+  typed idempotent wrapper over `plant agent run` that advances only after a
+  machine-readable durable `Succeeded` or `Failed` result.
 - A door is then an ordinary job script (`door-<name>.<interval>.ts`) of ~10
   lines: watch glob, filter predicate, prompt builder. Batch firing — one
   agent session per door per run, all new matches in one prompt.
@@ -35,3 +36,12 @@ over the new files, so a message can start (and, through the existing
   jobs.
 - Not changed: the Herdr lifecycle stays implemented once, in Plant; doors
   never drive panes except through `plant agent run`.
+
+## Issue traceability
+
+- GitHub #24: durable pre-side-effect job attempt fencing, fallible final
+  recording, exit-75 re-arm, and fail-closed recovery.
+- GitHub #27: fail-closed, cross-process, crash-safe Door claims and durable
+  Plant Agent Run outcome lookup.
+- GitHub #35: verified native Claude/Codex readiness and lifecycle cleanup in
+  the single Plant-owned Herdr boundary.

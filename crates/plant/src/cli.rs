@@ -33,6 +33,7 @@ pub struct AgentRunArgs {
     pub cleanup: WorkspaceCleanup,
     pub timeout: Duration,
     pub cwd: Option<String>,
+    pub idempotency_key: Option<String>,
 }
 
 pub fn parse_command(argv: &[String]) -> Result<Command, String> {
@@ -141,6 +142,7 @@ fn parse_agent(args: &[String]) -> Result<AgentRunArgs, String> {
     let mut extra_args = None;
     let mut label = None;
     let mut cwd = None;
+    let mut idempotency_key = None;
     let mut cleanup = WorkspaceCleanup::Never;
     let mut timeout = Duration::from_secs(45 * 60);
     let mut seen = HashSet::new();
@@ -164,6 +166,7 @@ fn parse_agent(args: &[String]) -> Result<AgentRunArgs, String> {
             "--args" => extra_args = Some(value.clone()),
             "--label" => label = Some(value.clone()),
             "--cwd" => cwd = Some(value.clone()),
+            "--idempotency-key" => idempotency_key = Some(value.clone()),
             "--timeout" => {
                 timeout =
                     jobs::parse_duration(value).ok_or("agent run: invalid --timeout duration")?;
@@ -192,6 +195,7 @@ fn parse_agent(args: &[String]) -> Result<AgentRunArgs, String> {
         cleanup,
         timeout,
         cwd,
+        idempotency_key,
     })
 }
 
@@ -261,6 +265,27 @@ mod tests {
                 cleanup: WorkspaceCleanup::OnSuccess,
                 timeout: Duration::from_secs(10 * 60),
                 cwd: None,
+                idempotency_key: None,
+            }))
+        );
+        assert_eq!(
+            parse_command(&argv(&[
+                "agent",
+                "run",
+                "--cli",
+                "claude",
+                "--idempotency-key",
+                "door-key",
+            ])),
+            Ok(Command::AgentRun(AgentRunArgs {
+                cli: Harness::ClaudeCode,
+                model: None,
+                args: None,
+                label: None,
+                cleanup: WorkspaceCleanup::Never,
+                timeout: Duration::from_secs(45 * 60),
+                cwd: None,
+                idempotency_key: Some("door-key".to_string()),
             }))
         );
     }

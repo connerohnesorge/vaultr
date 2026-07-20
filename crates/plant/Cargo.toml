@@ -18,5 +18,6 @@ zstd = "0.13"
 futures-util = "0.3"
 bytes = "1"
 tokio-stream = "0.1"
+tokio-util = { version = "0.7", features = ["rt"] }
 libc = "0.2"
 vaultr = { path = "../vaultr" }

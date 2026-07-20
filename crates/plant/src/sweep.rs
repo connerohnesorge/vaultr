@@ -4,7 +4,7 @@
 //! Every failure path non-fatal: capture uptime is sacred. All heavy work shells out.
 
 use crate::domain::Harness;
-use crate::process::{run, run30, which};
+use crate::process::{run, run30, run_inherit_stderr, which};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -308,7 +308,7 @@ pub fn stuck_captures(vault: &Path, age: Duration) -> Vec<StuckCapture> {
 /// for the pane once the run finishes and registers it, so both harnesses are excluded
 /// before dispatch — no content-heuristic skip in the learn skill.
 pub fn job_sids_path() -> PathBuf {
-    crate::jobs::state_dir().join("job-sids.txt")
+    crate::state::dir().join("job-sids.txt")
 }
 
 pub fn job_sids() -> HashSet<String> {
@@ -329,14 +329,19 @@ fn job_sids_at(path: &Path) -> HashSet<String> {
 
 pub fn register_job_sid(sid: &str) {
     let path = job_sids_path();
-    let _ = std::fs::create_dir_all(path.parent().unwrap());
+    let parent = path.parent().unwrap();
+    if crate::state::ensure_dir_durable(parent).is_err() {
+        return;
+    }
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)
+        .open(&path)
     {
-        let _ = writeln!(f, "{sid}");
+        let _ = writeln!(f, "{sid}")
+            .and_then(|_| f.sync_all())
+            .and_then(|_| crate::state::sync_dir(parent));
     }
 }
 
@@ -554,7 +559,7 @@ async fn seal_file(raw: &Path) -> Result<(), String> {
     let frame = raw.with_extension("frame-tmp");
     let raw_s = raw.display().to_string();
     let frame_s = frame.display().to_string();
-    let zstd = run(
+    let zstd = run_inherit_stderr(
         &["zstd", "-19", "-T0", "-q", "-f", "-o", &frame_s, &raw_s],
         Duration::from_secs(600),
     )
