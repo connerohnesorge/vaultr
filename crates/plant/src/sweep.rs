@@ -149,30 +149,45 @@ impl SessionGeneration {
         }
     }
 
-    fn idle_secs(&self) -> Option<u64> {
-        std::fs::metadata(self.path())
+    fn idle_secs(&self) -> Result<Option<u64>, String> {
+        let modified = std::fs::metadata(self.path())
             .and_then(|metadata| metadata.modified())
+            .map_err(|error| {
+                format!(
+                    "inspect capture generation {}: {error}",
+                    self.path().display()
+                )
+            })?;
+        Ok(SystemTime::now()
+            .duration_since(modified)
             .ok()
-            .and_then(|modified| SystemTime::now().duration_since(modified).ok())
-            .map(|duration| duration.as_secs())
+            .map(|duration| duration.as_secs()))
     }
 
-    fn idle_for(&self, idle: Duration) -> bool {
-        self.idle_secs()
-            .is_some_and(|seconds| seconds >= idle.as_secs())
+    fn idle_for(&self, idle: Duration) -> Result<bool, String> {
+        Ok(self
+            .idle_secs()?
+            .is_some_and(|seconds| seconds >= idle.as_secs()))
     }
 
-    fn substantive(&self) -> bool {
+    fn substantive(&self) -> Result<bool, String> {
         if self.selected != GenerationKind::Raw {
-            return true;
+            return Ok(true);
         }
         let size = std::fs::metadata(self.path())
             .map(|metadata| metadata.len())
-            .unwrap_or(0);
-        size > 20_480
-            || std::fs::read_to_string(self.path())
-                .map(|text| text.trim_end().lines().count() > 5)
-                .unwrap_or(false)
+            .map_err(|error| {
+                format!(
+                    "inspect capture generation {}: {error}",
+                    self.path().display()
+                )
+            })?;
+        if size > 20_480 {
+            return Ok(true);
+        }
+        std::fs::read_to_string(self.path())
+            .map(|text| text.trim_end().lines().count() > 5)
+            .map_err(|error| format!("read capture generation {}: {error}", self.path().display()))
     }
 
     fn ready_to_seal(
@@ -181,11 +196,13 @@ impl SessionGeneration {
         codex: &HashMap<String, u64>,
         jobs: &HashSet<String>,
         idle: Duration,
-    ) -> bool {
-        self.selected == GenerationKind::Detached
-            || ((self.learned_current(claude) && self.learned_current(codex)
-                || jobs.contains(&self.sid))
-                && self.idle_for(idle))
+    ) -> Result<bool, String> {
+        if self.selected == GenerationKind::Detached {
+            return Ok(true);
+        }
+        Ok((self.learned_current(claude) && self.learned_current(codex)
+            || jobs.contains(&self.sid))
+            && self.idle_for(idle)?)
     }
 }
 
@@ -337,7 +354,7 @@ pub fn stuck_captures(vault: &Path, age: Duration) -> Result<Vec<StuckCapture>, 
     let jobs = job_sids();
     let mut stuck = Vec::new();
     for generation in pending_generations(vault)? {
-        let Some(idle_secs) = generation.idle_secs() else {
+        let Some(idle_secs) = generation.idle_secs()? else {
             continue;
         };
         if idle_secs < age.as_secs() {
@@ -353,7 +370,7 @@ pub fn stuck_captures(vault: &Path, age: Duration) -> Result<Vec<StuckCapture>, 
                 (true, true) => StuckState::SealBlocked,
                 (true, false) => StuckState::HalfLearned(Harness::Codex),
                 (false, true) => StuckState::HalfLearned(Harness::ClaudeCode),
-                (false, false) if generation.substantive() => StuckState::Unlearned,
+                (false, false) if generation.substantive()? => StuckState::Unlearned,
                 (false, false) => StuckState::SubThreshold,
             }
         };
@@ -419,8 +436,8 @@ fn eligible_candidates(
         if jobs.contains(&generation.sid)
             || generation.learned_current(&processed)
             || inflight.contains(&generation.sid)
-            || !generation.idle_for(idle)
-            || !generation.substantive()
+            || !generation.idle_for(idle)?
+            || !generation.substantive()?
         {
             continue;
         }
@@ -491,6 +508,20 @@ pub fn eligibility_stats(vault: &Path, learner: Harness) -> Result<(usize, usize
 
 const COMMIT_CAP: u64 = 256 * 1024 * 1024;
 
+#[derive(Debug)]
+pub enum CompressError {
+    Inventory(String),
+    Operational(String),
+}
+
+impl fmt::Display for CompressError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Inventory(error) | Self::Operational(error) => formatter.write_str(error),
+        }
+    }
+}
+
 fn exclude_from_commit(vault: &Path, sealed: &Path, size: u64) {
     let Ok(root) = vaultr::validate::content_root(vault) else {
         return;
@@ -523,26 +554,32 @@ fn exclude_from_commit(vault: &Path, sealed: &Path, size: u64) {
     );
 }
 
-pub async fn compress_sweep(vault: &Path, idle: Duration) -> Result<(), String> {
+pub async fn compress_sweep(vault: &Path, idle: Duration) -> Result<(), CompressError> {
+    let pending = pending_generations(vault).map_err(CompressError::Inventory)?;
     if !which("zstd") {
-        return Err("zstd not on PATH".into());
+        return Err(CompressError::Operational("zstd not on PATH".into()));
     }
     let claude = ledger_latest(vault, Harness::ClaudeCode);
     let codex = ledger_latest(vault, Harness::Codex);
     let jobs = job_sids();
     let mut sealed = 0u32;
-    for selected in pending_generations(vault)? {
-        if !selected.ready_to_seal(&claude, &codex, &jobs, idle) {
+    for selected in pending {
+        if !selected
+            .ready_to_seal(&claude, &codex, &jobs, idle)
+            .map_err(CompressError::Inventory)?
+        {
             continue;
         }
         let directory = selected.path().parent().ok_or_else(|| {
-            format!(
+            CompressError::Inventory(format!(
                 "capture has no session directory: {}",
                 selected.path().display()
-            )
+            ))
         })?;
         let Some(generation) =
-            crate::capture::seal_ready_generation(vault, &selected.sid, directory).await?
+            crate::capture::seal_ready_generation(vault, &selected.sid, directory)
+                .await
+                .map_err(CompressError::Operational)?
         else {
             continue;
         };

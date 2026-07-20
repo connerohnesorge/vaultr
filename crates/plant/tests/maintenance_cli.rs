@@ -23,7 +23,7 @@ fn run(home: &Path, sessions: &Path, path: &Path, args: &[&str]) -> Output {
 }
 
 #[test]
-fn maintenance_commands_propagate_traversal_failures_and_preserve_no_work() {
+fn maintenance_commands_propagate_inventory_failures_and_preserve_no_work() {
     let tmp = std::env::temp_dir().join(format!(
         "plant-maintenance-{}-{}",
         std::process::id(),
@@ -89,6 +89,29 @@ fn maintenance_commands_propagate_traversal_failures_and_preserve_no_work() {
         );
     }
     fs::set_permissions(&day, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let session = tmp.join("unreadable-generation/2026/07/20/session");
+    fs::create_dir_all(&session).unwrap();
+    for name in ["turns.jsonl", "turns.jsonl.zst"] {
+        let generation = session.join(name);
+        fs::write(&generation, "{}\n".repeat(6)).unwrap();
+        fs::set_permissions(&generation, fs::Permissions::from_mode(0o000)).unwrap();
+        for args in [
+            &["sessions", "eligible"][..],
+            &["sessions", "stuck"][..],
+            &["compress", "once"][..],
+        ] {
+            let output = run(&home, &tmp.join("unreadable-generation"), &bin, args);
+            assert_eq!(
+                output.status.code(),
+                Some(2),
+                "{name} {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        fs::set_permissions(&generation, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::remove_file(generation).unwrap();
+    }
     fs::remove_dir_all(tmp).unwrap();
 }
 

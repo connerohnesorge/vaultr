@@ -264,11 +264,16 @@ impl CaptureGenerations {
                     path.display()
                 );
             }
+            let file = std::fs::File::open(&path)
+                .with_context(|| format!("open capture generation {}", path.display()))?;
             match kind {
                 CaptureGenerationName::Raw => generations.raw = Some(path),
                 CaptureGenerationName::Sealed => generations.sealed = Some(path),
                 CaptureGenerationName::Detached { base_len, digest } => {
-                    if sha256_file(&path)? != digest {
+                    if sha256_reader(file)
+                        .with_context(|| format!("hash capture generation {}", path.display()))?
+                        != digest
+                    {
                         bail!("detached generation digest mismatch at {}", path.display());
                     }
                     if generations

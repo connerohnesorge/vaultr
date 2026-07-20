@@ -180,7 +180,11 @@ async fn dispatch(command: Command) -> i32 {
                 Ok(()) => 0,
                 Err(error) => {
                     eprintln!("compress once: {error}");
-                    1
+                    if matches!(error, sweep::CompressError::Inventory(_)) {
+                        2
+                    } else {
+                        1
+                    }
                 }
             }
         }

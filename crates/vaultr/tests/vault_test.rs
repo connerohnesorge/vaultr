@@ -187,6 +187,25 @@ fn capture_file_is_raw_first_then_zstd() {
     assert!(vault::capture_file(tmp.path()).is_err());
 }
 
+#[cfg(unix)]
+#[test]
+fn capture_inventory_rejects_unreadable_raw_and_sealed_generations() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new().unwrap();
+    for name in ["turns.jsonl", "turns.jsonl.zst"] {
+        let path = tmp.path().join(name);
+        fs::write(&path, "capture").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        let result = vault::CaptureGenerations::load(tmp.path());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let error = result.unwrap_err().to_string();
+        assert!(error.contains("open capture generation"), "{error}");
+        assert!(error.contains(&path.display().to_string()), "{error}");
+        fs::remove_file(path).unwrap();
+    }
+}
+
 #[test]
 fn raw_corruption_is_not_hidden_by_zstd_fallback() {
     let tmp = TempDir::new().unwrap();

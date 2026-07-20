@@ -95,6 +95,25 @@ fn walker_propagates_hostile_numeric_symlink_errors() {
 }
 
 #[test]
+fn generation_policy_propagates_post_inventory_io_errors() {
+    let root = temp_root("generation-io");
+    let directory = root.join("session");
+    let raw = directory.join("turns.jsonl");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(&raw, [0xff]).unwrap();
+    let inventory = vaultr::vault::CaptureGenerations::load(&directory).unwrap();
+    let generation = SessionGeneration::current("session".to_string(), inventory).unwrap();
+
+    let error = generation.substantive().unwrap_err();
+    assert!(error.contains(&raw.display().to_string()), "{error}");
+    std::fs::remove_file(&raw).unwrap();
+    let error = generation.idle_secs().unwrap_err();
+    assert!(error.contains(&raw.display().to_string()), "{error}");
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn stuck_classification_covers_every_ledger_state() {
     let root = temp_root("stuck");
     let sessions = root.join("sessions");
@@ -305,11 +324,24 @@ async fn detached_sealing_conflict_is_an_operational_failure() {
     std::fs::write(&sealed, &conflict).unwrap();
 
     let error = compress_sweep(&vault, Duration::ZERO).await.unwrap_err();
-    assert!(error.contains("seal detached generation"), "{error}");
+    assert!(
+        matches!(&error, CompressError::Operational(message) if message.contains("seal detached generation")),
+        "{error}"
+    );
     assert!(detached.exists(), "detached evidence is preserved");
     assert_eq!(std::fs::read(&sealed).unwrap(), conflict);
 
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn compression_inventory_failures_are_distinct() {
+    let missing = temp_root("compress-missing");
+    let error = compress_sweep(&missing, Duration::ZERO).await.unwrap_err();
+    assert!(
+        matches!(&error, CompressError::Inventory(message) if message.contains(&missing.display().to_string())),
+        "{error}"
+    );
 }
 
 #[test]
