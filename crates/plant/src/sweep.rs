@@ -4,6 +4,7 @@
 //! Every failure path non-fatal: capture uptime is sacred. All heavy work shells out.
 
 use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -682,30 +683,6 @@ pub async fn compress_sweep(vault: &Path, idle: Duration) -> bool {
     true
 }
 
-/// Read a capture file's envelope lines, decompressing `.zst` transparently.
-/// ponytail: single-file only — the transient sealed+raw sibling pair (mid-resume)
-/// is chained by recon::reconstruct elsewhere; coverage is a point-in-time audit and
-/// reads whichever file `capture_file` returns. Unreadable => empty, never fatal.
-fn capture_lines(path: &Path) -> Vec<String> {
-    use std::io::Read;
-    let Ok(file) = std::fs::File::open(path) else {
-        return vec![];
-    };
-    let mut text = String::new();
-    let ok = if path.extension().and_then(|e| e.to_str()) == Some("zst") {
-        zstd::Decoder::new(file)
-            .and_then(|mut d| d.read_to_string(&mut text))
-            .is_ok()
-    } else {
-        let mut f = file;
-        f.read_to_string(&mut text).is_ok()
-    };
-    if !ok {
-        return vec![];
-    }
-    text.lines().map(String::from).collect()
-}
-
 /// Capture completeness for one Session Capture, measured over Plant's observation
 /// window (see ADR-0001). A resumed session's pre-window transcript history is
 /// reported as `carryover`, never as loss.
@@ -725,11 +702,8 @@ pub struct Coverage {
 }
 
 impl Coverage {
-    /// In-window captured / in-window native, as a percentage. Empty window is 100%.
+    /// In-window captured / in-window native, as a percentage.
     pub fn pct(&self) -> f64 {
-        if self.in_window_native == 0 {
-            return 100.0;
-        }
         let hit = self.in_window_native - self.missing.len();
         hit as f64 * 100.0 / self.in_window_native as f64
     }
@@ -745,10 +719,9 @@ pub fn coverage(vault: &Path, query: &str) -> Result<Coverage, String> {
     // Captured side: distinct response request-ids, and the window start (min observed_at).
     let mut captured: HashSet<String> = HashSet::new();
     let mut window_start: Option<String> = None;
-    for line in capture_lines(&cap) {
-        let Ok(env) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
+    let mut harness = None;
+    vaultr::recon::for_each_envelope(&cap, |env| {
+        harness = vaultr::recon::Harness::from_envelope(env, harness);
         if let Some(rid) = env
             .pointer("/response/headers/request-id")
             .and_then(|v| v.as_str())
@@ -760,6 +733,13 @@ pub fn coverage(vault: &Path, query: &str) -> Result<Coverage, String> {
                 window_start = Some(obs.to_string());
             }
         }
+    })
+    .map_err(|e| e.to_string())?;
+    if harness == Some(vaultr::recon::Harness::Codex) {
+        return Err(format!(
+            "coverage unsupported for Codex capture {}: no comparable native request IDs",
+            session.id
+        ));
     }
     let window_start = window_start
         .or_else(|| session.meta.original_start.clone())
@@ -771,11 +751,13 @@ pub fn coverage(vault: &Path, query: &str) -> Result<Coverage, String> {
         .transcript_path
         .clone()
         .ok_or_else(|| format!("no transcript_path in meta for {}", session.id))?;
-    let text = std::fs::read_to_string(&transcript)
+    let file = std::fs::File::open(&transcript)
         .map_err(|e| format!("read transcript {transcript}: {e}"))?;
-    let mut first_seen: HashMap<String, String> = HashMap::new();
-    for line in text.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+    let mut first_seen: HashMap<String, bool> = HashMap::new();
+    for (line_no, line) in BufReader::new(file).lines().enumerate() {
+        let line =
+            line.map_err(|e| format!("read transcript {transcript} line {}: {e}", line_no + 1))?;
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else {
             continue;
         };
         if v.get("type").and_then(|t| t.as_str()) != Some("assistant") {
@@ -784,32 +766,31 @@ pub fn coverage(vault: &Path, query: &str) -> Result<Coverage, String> {
         let Some(rid) = v.get("requestId").and_then(|r| r.as_str()) else {
             continue;
         };
-        let ts = v
-            .get("timestamp")
-            .and_then(|t| t.as_str())
-            .unwrap_or("")
-            .to_string();
+        let ts = v.get("timestamp").and_then(|t| t.as_str()).unwrap_or("");
+        let predates_window = ts < window_start.as_str();
         first_seen
             .entry(rid.to_string())
-            .and_modify(|e| {
-                if ts < *e {
-                    *e = ts.clone();
-                }
-            })
-            .or_insert(ts);
+            .and_modify(|seen_before| *seen_before |= predates_window)
+            .or_insert(predates_window);
+    }
+    if first_seen.is_empty() {
+        return Err(format!(
+            "no comparable native request IDs for {}",
+            session.id
+        ));
     }
 
     let mut in_window_native = 0usize;
     let mut carryover = 0usize;
     let mut missing = vec![];
-    for (rid, ts) in &first_seen {
-        if ts.as_str() >= window_start.as_str() {
+    for (rid, predates_window) in &first_seen {
+        if *predates_window {
+            carryover += 1;
+        } else {
             in_window_native += 1;
             if !captured.contains(rid) {
                 missing.push(rid.clone());
             }
-        } else {
-            carryover += 1;
         }
     }
     missing.sort();
@@ -828,6 +809,7 @@ pub fn coverage(vault: &Path, query: &str) -> Result<Coverage, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
 
     /// Build a minimal vault: meta index + dated session dir with turns.jsonl + a
     /// claude transcript. `envelopes` and `transcript` are raw file bodies.
@@ -855,8 +837,11 @@ mod tests {
     }
 
     fn envelope(observed_at: &str, request_id: &str) -> String {
+        envelope_for("claude-code", observed_at, request_id)
+    }
+    fn envelope_for(harness: &str, observed_at: &str, request_id: &str) -> String {
         format!(
-            r#"{{"observed_at":"{observed_at}","response":{{"headers":{{"request-id":"{request_id}"}}}}}}"#
+            r#"{{"harness":"{harness}","observed_at":"{observed_at}","response":{{"headers":{{"request-id":"{request_id}"}}}}}}"#
         )
     }
     fn assistant(ts: &str, request_id: &str) -> String {
@@ -918,6 +903,151 @@ mod tests {
         assert_eq!(c.in_window_native, 2);
         assert_eq!(c.missing, vec!["req_B".to_string()]);
         assert_eq!(c.pct(), 50.0);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn coverage_streams_mixed_generations_from_either_sibling() {
+        let raw = format!(
+            "{}\n{{\"harness\":\"claude-code\"",
+            envelope("2026-07-17T19:20:00.000Z", "req_C")
+        );
+        let transcript = ["req_A", "req_B", "req_C", "req_MISSING_1", "req_MISSING_2"]
+            .into_iter()
+            .enumerate()
+            .map(|(i, rid)| assistant(&format!("2026-07-17T19:{i:02}:00.000Z"), rid))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let root = coverage_fixture("mixed", true, &raw, &transcript);
+        let dir = root.join("2026/07/17/cov00000-0000-4000-8000-000000000000");
+        let sealed = dir.join("turns.jsonl.zst");
+        let sealed_body = format!(
+            "{}{}\n",
+            envelope("2026-07-17T19:00:00.000Z", "req_A"),
+            envelope("2026-07-17T19:10:00.000Z", "req_B"),
+        );
+        std::fs::write(
+            &sealed,
+            zstd::encode_all(sealed_body.as_bytes(), 1).unwrap(),
+        )
+        .unwrap();
+
+        for entry in [&dir.join("turns.jsonl"), &sealed] {
+            let mut ids = vec![];
+            vaultr::recon::for_each_envelope(entry, |env| {
+                if let Some(id) = env
+                    .pointer("/response/headers/request-id")
+                    .and_then(serde_json::Value::as_str)
+                {
+                    ids.push(id.to_string());
+                }
+            })
+            .unwrap();
+            assert_eq!(ids, ["req_A", "req_B", "req_C"]);
+        }
+
+        let c = coverage(&root, "cov00000").unwrap();
+        assert_eq!(c.captured, 3);
+        assert_eq!(
+            c.missing,
+            ["req_MISSING_1".to_string(), "req_MISSING_2".to_string()]
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn coverage_rejects_malformed_capture_evidence() {
+        let root = coverage_fixture(
+            "malformed",
+            false,
+            "",
+            &format!("{}\n", assistant("2026-07-17T19:00:00.000Z", "req_A")),
+        );
+        let sealed = root.join("2026/07/17/cov00000-0000-4000-8000-000000000000/turns.jsonl.zst");
+        std::fs::write(
+            sealed,
+            zstd::encode_all(&b"{\"harness\":\"claude-code\"\n"[..], 1).unwrap(),
+        )
+        .unwrap();
+        let err = coverage(&root, "cov00000").err().unwrap();
+        assert!(err.contains("sealed record 1"), "{err}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn coverage_rejects_unreadable_capture_evidence() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = coverage_fixture(
+            "unreadable",
+            false,
+            &(envelope("2026-07-17T19:00:00.000Z", "req_A") + "\n"),
+            &(assistant("2026-07-17T19:00:00.000Z", "req_A") + "\n"),
+        );
+        let raw = root.join("2026/07/17/cov00000-0000-4000-8000-000000000000/turns.jsonl");
+        std::fs::set_permissions(&raw, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let err = coverage(&root, "cov00000").err().unwrap();
+        std::fs::set_permissions(&raw, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(err.contains("open"), "{err}");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn coverage_rejects_codex_and_empty_denominators() {
+        let codex = coverage_fixture(
+            "codex",
+            false,
+            &(envelope_for("codex", "2026-07-17T19:00:00.000Z", "req_A") + "\n"),
+            "{\"type\":\"response_item\",\"timestamp\":\"2026-07-17T19:00:00.000Z\"}\n",
+        );
+        let err = coverage(&codex, "cov00000").err().unwrap();
+        assert!(err.contains("unsupported for Codex"), "{err}");
+        let _ = std::fs::remove_dir_all(codex);
+
+        let empty = coverage_fixture(
+            "empty",
+            false,
+            &(envelope("2026-07-17T19:00:00.000Z", "req_A") + "\n"),
+            "{\"type\":\"user\",\"timestamp\":\"2026-07-17T19:00:00.000Z\"}\n",
+        );
+        let err = coverage(&empty, "cov00000").err().unwrap();
+        assert!(err.contains("no comparable native request IDs"), "{err}");
+        let _ = std::fs::remove_dir_all(empty);
+    }
+
+    #[test]
+    fn coverage_streams_large_capture_and_transcript() {
+        const RECORDS: usize = 64;
+        const PADDING: usize = 1024 * 1024;
+        let root = coverage_fixture("large", false, "", "");
+        let dir = root.join("2026/07/17/cov00000-0000-4000-8000-000000000000");
+        let padding = "x".repeat(PADDING);
+        {
+            let mut capture =
+                std::io::BufWriter::new(std::fs::File::create(dir.join("turns.jsonl")).unwrap());
+            let mut transcript = std::io::BufWriter::new(
+                std::fs::File::create(root.join("transcript.jsonl")).unwrap(),
+            );
+            for i in 0..RECORDS {
+                writeln!(
+                    capture,
+                    r#"{{"harness":"claude-code","observed_at":"2026-07-17T19:00:00.000Z","padding":"{padding}","response":{{"headers":{{"request-id":"req_{i}"}}}}}}"#
+                )
+                .unwrap();
+                writeln!(
+                    transcript,
+                    r#"{{"type":"assistant","requestId":"req_{i}","timestamp":"2026-07-17T19:00:00.000Z","padding":"{padding}"}}"#
+                )
+                .unwrap();
+            }
+        }
+
+        let c = coverage(&root, "cov00000").unwrap();
+        assert_eq!(c.in_window_native, RECORDS);
+        assert_eq!(c.captured, RECORDS);
+        assert!(c.missing.is_empty());
         let _ = std::fs::remove_dir_all(root);
     }
 

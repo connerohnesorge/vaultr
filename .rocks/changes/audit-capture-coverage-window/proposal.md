@@ -54,11 +54,17 @@ of manufacturing phantom loss from resume carryover.
 - Report in-window coverage as `captured / in_window_native` with the residual
   missing `request-id`s listed, so a real gap is visible and a resume artifact
   is labeled as such.
+- Reuse Reconstruction's sealed-then-live-raw streaming Envelope traversal so
+  coverage includes every generation, preserves its strictness, and retains
+  memory only for the largest record and comparison ID sets.
+- Stream the native transcript, derive harness support from Envelope truth, and
+  fail explicitly for Codex or an empty comparable native-ID denominator.
 
 ## Impact
 
 - Affected specs: `capture-stewardship`
-- Affected code: `crates/plant/src/sweep.rs` (coverage computation),
+- Affected code: `crates/vaultr/src/recon.rs` (shared Envelope traversal),
+  `crates/plant/src/sweep.rs` (coverage computation),
   `crates/plant/src/main.rs` (subcommand wiring), focused tests
 - Related change: `update-capture-persistence-order` owns the in-window
   durability residual; this change only measures it, it does not repair it.

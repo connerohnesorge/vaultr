@@ -45,6 +45,29 @@ Deliberately **not** in scope (ponytail): no new daemon, no per-turn coverage
 metric on the hot path, no automatic remediation. One read-only subcommand over
 data already on disk.
 
+## Streaming evidence traversal
+
+Reconstruction owns the canonical capture read order and corruption policy:
+sealed Envelopes first, then the live raw sibling; every complete concatenated
+JSON value is visited; terminated malformed residue fails; and only one final
+unterminated live-raw fragment is tolerated. Expose that path as a closure-based
+Envelope stream and use it for both Reconstruction and coverage. Do not add a
+visitor trait or construct full reconstructed history for an ID-set audit.
+
+Coverage reads the native transcript through `BufRead`, retaining only distinct
+request IDs and their in-window classification. Capture and transcript memory is
+therefore bounded by the largest physical record plus the comparison ID sets,
+not by either file's decoded size. Any capture open, decode, or record error
+fails the audit instead of silently erasing evidence.
+
+## Harness support and denominator
+
+Envelope harness identity is wire truth. Codex has no comparable native
+`assistant.requestId` denominator, so the command fails explicitly instead of
+inventing a proxy. A Claude transcript with zero comparable native IDs also
+fails. The percentage function is reached only for a non-zero supported
+denominator, so `0/0` can never print as `100%`.
+
 ## ADRs
 
 ### ADR-0001: Coverage denominator is Plant's observation window, not the full transcript

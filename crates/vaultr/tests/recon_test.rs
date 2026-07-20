@@ -144,6 +144,11 @@ fn mixed_generations_reconstruct_from_either_sibling() {
     assert_eq!(from_sealed.messages, expected.messages);
     assert_eq!(from_raw.envelopes, 2);
     assert_eq!(from_sealed.envelopes, 2);
+    for entry in [&raw_path, &sealed_path] {
+        let mut seen = 0;
+        recon::for_each_envelope(entry, |_| seen += 1).unwrap();
+        assert_eq!(seen, 2, "streaming entry failed for {}", entry.display());
+    }
 
     fs::write(&sealed_path, "not zstd").unwrap();
     assert!(recon::reconstruct(&raw_path).is_err());
