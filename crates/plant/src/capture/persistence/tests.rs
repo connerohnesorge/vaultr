@@ -1,3 +1,4 @@
+use super::commit::{capture_tail, CaptureTail, RawGeneration};
 use super::*;
 
 fn test_dir(label: &str) -> PathBuf {
