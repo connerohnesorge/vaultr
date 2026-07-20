@@ -54,9 +54,12 @@ of manufacturing phantom loss from resume carryover.
 - Report in-window coverage as `captured / in_window_native` with the residual
   missing `request-id`s listed, so a real gap is visible and a resume artifact
   is labeled as such.
-- Reuse Reconstruction's sealed-then-live-raw streaming Envelope traversal so
-  coverage includes every generation, preserves its strictness, and retains
-  memory only for the largest record and comparison ID sets.
+- Reuse Reconstruction's retained sealed-to-detached-to-live-raw streaming
+  Envelope traversal so coverage includes every generation. Detached evidence
+  is omitted only when the same retained sealed handle proves that its committed
+  decoded suffix has the detached raw digest. The audit preserves
+  Reconstruction strictness and retains memory only for the largest record and
+  comparison ID sets.
 - Stream the native transcript, derive harness support from Envelope truth, and
   fail explicitly for Codex or an empty comparable native-ID denominator.
 
@@ -71,3 +74,9 @@ of manufacturing phantom loss from resume carryover.
   durability residual; this change only measures it, it does not repair it.
 - No change to the capture write path — measurement is read-only over Session
   Captures and the transcript.
+
+## Issue traceability
+
+- GitHub #28 and #29: the shared strict evidence traversal, explicit
+  denominator failures, and release self-test hardening are retained at this
+  exact tip (`7ca56aa`, `8fb2ee6`, and `f88278c`).

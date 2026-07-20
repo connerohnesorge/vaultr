@@ -48,11 +48,15 @@ data already on disk.
 ## Streaming evidence traversal
 
 Reconstruction owns the canonical capture read order and corruption policy:
-sealed Envelopes first, then the live raw sibling; every complete concatenated
-JSON value is visited; terminated malformed residue fails; and only one final
-unterminated live-raw fragment is tolerated. Expose that path as a closure-based
-Envelope stream and use it for both Reconstruction and coverage. Do not add a
-visitor trait or construct full reconstructed history for an ID-set audit.
+the retained sealed base first, then retained detached evidence, then the
+retained live raw generation. Detached evidence is skipped only when the same
+retained sealed handle proves that the suffix from the detached base through
+its captured length decodes to the detached raw digest. Every complete
+concatenated JSON value is visited; terminated malformed residue fails; and
+only one final unterminated live-raw fragment is tolerated. Expose that path as
+a closure-based Envelope stream and use it for both Reconstruction and
+coverage. Do not add a visitor trait or construct full reconstructed history
+for an ID-set audit.
 
 Coverage reads the native transcript through `BufRead`, retaining only distinct
 request IDs and their in-window classification. Capture and transcript memory is

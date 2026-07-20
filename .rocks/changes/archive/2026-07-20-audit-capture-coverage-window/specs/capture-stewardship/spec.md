@@ -9,13 +9,17 @@ compares captured Envelope response `request-id`s against the harness
 transcript's distinct assistant `requestId`s, restricted to Plant's observation
 window. The window start MUST be the earliest captured Envelope `observed_at`,
 falling back to the Capture's meta `original_start` when no Envelope exists.
-The audit MUST stream every sealed-then-live-raw Envelope generation in
-chronological generation order using Reconstruction's canonical traversal,
-including complete concatenated records and its live-tail/error semantics, no
-matter which canonical sibling is selected. It MUST stream the native
-transcript and retain memory bounded by the largest record plus comparison ID
-sets. Capture evidence that cannot be opened, decoded, or parsed under
-Reconstruction's rules MUST fail the audit.
+The audit MUST stream every retained sealed, detached, and live raw Envelope
+generation in chronological generation order using Reconstruction's canonical
+traversal, including complete concatenated records and its live-tail/error
+semantics, no matter which canonical sibling is selected. Detached evidence
+MUST contribute after the sealed base unless the same retained sealed handle
+proves that the suffix from the detached generation's recorded base through
+that handle's captured length decodes to the detached raw digest; only that
+proof MAY omit the detached handle as already committed. It MUST stream the
+native transcript and retain memory bounded by the largest record plus
+comparison ID sets. Capture evidence that cannot be opened, decoded, or parsed
+under Reconstruction's rules MUST fail the audit.
 Native `requestId`s whose first transcript occurrence precedes the window start
 MUST be reported as out-of-scope carryover (not as missing capture), and the
 audit MUST report in-window coverage as captured over in-window native together
@@ -37,11 +41,17 @@ Session Capture or transcript.
 - WHEN every in-window native `requestId` has a matching captured Envelope `request-id`
 - THEN coverage is reported as 100% with an empty residual missing list
 
-#### Scenario: Resumed capture has sealed and live raw generations
+#### Scenario: Resumed capture has sealed, detached, and live raw generations
 
-- WHEN a Capture has a sealed generation followed by a live raw generation
-- THEN both generations contribute in that order regardless of which canonical sibling is selected
+- WHEN a Capture has a sealed base, an unproven detached generation, and a newer live raw generation
+- THEN all three generations contribute in that order regardless of which canonical sibling is selected
 - AND complete concatenated records and the final live tail follow Reconstruction's behavior
+
+#### Scenario: Detached generation is already committed
+
+- WHEN the same retained sealed handle proves that its decoded suffix from the detached base has the detached raw digest
+- THEN the committed suffix contributes through the sealed handle
+- AND the detached handle is not visited a second time
 
 #### Scenario: Capture evidence is malformed or unreadable
 
