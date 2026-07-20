@@ -108,6 +108,10 @@ Recovery inventories only the staging hash for the canonical current root and
 the exact Session Capture paths returned by the shared explicit-error walker.
 Numeric date and session levels must be real directories, never symlinks, and
 every canonical discovered session must remain beneath the canonical root.
+An existing empty root is a successful empty inventory. A missing root or any
+unreadable root, numeric date level, directory entry, or generation is an
+operational error; eligibility, stuck detection, compression, and startup
+recovery propagate it rather than treating a partial walk as empty work.
 Each journal is parsed once into a retained `RecoverySession`; validation and
 application consume that same value rather than reopening mutable evidence.
 
@@ -247,6 +251,19 @@ Legacy Envelope files and concatenated zstd frames remain unchanged.
 Session Index updates and Herdr snapshots run once at durable stage acceptance,
 matching current response-finish timing. Their failures are logged separately
 and do not reclassify an accepted stage as lost.
+
+### Maintenance CLI outcome contract
+
+`plant sessions eligible` returns 0 only with a selected batch, 1 when the
+inventory is valid but empty, and 2 for inventory or claim failure. `plant
+sessions stuck` returns 0 when no actionable state exists, 1 when actionable
+stuck captures exist, and 2 for inventory failure. `plant compress once`
+returns 2 when listener ownership, recovery, or inventory fails and retains 1
+for an operational Sealing failure. At auxiliary Vault commit
+`348db602a22a87e9e25c440f0bd2a06178b12922`, retained at reviewed tip
+`dcc626fcccedccec5af9096d7580c9131473097b`, both learn wrappers convert only
+eligible status 1 to a benign no-work success and propagate status 2 without
+launching an agent; `jobs/learn-wrappers.test.ts` proves both consumers.
 
 ### Reconstruction
 

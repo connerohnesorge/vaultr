@@ -394,3 +394,166 @@ sealed Session Capture MUST fail on incomplete or malformed trailing content.
 
 - WHEN a sealed Session Capture contains incomplete or malformed trailing JSON
 - THEN Reconstruction fails instead of silently returning a partial history
+
+### Requirement: Fallible Session Capture maintenance inventory
+
+Vaultr MUST walk the Session Capture root through numeric year, month, and day
+directories and real session directories with explicit errors. An existing
+empty root MUST produce a complete empty inventory. A missing root, unreadable
+root or numeric date level, unreadable directory entry, symlinked date or
+session level, canonical escape, or unreadable/invalid generation MUST fail the
+inventory instead of returning a partial or empty result. Plant eligibility,
+stuck detection, compression, and startup recovery MUST propagate that failure
+without performing work based on an incomplete inventory. Non-numeric
+root/year/month/day entries MUST remain outside the Session Capture walk.
+
+Plant maintenance commands MUST distinguish domain outcomes from operational
+failures. `plant sessions eligible` MUST exit 0 only when it prints a selected
+batch, 1 when a complete inventory contains no eligible sessions, and 2 when
+inventory or claim publication fails. `plant sessions stuck` MUST exit 0 when a
+complete inventory has no actionable stuck capture, 1 when it reports an
+actionable stuck capture, and 2 when inventory fails. `plant compress once`
+MUST exit 0 after a successful no-op or sweep, 1 for an operational Sealing
+failure after ownership and recovery, and 2 when listener ownership, recovery,
+or inventory fails. Learn-job wrappers consuming `sessions eligible` MUST
+convert only status 1 to benign no-work success; they MUST propagate status 2
+without invoking `plant agent run`.
+
+#### Scenario: Existing root has no Session Captures
+
+- WHEN the Session Capture root exists and contains no numeric dated sessions
+- THEN maintenance receives a successful empty inventory
+
+#### Scenario: Session Capture root is missing
+
+- WHEN the configured Session Capture root does not exist
+- THEN maintenance fails with a location-bearing inventory error
+- AND it does not treat the missing root as no work
+
+#### Scenario: Numeric date traversal is unreadable
+
+- WHEN an otherwise eligible numeric year, month, or day directory cannot be read
+- THEN the walk fails without returning sessions found before the error
+- AND eligibility, stuck detection, compression, and recovery propagate the failure
+
+#### Scenario: Unsafe traversal level is present
+
+- WHEN a numeric date or session level is a symlink or canonicalizes outside the Session Capture root
+- THEN the walk fails before reading or mutating the target
+
+#### Scenario: Non-date content shares the root
+
+- WHEN metadata, notes, backups, or temporary directories do not form numeric year/month/day levels
+- THEN maintenance ignores them without treating them as Session Captures
+
+#### Scenario: Complete eligibility inventory has no work
+
+- WHEN `plant sessions eligible` successfully inventories the root but selects no sessions
+- THEN it exits 1 and prints no paths
+- AND a learn wrapper may convert that status to a successful no-work attempt
+
+#### Scenario: Eligibility inventory or claim fails
+
+- WHEN `plant sessions eligible` cannot complete inventory or durably publish its claim
+- THEN it exits 2 and prints no unclaimed paths
+- AND each learn wrapper propagates status 2 without launching an agent
+
+#### Scenario: Stuck inspection cannot complete inventory
+
+- WHEN `plant sessions stuck` encounters a maintenance inventory failure
+- THEN it exits 2 instead of reporting a healthy or actionable domain result
+
+#### Scenario: Compression cannot enter its ownership boundary
+
+- WHEN `plant compress once` cannot retain both listeners, recover capture state, or complete inventory
+- THEN it exits 2 without reporting a successful no-op or mutating from partial evidence
+
+## MODIFIED Requirements
+
+### Requirement: Stuck Session Capture detection
+
+Plant MUST classify every pending unsealed Session Capture generation idle for
+at least a configurable age (default 24 hours) by its ownership and
+learn-ledger state: `job-capture` when Plant registered it as a Cultivation Job
+self-capture, `seal-blocked` when every learner has ledgered the selected
+generation yet it remains unsealed, `half-learned` naming the missing learner
+when only a strict subset of learners ledgered the selected generation,
+`unlearned` when no learner ledgered it and it passes the learn substance gate,
+and `sub-threshold` when no learner ledgered it and it falls below the substance
+gate. A resumed raw generation beside older sealed or detached evidence MUST
+count a learner only when its latest ledger entry postdates that prior
+generation boundary. Detection MUST be read-only against Session Captures and
+MUST propagate maintenance inventory failures rather than returning a partial
+classification.
+
+#### Scenario: Sealing is failing on a fully learned capture
+
+- WHEN a pending Session Capture generation idle beyond the age threshold is ledgered by every learner
+- THEN it is reported as `seal-blocked`
+
+#### Scenario: One learner never processed a capture
+
+- WHEN a pending Session Capture generation idle beyond the age threshold is ledgered by only one learner
+- THEN it is reported as `half-learned` naming the missing learner
+
+#### Scenario: Learn never picked up a substantive capture
+
+- WHEN a pending Session Capture generation idle beyond the age threshold has no ledger entry and passes the substance gate
+- THEN it is reported as `unlearned`
+
+#### Scenario: Capture below the substance gate
+
+- WHEN a pending Session Capture generation idle beyond the age threshold has no ledger entry and falls below the substance gate
+- THEN it is reported as `sub-threshold`
+
+#### Scenario: Cultivation Job self-capture is informational
+
+- WHEN an idle pending Session Capture is registered as a Plant Cultivation Job self-capture
+- THEN it is reported as `job-capture`
+- AND it is not actionable for learn dispatch or watchdog failure
+
+#### Scenario: Resumed generation needs fresh learning
+
+- WHEN a raw generation exists beside an older sealed or detached generation and a learner's latest ledger entry does not postdate that boundary
+- THEN that learner is missing for the raw generation's classification
+
+#### Scenario: Active and sealed captures are exempt
+
+- WHEN a pending Session Capture generation was modified within the age threshold, or a Session Capture is already sealed with no pending generation
+- THEN it is not reported
+
+#### Scenario: Stuck inventory is incomplete
+
+- WHEN a missing, unreadable, or unsafe traversal level prevents a complete maintenance inventory
+- THEN detection fails instead of returning the captures found before the error
+
+### Requirement: Watchdog Cultivation Job
+
+Plant MUST run a `watchdog` Cultivation Job every 6 hours that invokes the
+shared stuck detection and records the outcome: `failed` with deterministic
+per-state counts when any `seal-blocked`, `half-learned`, or `unlearned`
+capture exists, otherwise `success`. Sub-threshold and `job-capture` captures
+MUST be counted in the recorded detail but MUST NOT fail the job. An inventory
+failure MUST fail the job and MUST NOT be recorded as a healthy pipeline. The
+job launches no agent pane and writes nothing to Session Captures.
+
+#### Scenario: Actionable stuck captures exist
+
+- WHEN detection finds at least one seal-blocked, half-learned, or unlearned capture
+- THEN the job logs one line per stuck capture and records `failed` with deterministic per-state counts
+
+#### Scenario: Only informational captures exist
+
+- WHEN detection finds only sub-threshold or job-capture entries
+- THEN the job records `success` with each informational count in the detail
+
+#### Scenario: Pipeline is healthy
+
+- WHEN detection finds nothing stuck
+- THEN the job records `success`
+
+#### Scenario: Watchdog inventory fails
+
+- WHEN stuck detection cannot complete the maintenance inventory
+- THEN the command exits 2 and the watchdog records `failed`
+- AND it does not emit a healthy summary from partial evidence

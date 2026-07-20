@@ -28,6 +28,11 @@ must reconcile that durable backlog before new capture or Sealing begins.
   compression, and run scheduled compression in-process in the owning daemon.
 - Propagate shared maintenance traversal failures through every caller instead
   of treating an incomplete inventory as successful work.
+- Preserve the maintenance CLI contract: status 1 is a domain result (no
+  eligible sessions, actionable stuck captures, or a Sealing failure), while
+  missing/unreadable inventory, claim, ownership, or recovery failures return
+  status 2. The reviewed Vault learn wrappers swallow only eligible status 1
+  and propagate status 2 without launching an agent.
 - Keep Session Index and Herdr snapshot timing at durable stage acceptance.
 - Make Reconstruction recover complete concatenated legacy Envelopes while
   rejecting unrecoverable terminated records and malformed sealed tails, and
@@ -60,3 +65,9 @@ must reconcile that durable backlog before new capture or Sealing begins.
   mixed-generation Reconstruction evidence
 - Existing proposals: distinct from draft PR #12, whose Plant generation
   lifecycle was superseded by merged PR #14
+- Auxiliary implementation: GitLab `COHNESOR/vault` commit
+  `348db602a22a87e9e25c440f0bd2a06178b12922` added both corrected learn
+  wrappers and `jobs/learn-wrappers.test.ts`; reviewed tip
+  `dcc626fcccedccec5af9096d7580c9131473097b` retains them and is the second
+  parent of merged remote-main commit
+  `91876b8e7899d92f17458299de4c13d60ada5439`.
