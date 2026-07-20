@@ -9,7 +9,7 @@ use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Harness identity of a capture, derived once during reconstruction.
 ///
@@ -57,45 +57,109 @@ pub struct Recon {
     pub envelopes: usize,
 }
 
+fn detached_generation(dir: &Path) -> Result<Option<(PathBuf, u64)>> {
+    let mut found = None;
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("read session directory {}", dir.display()))?
+    {
+        let path = entry
+            .with_context(|| format!("read session entry under {}", dir.display()))?
+            .path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(rest) = name.strip_prefix("turns.jsonl.sealing-") else {
+            continue;
+        };
+        let Some((base_len, digest)) = rest.split_once('-') else {
+            anyhow::bail!(
+                "reconstruct: invalid detached generation at {}",
+                path.display()
+            );
+        };
+        let base_len = base_len.parse::<u64>().with_context(|| {
+            format!(
+                "reconstruct: invalid detached generation at {}",
+                path.display()
+            )
+        })?;
+        if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+            anyhow::bail!(
+                "reconstruct: invalid detached generation at {}",
+                path.display()
+            );
+        }
+        if found.is_some() {
+            anyhow::bail!(
+                "reconstruct: multiple detached generations in {}",
+                dir.display()
+            );
+        }
+        found = Some((path, base_len));
+    }
+    Ok(found)
+}
+
 /// Reconstruct from a capture file path (`.zst` handled transparently).
 ///
-/// A resumed capture can have a sealed generation followed by a raw one.
-/// Entering through either canonical sibling reconstructs both in that order.
+/// A resumed capture can have sealed, detached-sealing, and live raw
+/// generations. Entering through any canonical sibling reconstructs each
+/// generation exactly once in that order.
 pub fn reconstruct(path: &Path) -> Result<Recon> {
-    let sibling = match path.file_name().and_then(|name| name.to_str()) {
-        Some("turns.jsonl") => Some(path.with_file_name("turns.jsonl.zst")),
-        Some("turns.jsonl.zst") => Some(path.with_file_name("turns.jsonl")),
-        _ => None,
-    };
-    if let Some(sibling) = sibling {
-        if sibling
-            .try_exists()
-            .with_context(|| format!("inspect {}", sibling.display()))?
-        {
-            let (sealed, raw) =
-                if path.file_name().and_then(|name| name.to_str()) == Some("turns.jsonl.zst") {
-                    (path, sibling.as_path())
-                } else {
-                    (sibling.as_path(), path)
-                };
-            let sealed =
-                File::open(sealed).with_context(|| format!("open {}", sealed.display()))?;
-            let raw = File::open(raw).with_context(|| format!("open {}", raw.display()))?;
-            let dec = zstd::Decoder::new(sealed).context("zstd decoder")?;
-            // Sealed generation is strict; the trailing raw generation is the
-            // live tail (one unterminated final fragment tolerated). Shared state
-            // so the raw deltas continue the sealed history.
-            let mut st = ReconState::new();
+    let name = path.file_name().and_then(|name| name.to_str());
+    let canonical = matches!(name, Some("turns.jsonl" | "turns.jsonl.zst"))
+        || name.is_some_and(|name| name.starts_with("turns.jsonl.sealing-"));
+    if canonical {
+        let dir = path.parent().unwrap_or_else(|| Path::new(""));
+        let sealed = dir.join("turns.jsonl.zst");
+        let raw = dir.join("turns.jsonl");
+        let detached = detached_generation(dir)?;
+        let mut st = ReconState::new();
+
+        let sealed_len = match std::fs::metadata(&sealed) {
+            Ok(meta) => Some(meta.len()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e).with_context(|| format!("inspect {}", sealed.display())),
+        };
+        if let Some(len) = sealed_len {
+            let file = File::open(&sealed).with_context(|| format!("open {}", sealed.display()))?;
+            let dec = zstd::Decoder::new(file).context("zstd decoder")?;
             run_segment(BufReader::new(dec), Segment::Sealed, &mut st)?;
-            run_segment(BufReader::new(raw), Segment::LiveRaw, &mut st)?;
-            return Ok(st.finish());
+            if let Some((_, base_len)) = &detached {
+                if len < *base_len {
+                    anyhow::bail!(
+                        "reconstruct: sealed destination shorter than detached base at {}",
+                        sealed.display()
+                    );
+                }
+            }
         }
+        if let Some((detached, base_len)) = detached {
+            if base_len > 0 && sealed_len.is_none() {
+                anyhow::bail!(
+                    "reconstruct: detached generation has no sealed base at {}",
+                    sealed.display()
+                );
+            }
+            if sealed_len.unwrap_or(0) == base_len {
+                let file = File::open(&detached)
+                    .with_context(|| format!("open {}", detached.display()))?;
+                run_segment(BufReader::new(file), Segment::Sealed, &mut st)?;
+            }
+        }
+        if raw
+            .try_exists()
+            .with_context(|| format!("inspect {}", raw.display()))?
+        {
+            let file = File::open(&raw).with_context(|| format!("open {}", raw.display()))?;
+            run_segment(BufReader::new(file), Segment::LiveRaw, &mut st)?;
+        }
+        return Ok(st.finish());
     }
 
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
     let mut st = ReconState::new();
     if path.extension().and_then(|e| e.to_str()) == Some("zst") {
-        // A lone sealed capture is fully terminated: strict.
         let dec = zstd::Decoder::new(file).context("zstd decoder")?;
         run_segment(BufReader::new(dec), Segment::Sealed, &mut st)?;
     } else {

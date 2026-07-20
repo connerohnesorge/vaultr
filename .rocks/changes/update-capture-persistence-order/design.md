@@ -12,9 +12,9 @@ journal; sequencing starts lazily on the first new reservation.
 
 A `capture.rs`-private per-session async mutex, keyed by canonical Session
 Capture root plus session id, serializes journal mutation, stage publication,
-and eligible draining. It is never held across upstream response streaming.
-Cross-process locking is not added without evidence that multiple Plant
-instances write the same vault concurrently.
+eligible draining, and raw-generation detachment. It is never held across
+upstream response streaming. Cross-process locking is not added; complete
+ownership of both existing listeners is the process-ownership boundary.
 
 ### Completed stage files
 
@@ -47,10 +47,16 @@ Persisted line order remains the Envelope contract. Preparation sequence is not
 added to the public Envelope schema; `request_id` is the idempotency identity.
 No global duplicate scan is introduced.
 
-### Startup recovery
+### Daemon ownership and startup recovery
 
-Plant recovers every staged session before binding proxy ports or permitting
-Sealing:
+Plant binds and retains both proxy listeners before recovery. A partial bind is
+released immediately. An address collision exits zero only when both health
+endpoints identify the expected Plant harness and upstream; a partial or
+unrecognized owner fails nonzero. Recovery and the scheduler therefore run only
+in the process that owns both harnesses.
+
+Recovery inventories only the staging hash for the canonical current root and
+the exact Session Capture paths returned by the shared explicit-error walker:
 
 - Every pre-restart reservation without a completed matching stage becomes an
   explicit incomplete Envelope at its reserved position, preserving the real
@@ -67,10 +73,33 @@ Sealing:
   and fail startup.
 - Missing ordering fields default to an empty journal only when no private stage
   backlog exists.
+- Journals and stages must have valid object shapes and matching root, sequence,
+  request, Session, and Envelope identity.
+- A discovered journal is recovered at its exact path; metadata is never used to
+  invent a replacement dated directory.
+- A retired stage is removed only when it exactly matches the final committed
+  Envelope. Cleanup errors fail startup while leaving evidence retryable.
+- Abandoned incomplete Envelopes use the same exact-complete/prefix-tail
+  reconciliation as completed stages.
 
-`compress_sweep` consults a narrow crate-private Capture predicate and skips a
-raw generation with open reservations or completed stages. Journal and staging
-details do not become a public watchdog/session state.
+### Immutable generation Sealing
+
+`compress_sweep` enters a narrow crate-private Capture transaction. Under the
+session mutex it rechecks the journal and stage backlog, scrubs the closed raw
+file, hashes it, and renames it to
+`turns.jsonl.sealing-<prior-zstd-length>-<sha256>`. New captures then create a
+fresh `turns.jsonl` without touching the detached generation.
+
+Sealing regenerates the detached generation's zstd frame. The prior destination
+length identifies the commit boundary: a destination at that length is
+uncommitted; a destination whose exact suffix is the regenerated frame is the
+post-rename/pre-detached-removal state and only needs cleanup; any other state
+fails without deleting evidence. Reconstruction reads sealed, detached, and
+new live raw generations in order, omitting detached bytes only when the sealed
+destination has already advanced past the recorded boundary.
+
+The detached filename and location diagnostics contain no captured content.
+Legacy Envelope files and concatenated zstd frames remain unchanged.
 
 Session Index updates and Herdr snapshots run once at durable stage acceptance,
 matching current response-finish timing. Their failures are logged separately
@@ -108,7 +137,9 @@ preparation order differ in practice.
 
 - Goals: preserve delta lineage, prevent concurrent append interleaving, retain
   completed evidence across Plant process crashes, recover abandoned requests
-  without inventing responses, and read historical concatenated records.
+  without inventing responses, seal each immutable generation exactly once,
+  require complete daemon ownership before recovery, and read historical
+  concatenated records.
 - Non-Goals: a new trait, public Interface, Module, Adapter, generic queue,
   Envelope sequence field, live gap timeout, public watchdog state,
   cross-process locking, vault-move migration, or clone/cache optimization.
@@ -138,15 +169,20 @@ preparation order differ in practice.
 - Corrupt journal/stage combinations can prevent Plant startup. Failing closed
   preserves evidence and is preferable to silently guessing delta order.
 - A moved vault leaves private stages keyed to its old canonical path. Vault
-  moves are not a current requirement; recovery reports the mismatch.
+  moves are not a current requirement; current-root recovery does not process
+  the other root's evidence.
 - Additional journal writes add local I/O. Per-request sync is intentionally
   excluded to avoid an unmeasured hot-path durability cost.
+- Scrubbing and hashing run while the session mutex is held so the renamed
+  generation is immutable. Response streaming remains unlocked; only completion
+  for that session waits at the final persistence boundary.
 
 ## Migration Plan
 
 - Do not eagerly rewrite existing Session Captures or `state.json` files.
 - Initialize ordering fields lazily while preserving the existing delta base.
 - Read historical concatenated records through Reconstruction compatibility.
+- Resume any existing detached generation before considering a newer raw file.
 - Before rolling back to an older Plant, drain all journals and verify the
   private stage tree is empty; older code may then ignore additive state fields.
 

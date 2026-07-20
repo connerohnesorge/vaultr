@@ -165,6 +165,39 @@ fn read_order(state: &Map<String, Value>) -> CaptureOrder {
         .unwrap_or_default()
 }
 
+fn read_state_strict(path: &Path) -> Result<Map<String, Value>, String> {
+    let text = fs::read_to_string(path)
+        .map_err(|e| format!("capture recovery: read {}: {e}", path.display()))?;
+    match serde_json::from_str::<Value>(&text) {
+        Ok(Value::Object(state)) => Ok(state),
+        Ok(_) => Err(format!(
+            "capture recovery: journal {} is not a JSON object",
+            path.display()
+        )),
+        Err(e) => Err(format!(
+            "capture recovery: parse journal {}: {e}",
+            path.display()
+        )),
+    }
+}
+
+fn read_order_strict(
+    state: &Map<String, Value>,
+    journal: &Path,
+) -> Result<Option<CaptureOrder>, String> {
+    let Some(value) = state.get("capture_order") else {
+        return Ok(None);
+    };
+    serde_json::from_value(value.clone())
+        .map(Some)
+        .map_err(|e| {
+            format!(
+                "capture recovery: invalid capture_order in {}: {e}",
+                journal.display()
+            )
+        })
+}
+
 /// Persist a state map with the given ordering journal, atomically.
 fn persist_state(
     dir: &Path,
@@ -267,10 +300,16 @@ fn reconcile_append(turns: &Path, env: &Value) -> Result<(), String> {
 
 /// True when a session has an open reservation or undrained completed stage —
 /// its raw generation must not be sealed yet. Crate-private; no public state.
+#[cfg(test)]
 pub(crate) fn has_open_capture(vault: &Path, sid: &str) -> bool {
     let Ok(dir) = session_dir(vault, sid) else {
         return false;
     };
+    has_open_capture_at(vault, sid, &dir)
+}
+
+#[cfg(test)]
+fn has_open_capture_at(vault: &Path, sid: &str, dir: &Path) -> bool {
     let order = read_order(&read_state(&dir));
     if order.next_to_drain < order.next_sequence {
         return true;
@@ -279,6 +318,147 @@ pub(crate) fn has_open_capture(vault: &Path, sid: &str) -> bool {
     fs::read_dir(&sdir)
         .map(|mut r| r.next().is_some())
         .unwrap_or(false)
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct DetachedGeneration {
+    pub path: PathBuf,
+    pub base_len: u64,
+}
+
+fn detached_generation(dir: &Path) -> Result<Option<DetachedGeneration>, String> {
+    let entries = fs::read_dir(dir)
+        .map_err(|e| format!("inspect detached generation {}: {e}", dir.display()))?;
+    let mut found = None;
+    for entry in entries {
+        let path = entry
+            .map_err(|e| format!("inspect detached generation {}: {e}", dir.display()))?
+            .path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(rest) = name.strip_prefix("turns.jsonl.sealing-") else {
+            continue;
+        };
+        let Some((base_len, digest)) = rest.split_once('-') else {
+            return Err(format!(
+                "invalid detached generation name at {}",
+                path.display()
+            ));
+        };
+        let base_len = base_len.parse::<u64>().map_err(|_| {
+            format!(
+                "invalid detached generation base length at {}",
+                path.display()
+            )
+        })?;
+        if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!(
+                "invalid detached generation digest at {}",
+                path.display()
+            ));
+        }
+        if found.is_some() {
+            return Err(format!(
+                "multiple detached generations under {}",
+                dir.display()
+            ));
+        }
+        found = Some(DetachedGeneration { path, base_len });
+    }
+    Ok(found)
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut file =
+        fs::File::open(path).map_err(|e| format!("hash generation {}: {e}", path.display()))?;
+    let mut hash = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .map_err(|e| format!("hash generation {}: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hash.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hash.finalize()))
+}
+
+/// Under the same per-session mutex as capture completion, recheck that the
+/// current raw generation is closed and atomically detach it. A prior detached
+/// generation is resumed before any newer raw generation is considered.
+pub(crate) async fn detach_generation(
+    vault: &Path,
+    sid: &str,
+    dir: &Path,
+) -> Result<Option<DetachedGeneration>, String> {
+    let root = canonical_root(vault);
+    let lock = session_lock(&root, sid);
+    let _guard = lock.lock().await;
+
+    if let Some(detached) = detached_generation(dir)? {
+        let expected = detached
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.rsplit_once('-'))
+            .map(|(_, digest)| digest)
+            .unwrap_or_default();
+        if sha256_file(&detached.path)? != expected {
+            return Err(format!(
+                "detached generation digest mismatch at {}",
+                detached.path.display()
+            ));
+        }
+        return Ok(Some(detached));
+    }
+
+    let journal = dir.join("state.json");
+    let order = if journal.exists() {
+        let state = read_state_strict(&journal)?;
+        read_order_strict(&state, &journal)?.unwrap_or_default()
+    } else {
+        CaptureOrder::default()
+    };
+    let staged = match fs::read_dir(staging_dir(&root, sid)) {
+        Ok(mut entries) => entries
+            .next()
+            .transpose()
+            .map_err(|e| {
+                format!(
+                    "inspect capture stages for {sid} under {}: {e}",
+                    staging_dir(&root, sid).display()
+                )
+            })?
+            .is_some(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            return Err(format!(
+                "inspect capture stages for {sid} under {}: {e}",
+                staging_dir(&root, sid).display()
+            ))
+        }
+    };
+    if order.next_to_drain < order.next_sequence || staged {
+        return Ok(None);
+    }
+
+    let raw = dir.join("turns.jsonl");
+    if !raw.is_file() {
+        return Ok(None);
+    }
+    if !crate::sweep::scrub(&raw).await {
+        return Err(format!("scrub generation failed at {}", raw.display()));
+    }
+    let digest = sha256_file(&raw)?;
+    let base_len = fs::metadata(dir.join("turns.jsonl.zst"))
+        .map(|meta| meta.len())
+        .unwrap_or(0);
+    let path = dir.join(format!("turns.jsonl.sealing-{base_len}-{digest}"));
+    fs::rename(&raw, &path).map_err(|e| format!("detach generation {}: {e}", raw.display()))?;
+    Ok(Some(DetachedGeneration { path, base_len }))
 }
 
 /// ISO-8601 UTC with milliseconds, matching JS Date.toISOString().
@@ -557,106 +737,374 @@ fn drain(dir: &Path, root: &str, sid: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Recover every ordering journal and completed stage before Plant accepts proxy
-/// traffic or permits Sealing. Preserves every real request delta, invents no
-/// response output, and fails startup (leaving persisted bytes unchanged) on any
-/// journal / identity / persisted-tail conflict.
-pub fn recover_all(vault: &Path) -> Result<(), String> {
-    let root = canonical_root(vault);
-    let mut sessions: BTreeSet<String> = BTreeSet::new();
+struct StageEvidence {
+    path: PathBuf,
+    envelope: Value,
+}
 
-    // Sessions with staged completed evidence (the durable-evidence index).
-    let base = staging_base();
-    if base.is_dir() {
-        for hash_entry in fs::read_dir(&base).into_iter().flatten().flatten() {
-            for sid_entry in fs::read_dir(hash_entry.path())
-                .into_iter()
-                .flatten()
-                .flatten()
-            {
-                if let Some(sid) = sid_entry.file_name().to_str() {
-                    sessions.insert(sid.to_string());
-                }
-            }
-        }
+fn validate_order(
+    state: &Map<String, Value>,
+    order: &CaptureOrder,
+    journal: &Path,
+    root: &str,
+    sid: &str,
+) -> Result<(), String> {
+    if state.get("session_id").and_then(Value::as_str) != Some(sid) {
+        return Err(format!(
+            "capture recovery: journal identity mismatch at {}",
+            journal.display()
+        ));
     }
-    // Unsealed sessions whose journal still has open reservations (abandoned
-    // preparations may have no stage at all). Bounded to raw, recent captures.
-    for (sid, sess) in vaultr::vault::walk_session_dirs(vault) {
-        if !sess.join("state.json").is_file() {
-            continue;
-        }
-        let order = read_order(&read_state(&sess));
-        if order.next_to_drain < order.next_sequence {
-            sessions.insert(sid);
-        }
+    if order.root != root {
+        return Err(format!(
+            "capture recovery: journal vault-identity mismatch at {}",
+            journal.display()
+        ));
     }
-
-    for sid in sessions {
-        recover_session(vault, &root, &sid)?;
+    if order.next_to_drain > order.next_sequence {
+        return Err(format!(
+            "capture recovery: invalid sequence bounds at {}",
+            journal.display()
+        ));
+    }
+    if order
+        .pending
+        .keys()
+        .any(|seq| *seq < order.next_to_drain || *seq >= order.next_sequence)
+    {
+        return Err(format!(
+            "capture recovery: pending sequence outside journal bounds at {}",
+            journal.display()
+        ));
+    }
+    for seq in order.next_to_drain..order.next_sequence {
+        let Some(request) = order.pending.get(&seq) else {
+            return Err(format!(
+                "capture recovery: journal {} missing request for sequence {seq}",
+                journal.display()
+            ));
+        };
+        if request.get("session_id").and_then(Value::as_str) != Some(sid)
+            || request.get("request_id").and_then(Value::as_str).is_none()
+        {
+            return Err(format!(
+                "capture recovery: invalid request identity in {} sequence {seq}",
+                journal.display()
+            ));
+        }
     }
     Ok(())
 }
 
-fn recover_session(vault: &Path, root: &str, sid: &str) -> Result<(), String> {
-    let dir = session_dir(vault, sid).map_err(|e| e.to_string())?;
-    let sdir = staging_dir(root, sid);
-    let staged_any = fs::read_dir(&sdir)
-        .map(|mut r| r.next().is_some())
-        .unwrap_or(false);
-    // A stage with no readable journal must not be guessed at.
-    if staged_any && !dir.join("state.json").is_file() {
-        return Err(format!(
-            "capture recovery: staged session {sid} has no journal at {}",
-            dir.display()
-        ));
+fn read_stages(
+    sdir: &Path,
+    root: &str,
+    sid: &str,
+    order: &CaptureOrder,
+) -> Result<BTreeMap<u64, StageEvidence>, String> {
+    if !sdir.exists() {
+        return Ok(BTreeMap::new());
     }
+    let entries = fs::read_dir(sdir).map_err(|e| {
+        format!(
+            "capture recovery: read stage directory {}: {e}",
+            sdir.display()
+        )
+    })?;
+    let mut stages = BTreeMap::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|e| format!("capture recovery: read stage entry {}: {e}", sdir.display()))?
+            .path();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| format!("capture recovery: invalid stage name at {}", path.display()))?;
+        let stem = name.strip_suffix(".json").ok_or_else(|| {
+            format!(
+                "capture recovery: unexpected stage entry at {}",
+                path.display()
+            )
+        })?;
+        let (sequence, file_request_id) = stem
+            .split_once('-')
+            .ok_or_else(|| format!("capture recovery: invalid stage name at {}", path.display()))?;
+        let sequence = sequence.parse::<u64>().map_err(|_| {
+            format!(
+                "capture recovery: invalid stage sequence at {}",
+                path.display()
+            )
+        })?;
+        let text = fs::read_to_string(&path)
+            .map_err(|e| format!("capture recovery: read stage {}: {e}", path.display()))?;
+        let doc: Value = serde_json::from_str(&text)
+            .map_err(|e| format!("capture recovery: parse stage {}: {e}", path.display()))?;
+        if doc.get("root").and_then(Value::as_str) != Some(root)
+            || doc.get("sequence").and_then(Value::as_u64) != Some(sequence)
+        {
+            return Err(format!(
+                "capture recovery: stage root or sequence mismatch at {}",
+                path.display()
+            ));
+        }
+        let request_id = doc
+            .get("request_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                format!(
+                    "capture recovery: stage missing request identity at {}",
+                    path.display()
+                )
+            })?;
+        let envelope = doc.get("envelope").cloned().ok_or_else(|| {
+            format!(
+                "capture recovery: stage missing envelope at {}",
+                path.display()
+            )
+        })?;
+        if request_id != file_request_id
+            || envelope.get("request_id").and_then(Value::as_str) != Some(request_id)
+            || envelope.get("session_id").and_then(Value::as_str) != Some(sid)
+        {
+            return Err(format!(
+                "capture recovery: stage envelope identity mismatch at {}",
+                path.display()
+            ));
+        }
+        if sequence >= order.next_to_drain {
+            let request = order.pending.get(&sequence).ok_or_else(|| {
+                format!(
+                    "capture recovery: stage sequence outside journal at {}",
+                    path.display()
+                )
+            })?;
+            let request_obj = request.as_object().ok_or_else(|| {
+                format!(
+                    "capture recovery: invalid pending request for stage {}",
+                    path.display()
+                )
+            })?;
+            if request_obj
+                .iter()
+                .any(|(key, value)| envelope.get(key) != Some(value))
+            {
+                return Err(format!(
+                    "capture recovery: stage does not match journal request at {}",
+                    path.display()
+                ));
+            }
+        }
+        if stages
+            .insert(sequence, StageEvidence { path, envelope })
+            .is_some()
+        {
+            return Err(format!(
+                "capture recovery: duplicate stage sequence {sequence} under {}",
+                sdir.display()
+            ));
+        }
+    }
+    Ok(stages)
+}
+
+/// Recover every ordering journal and completed stage before Plant accepts proxy
+/// traffic or permits Sealing. Inventory is bounded to the canonical current
+/// root and retains each discovered evidence path through reconciliation.
+pub fn recover_all(vault: &Path) -> Result<(), String> {
+    let root = canonical_root(vault);
+    let mut dirs = BTreeMap::new();
+    let mut sessions = BTreeSet::new();
+    for (sid, dir) in vaultr::vault::walk_session_dirs(vault).map_err(|e| e.to_string())? {
+        if dirs.insert(sid.clone(), dir.clone()).is_some() {
+            return Err(format!(
+                "capture recovery: duplicate session {sid} under {}",
+                vault.display()
+            ));
+        }
+        let journal = dir.join("state.json");
+        if !journal.exists() {
+            continue;
+        }
+        let state = read_state_strict(&journal)?;
+        if let Some(order) = read_order_strict(&state, &journal)? {
+            validate_order(&state, &order, &journal, &root, &sid)?;
+            if order.next_to_drain < order.next_sequence {
+                sessions.insert(sid);
+            }
+        }
+    }
+
+    let hash_dir = staging_base().join(sha256_hex(root.as_bytes()));
+    if hash_dir.exists() {
+        let entries = fs::read_dir(&hash_dir).map_err(|e| {
+            format!(
+                "capture recovery: read current-root staging {}: {e}",
+                hash_dir.display()
+            )
+        })?;
+        for entry in entries {
+            let path = entry
+                .map_err(|e| {
+                    format!(
+                        "capture recovery: read current-root staging {}: {e}",
+                        hash_dir.display()
+                    )
+                })?
+                .path();
+            if !path.is_dir() {
+                return Err(format!(
+                    "capture recovery: unexpected current-root stage entry at {}",
+                    path.display()
+                ));
+            }
+            let sid = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| {
+                    format!(
+                        "capture recovery: invalid staged session name at {}",
+                        path.display()
+                    )
+                })?
+                .to_string();
+            sessions.insert(sid);
+        }
+    }
+
+    // Validate every current-root journal and stage before reconciling any of
+    // them, so malformed inventory cannot hide behind an earlier mutation.
+    for sid in &sessions {
+        let dir = dirs.get(sid).ok_or_else(|| {
+            format!(
+                "capture recovery: staged session {sid} has no discovered session directory under {}",
+                vault.display()
+            )
+        })?;
+        let journal = dir.join("state.json");
+        let state = read_state_strict(&journal)?;
+        let order = read_order_strict(&state, &journal)?.ok_or_else(|| {
+            format!(
+                "capture recovery: staged session {sid} has no capture_order in {}",
+                journal.display()
+            )
+        })?;
+        validate_order(&state, &order, &journal, &root, sid)?;
+        read_stages(&staging_dir(&root, sid), &root, sid, &order)?;
+    }
+
+    for sid in sessions {
+        let dir = dirs.get(&sid).expect("validated recovery session path");
+        recover_session(dir, &root, &sid)?;
+    }
+    Ok(())
+}
+
+fn recover_session(dir: &Path, root: &str, sid: &str) -> Result<(), String> {
+    let journal = dir.join("state.json");
+    let mut state = read_state_strict(&journal)?;
+    let mut order = read_order_strict(&state, &journal)?.ok_or_else(|| {
+        format!(
+            "capture recovery: staged session {sid} has no capture_order in {}",
+            journal.display()
+        )
+    })?;
+    validate_order(&state, &order, &journal, root, sid)?;
+
+    let sdir = staging_dir(root, sid);
+    let mut stages = read_stages(&sdir, root, sid, &order)?;
     let turns = dir.join("turns.jsonl");
-    let mut order = read_order(&read_state(&dir));
+
+    let retired: Vec<u64> = stages
+        .keys()
+        .copied()
+        .take_while(|seq| *seq < order.next_to_drain)
+        .collect();
+    for seq in retired {
+        let stage = stages.remove(&seq).unwrap();
+        let serialized = serde_json::to_string(&stage.envelope).map_err(|e| e.to_string())?;
+        let matches = last_line(&turns, serialized.len() + 4096)?
+            .and_then(|(line, terminated, _)| {
+                terminated
+                    .then(|| serde_json::from_str::<Value>(&line).ok())
+                    .flatten()
+            })
+            .is_some_and(|envelope| envelope == stage.envelope);
+        if !matches || seq + 1 != order.next_to_drain {
+            return Err(format!(
+                "capture recovery: retired stage does not match committed evidence at {}",
+                stage.path.display()
+            ));
+        }
+        fs::remove_file(&stage.path).map_err(|e| {
+            format!(
+                "capture recovery: remove retired stage {}: {e}",
+                stage.path.display()
+            )
+        })?;
+    }
+
     let mut seq = order.next_to_drain;
     while seq < order.next_sequence {
-        match find_stage(root, sid, seq) {
-            Some(stage_path) => {
-                let doc: Value = serde_json::from_str(
-                    &fs::read_to_string(&stage_path).map_err(|e| e.to_string())?,
-                )
-                .map_err(|e| e.to_string())?;
-                if let Some(sroot) = doc.get("root").and_then(Value::as_str) {
-                    if sroot != root {
-                        return Err(format!(
-                            "capture recovery: stage vault-identity mismatch for {sid} seq {seq}"
-                        ));
-                    }
-                }
-                let env = doc.get("envelope").cloned().ok_or_else(|| {
-                    format!("capture recovery: stage {sid} seq {seq} has no envelope")
-                })?;
-                reconcile_append(&turns, &env)?;
-                order.next_to_drain = seq + 1;
-                order.pending.remove(&seq);
-                persist_state(&dir, read_state(&dir), &order)?;
-                let _ = fs::remove_file(&stage_path);
-            }
+        let stage = stages.remove(&seq);
+        let env = match &stage {
+            Some(stage) => stage.envelope.clone(),
             None => {
-                // Abandoned reservation: materialize the real request delta as an
-                // incomplete Envelope. No synthesized response output.
-                if let Some(req_half) = order.pending.get(&seq).cloned() {
-                    let mut env = req_half;
-                    if let Some(o) = env.as_object_mut() {
-                        o.insert("response".into(), json!({ "complete": false }));
-                    }
-                    append_line(&turns, &env)?;
-                }
-                order.next_to_drain = seq + 1;
-                order.pending.remove(&seq);
-                persist_state(&dir, read_state(&dir), &order)?;
+                let mut env = order.pending.get(&seq).cloned().ok_or_else(|| {
+                    format!(
+                        "capture recovery: journal {} missing request for sequence {seq}",
+                        journal.display()
+                    )
+                })?;
+                env.as_object_mut()
+                    .expect("validated pending request object")
+                    .insert("response".into(), json!({ "complete": false }));
+                env
             }
+        };
+        reconcile_append(&turns, &env)?;
+        order.next_to_drain = seq + 1;
+        order.pending.remove(&seq);
+        persist_state(dir, state.clone(), &order)?;
+        state.insert(
+            "capture_order".into(),
+            serde_json::to_value(&order).map_err(|e| e.to_string())?,
+        );
+        if let Some(stage) = stage {
+            fs::remove_file(&stage.path).map_err(|e| {
+                format!(
+                    "capture recovery: remove committed stage {}: {e}",
+                    stage.path.display()
+                )
+            })?;
         }
         seq += 1;
     }
-    let _ = fs::remove_dir(&sdir);
+    if let Some((_, stage)) = stages.into_iter().next() {
+        return Err(format!(
+            "capture recovery: unreconciled stage at {}",
+            stage.path.display()
+        ));
+    }
+    if sdir.exists() {
+        fs::remove_dir(&sdir).map_err(|e| {
+            format!(
+                "capture recovery: remove stage directory {}: {e}",
+                sdir.display()
+            )
+        })?;
+    }
     if let Some(hash_dir) = sdir.parent() {
-        let _ = fs::remove_dir(hash_dir);
+        match fs::remove_dir(hash_dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {}
+            Err(e) => {
+                return Err(format!(
+                    "capture recovery: remove staging root {}: {e}",
+                    hash_dir.display()
+                ))
+            }
+        }
     }
     Ok(())
 }
@@ -1313,5 +1761,283 @@ mod tests {
             .await
             .unwrap();
         assert!(!has_open_capture(&vault, &sid), "sealable once drained");
+    }
+
+    #[tokio::test]
+    async fn detachment_rechecks_behind_a_finishing_capture() {
+        let (_g, vault) = set_home();
+        let adapter = claude_adapter();
+        let sid = uuid::Uuid::new_v4().to_string();
+        let pending = prepare_capture(&vault, &adapter, captured(Some(&sid)), body(&["a"]))
+            .await
+            .unwrap();
+        let dir = pending.dir.clone();
+        let root = pending.root.clone();
+
+        let lock = session_lock(&root, &sid);
+        let guard = lock.lock().await;
+        let detach_vault = vault.clone();
+        let detach_sid = sid.clone();
+        let detach_dir = dir.clone();
+        let detach = tokio::spawn(async move {
+            detach_generation(&detach_vault, &detach_sid, &detach_dir).await
+        });
+        tokio::task::yield_now().await;
+        let finish_vault = vault.clone();
+        let finish = tokio::spawn(async move {
+            finish_capture(&finish_vault, &claude_adapter(), pending, &resp(true)).await
+        });
+        tokio::task::yield_now().await;
+        drop(guard);
+
+        assert!(
+            detach.await.unwrap().unwrap().is_none(),
+            "queued detachment must observe the open reservation"
+        );
+        finish.await.unwrap().unwrap();
+        let generation = detach_generation(&vault, &sid, &dir)
+            .await
+            .unwrap()
+            .expect("finished generation detaches");
+        assert_eq!(
+            recon::reconstruct(&generation.path).unwrap().envelopes,
+            1,
+            "the concurrent completion remains reconstructable"
+        );
+    }
+
+    #[test]
+    fn recovery_rejects_corrupt_and_wrong_shaped_journals() {
+        let (_g, vault) = set_home();
+        let sid = uuid::Uuid::new_v4().to_string();
+        let dir = vault.join("2026/07/20").join(&sid);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("turns.jsonl"), "").unwrap();
+
+        for value in [
+            "{".to_string(),
+            "[]".to_string(),
+            json!({"session_id": sid, "capture_order": "wrong"}).to_string(),
+        ] {
+            fs::write(dir.join("state.json"), value).unwrap();
+            assert!(
+                recover_all(&vault).is_err(),
+                "invalid persisted state must fail closed"
+            );
+            assert_eq!(fs::read_to_string(dir.join("turns.jsonl")).unwrap(), "");
+        }
+    }
+
+    #[test]
+    fn recovery_ignores_evidence_from_another_vault_root() {
+        let (_g, vault) = set_home();
+        let foreign = staging_base()
+            .join(sha256_hex(b"/another/canonical/vault"))
+            .join("foreign-session")
+            .join("0-bad.json");
+        fs::create_dir_all(foreign.parent().unwrap()).unwrap();
+        fs::write(&foreign, "not valid current-root evidence").unwrap();
+
+        recover_all(&vault).unwrap();
+        assert!(foreign.exists(), "foreign-root evidence remains untouched");
+    }
+
+    #[tokio::test]
+    async fn recovery_uses_the_discovered_relocated_session_path() {
+        let (_g, vault) = set_home();
+        let adapter = claude_adapter();
+        let sid = uuid::Uuid::new_v4().to_string();
+        let pending = prepare_capture(&vault, &adapter, captured(Some(&sid)), body(&["a"]))
+            .await
+            .unwrap();
+        let original = pending.dir;
+        let relocated = vault.join("2001/02/03").join(&sid);
+        fs::create_dir_all(relocated.parent().unwrap()).unwrap();
+        fs::rename(&original, &relocated).unwrap();
+
+        recover_all(&vault).unwrap();
+        assert!(
+            !original.exists(),
+            "recovery must not recreate the cached path"
+        );
+        assert_eq!(turns_lines(&relocated).len(), 1);
+        assert_eq!(
+            turns_lines(&relocated)[0]["response"]["complete"],
+            json!(false)
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_requires_stage_root_sequence_and_envelope_identity() {
+        let (_g, vault) = set_home();
+        for case in ["missing-root", "wrong-root", "missing-request-id"] {
+            let adapter = claude_adapter();
+            let sid = uuid::Uuid::new_v4().to_string();
+            let pending = prepare_capture(&vault, &adapter, captured(Some(&sid)), body(&["a"]))
+                .await
+                .unwrap();
+            let mut envelope = pending.request_part.clone();
+            envelope
+                .as_object_mut()
+                .unwrap()
+                .insert("response".into(), json!({"complete": true}));
+            let request_id = envelope["request_id"].as_str().unwrap().to_string();
+            let mut doc = json!({
+                "root": pending.root,
+                "sequence": pending.sequence,
+                "request_id": request_id,
+                "envelope": envelope,
+            });
+            match case {
+                "missing-root" => {
+                    doc.as_object_mut().unwrap().remove("root");
+                }
+                "wrong-root" => doc["root"] = json!("/another/vault"),
+                "missing-request-id" => {
+                    doc.as_object_mut().unwrap().remove("request_id");
+                }
+                _ => unreachable!(),
+            }
+            let stage = staging_dir(&canonical_root(&vault), &sid)
+                .join(format!("{}-{request_id}.json", pending.sequence));
+            atomic_write(&stage, doc.to_string().as_bytes()).unwrap();
+
+            assert!(recover_all(&vault).is_err(), "{case} must fail closed");
+            assert!(stage.exists(), "{case} evidence must remain");
+            assert!(turns_lines(&pending.dir).is_empty());
+            fs::remove_dir_all(staging_dir(&canonical_root(&vault), &sid)).unwrap();
+            fs::remove_dir_all(&pending.dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_reconciles_only_matching_retired_stages() {
+        let (_g, vault) = set_home();
+        for conflict in [false, true] {
+            let adapter = claude_adapter();
+            let sid = uuid::Uuid::new_v4().to_string();
+            let pending = prepare_capture(&vault, &adapter, captured(Some(&sid)), body(&["a"]))
+                .await
+                .unwrap();
+            let dir = pending.dir.clone();
+            let root = pending.root.clone();
+            let seq = pending.sequence;
+            finish_capture(&vault, &adapter, pending, &resp(true))
+                .await
+                .unwrap();
+            let committed = turns_lines(&dir)[0].clone();
+            let mut staged = committed.clone();
+            if conflict {
+                staged["response"]["complete"] = json!(false);
+            }
+            let stage = staging_dir(&root, &sid).join(format!(
+                "{seq}-{}.json",
+                committed["request_id"].as_str().unwrap()
+            ));
+            atomic_write(
+                &stage,
+                json!({
+                    "root": root,
+                    "sequence": seq,
+                    "request_id": committed["request_id"],
+                    "envelope": staged,
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap();
+
+            if conflict {
+                assert!(recover_all(&vault).is_err());
+                assert!(stage.exists(), "conflicting retired evidence is preserved");
+            } else {
+                recover_all(&vault).unwrap();
+                assert!(!stage.exists(), "matching retired evidence is cleaned");
+            }
+            assert_eq!(turns_lines(&dir), vec![committed], "never duplicate");
+        }
+    }
+
+    #[tokio::test]
+    async fn incomplete_recovery_reconciles_complete_and_prefix_retries() {
+        let (_g, vault) = set_home();
+        for prefix in [false, true] {
+            let adapter = claude_adapter();
+            let sid = uuid::Uuid::new_v4().to_string();
+            let pending = prepare_capture(&vault, &adapter, captured(Some(&sid)), body(&["a"]))
+                .await
+                .unwrap();
+            let dir = pending.dir.clone();
+            let mut incomplete = pending.request_part.clone();
+            incomplete
+                .as_object_mut()
+                .unwrap()
+                .insert("response".into(), json!({"complete": false}));
+            let line = serde_json::to_string(&incomplete).unwrap();
+            fs::write(
+                dir.join("turns.jsonl"),
+                if prefix {
+                    line[..line.len() / 2].to_string()
+                } else {
+                    format!("{line}\n")
+                },
+            )
+            .unwrap();
+
+            recover_all(&vault).unwrap();
+            assert_eq!(
+                turns_lines(&dir),
+                vec![incomplete],
+                "retry ends with exactly one incomplete envelope"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn recovery_surfaces_cleanup_failure_and_preserves_stage() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_g, vault) = set_home();
+        let adapter = claude_adapter();
+        let sid = uuid::Uuid::new_v4().to_string();
+        let pending = prepare_capture(&vault, &adapter, captured(Some(&sid)), body(&["a"]))
+            .await
+            .unwrap();
+        let dir = pending.dir.clone();
+        let root = pending.root.clone();
+        let seq = pending.sequence;
+        let mut envelope = pending.request_part.clone();
+        envelope
+            .as_object_mut()
+            .unwrap()
+            .insert("response".into(), json!({"complete": true}));
+        let stage = staging_dir(&root, &sid).join(format!(
+            "{seq}-{}.json",
+            envelope["request_id"].as_str().unwrap()
+        ));
+        atomic_write(
+            &stage,
+            json!({
+                "root": root,
+                "sequence": seq,
+                "request_id": envelope["request_id"],
+                "envelope": envelope,
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        fs::set_permissions(stage.parent().unwrap(), fs::Permissions::from_mode(0o500)).unwrap();
+
+        let error = recover_all(&vault).unwrap_err();
+        assert!(error.contains("remove committed stage"), "{error}");
+        assert!(stage.exists(), "cleanup failure preserves staged evidence");
+        assert_eq!(turns_lines(&dir).len(), 1);
+
+        fs::set_permissions(stage.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+        recover_all(&vault).unwrap();
+        assert!(!stage.exists());
+        assert_eq!(turns_lines(&dir).len(), 1, "retry does not duplicate");
     }
 }

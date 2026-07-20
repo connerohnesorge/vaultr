@@ -149,7 +149,11 @@ fn iso_to_epoch(s: &str) -> Option<u64> {
 /// The sealed sibling (`turns.jsonl` -> `turns.jsonl.zst`) of a raw capture file.
 fn seal_sibling(raw: &Path) -> PathBuf {
     let name = raw.file_name().and_then(|n| n.to_str()).unwrap_or_default();
-    raw.with_file_name(format!("{name}.zst"))
+    if name.starts_with("turns.jsonl.sealing-") {
+        raw.with_file_name("turns.jsonl.zst")
+    } else {
+        raw.with_file_name(format!("{name}.zst"))
+    }
 }
 
 /// Has `learner` learned the *current* content behind `path`? Plain contains-check,
@@ -229,26 +233,48 @@ pub fn claim_inflight(vault: &Path, learner: &str, sids: &[String], expires_at: 
     let _ = std::fs::write(path, body.to_string());
 }
 
-fn capture_files(vault: &Path) -> Vec<(String, PathBuf)> {
+fn capture_files(vault: &Path) -> Result<Vec<(String, PathBuf)>, String> {
     turns_files(vault, true)
 }
 
 /// YYYY/MM/DD/<id>/turns.jsonl[.zst] under vault -> (session_id, path).
 /// Uses the shared digit-filtered walker, so non-date dirs (e.g. `.meta`) are skipped.
-fn turns_files(vault: &Path, include_compressed: bool) -> Vec<(String, PathBuf)> {
+fn turns_files(vault: &Path, include_compressed: bool) -> Result<Vec<(String, PathBuf)>, String> {
     let mut out = vec![];
-    for (sid, sess) in vaultr::vault::walk_session_dirs(vault) {
+    for (sid, sess) in vaultr::vault::walk_session_dirs(vault).map_err(|e| e.to_string())? {
+        let entries = std::fs::read_dir(&sess)
+            .map_err(|e| format!("read session directory {}: {e}", sess.display()))?;
+        let mut raw = None;
+        let mut sealed = None;
+        let mut detached = None;
+        for entry in entries {
+            let path = entry
+                .map_err(|e| format!("read session entry under {}: {e}", sess.display()))?
+                .path();
+            match path.file_name().and_then(|name| name.to_str()) {
+                Some("turns.jsonl") => raw = Some(path),
+                Some("turns.jsonl.zst") => sealed = Some(path),
+                Some(name) if name.starts_with("turns.jsonl.sealing-") => {
+                    if detached.replace(path).is_some() {
+                        return Err(format!(
+                            "multiple detached generations under {}",
+                            sess.display()
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
         let f = if include_compressed {
-            vaultr::vault::capture_file(&sess).ok()
+            raw.or(sealed).or(detached)
         } else {
-            let raw = sess.join("turns.jsonl");
-            raw.is_file().then_some(raw)
+            detached.or(raw)
         };
         if let Some(f) = f {
             out.push((sid, f));
         }
     }
-    out
+    Ok(out)
 }
 
 fn idle_secs(path: &Path) -> Option<u64> {
@@ -289,12 +315,12 @@ pub struct StuckCapture {
 /// job and `plant sessions stuck` both call this. sub-threshold captures can never seal
 /// under current rules (learn skips them, sealing needs both ledgers) — reported so the
 /// gap stays visible, but callers treat them as informational, not actionable.
-pub fn stuck_captures(vault: &Path, age: Duration) -> Vec<StuckCapture> {
+pub fn stuck_captures(vault: &Path, age: Duration) -> Result<Vec<StuckCapture>, String> {
     let claude = ledger_latest(vault, "claude");
     let codex = ledger_latest(vault, "codex");
     let mut out = vec![];
     let jobs = job_sids();
-    for (sid, path) in turns_files(vault, false) {
+    for (sid, path) in turns_files(vault, false)? {
         let Some(idle) = idle_secs(&path) else {
             continue;
         };
@@ -321,7 +347,7 @@ pub fn stuck_captures(vault: &Path, age: Duration) -> Vec<StuckCapture> {
             idle_secs: idle,
         });
     }
-    out
+    Ok(out)
 }
 
 /// Sids of agent panes plant itself launched for scheduled jobs. Learn passes must not
@@ -364,12 +390,17 @@ pub fn register_job_sid(sid: &str) {
     }
 }
 
-pub fn eligible_sessions(vault: &Path, idle: Duration, max: usize, learner: &str) -> Vec<String> {
+pub fn eligible_sessions(
+    vault: &Path,
+    idle: Duration,
+    max: usize,
+    learner: &str,
+) -> Result<Vec<String>, String> {
     let processed = ledger_latest(vault, learner);
     let inflight = inflight_sessions(vault, learner);
     let jobs = job_sids();
     let mut out = vec![];
-    for (sid, path) in capture_files(vault) {
+    for (sid, path) in capture_files(vault)? {
         if jobs.contains(&sid)
             || learned_current(&processed, &sid, &path)
             || inflight.contains(&sid)
@@ -384,16 +415,16 @@ pub fn eligible_sessions(vault: &Path, idle: Duration, max: usize, learner: &str
         }
     }
     out.truncate(max);
-    out
+    Ok(out)
 }
 
 /// Diagnostics for the `sessions eligible` subcommand's stderr — stdout must stay
 /// clean (it is substituted into an agent prompt by the learn job).
-pub fn eligibility_stats(vault: &Path, learner: &str) -> (usize, usize) {
-    (
-        capture_files(vault).len(),
+pub fn eligibility_stats(vault: &Path, learner: &str) -> Result<(usize, usize), String> {
+    Ok((
+        capture_files(vault)?.len(),
         ledger_latest(vault, learner).len(),
-    )
+    ))
 }
 
 /// Unambiguous secret formats — low false-positive prefixes only. Deliberately NOT a
@@ -561,6 +592,104 @@ async fn seal_file(raw: &Path) -> Result<(), String> {
     }
 }
 
+fn suffix_matches(path: &Path, offset: u64, suffix: &Path) -> Result<bool, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file =
+        std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|e| format!("seek {}: {e}", path.display()))?;
+    let mut expected =
+        std::fs::File::open(suffix).map_err(|e| format!("open {}: {e}", suffix.display()))?;
+    let mut left = [0u8; 64 * 1024];
+    let mut right = [0u8; 64 * 1024];
+    loop {
+        let a = file
+            .read(&mut left)
+            .map_err(|e| format!("read {}: {e}", path.display()))?;
+        let b = expected
+            .read(&mut right)
+            .map_err(|e| format!("read {}: {e}", suffix.display()))?;
+        if a != b || left[..a] != right[..b] {
+            return Ok(false);
+        }
+        if a == 0 {
+            return Ok(true);
+        }
+    }
+}
+
+/// Commit one immutable detached generation exactly once. The filename records
+/// the sealed destination length at detach time; a retry after the destination
+/// rename verifies the regenerated frame at that exact offset before cleanup.
+async fn seal_detached(generation: &crate::capture::DetachedGeneration) -> Result<PathBuf, String> {
+    let raw_mtime = std::fs::metadata(&generation.path)
+        .and_then(|m| m.modified())
+        .map_err(|e| format!("stat {}: {e}", generation.path.display()))?;
+    let dest = generation.path.with_file_name("turns.jsonl.zst");
+    let frame = generation.path.with_file_name("turns.jsonl.frame-tmp");
+    let raw_s = generation.path.display().to_string();
+    let frame_s = frame.display().to_string();
+    let zstd = run(
+        &["zstd", "-19", "-T0", "-q", "-f", "-o", &frame_s, &raw_s],
+        Duration::from_secs(600),
+    )
+    .await;
+    if !zstd.ok {
+        let _ = std::fs::remove_file(&frame);
+        return Err(zstd.failure_detail());
+    }
+    let frame_len = std::fs::metadata(&frame)
+        .map(|meta| meta.len())
+        .map_err(|e| format!("stat {}: {e}", frame.display()))?;
+    let dest_len = match std::fs::metadata(&dest) {
+        Ok(meta) => meta.len(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => return Err(format!("stat {}: {e}", dest.display())),
+    };
+
+    let result = if dest_len == generation.base_len {
+        let merged = generation.path.with_file_name("turns.jsonl.zst-tmp");
+        let assembled = (|| -> std::io::Result<()> {
+            let mut out = std::fs::File::create(&merged)?;
+            if generation.base_len > 0 {
+                std::io::copy(&mut std::fs::File::open(&dest)?, &mut out)?;
+            }
+            std::io::copy(&mut std::fs::File::open(&frame)?, &mut out)?;
+            out.sync_all()?;
+            std::fs::rename(&merged, &dest)
+        })();
+        if let Err(e) = assembled {
+            let _ = std::fs::remove_file(&merged);
+            Err(e.to_string())
+        } else {
+            Ok(())
+        }
+    } else if dest_len == generation.base_len + frame_len
+        && suffix_matches(&dest, generation.base_len, &frame)?
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "sealed destination conflicts with detached generation at {}",
+            dest.display()
+        ))
+    };
+    let _ = std::fs::remove_file(&frame);
+    result?;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&dest)
+        .and_then(|file| file.set_modified(raw_mtime))
+        .map_err(|e| format!("set mtime {}: {e}", dest.display()))?;
+    std::fs::remove_file(&generation.path).map_err(|e| {
+        format!(
+            "remove detached generation {}: {e}",
+            generation.path.display()
+        )
+    })?;
+    Ok(dest)
+}
+
 /// Sealed captures above this stay on disk but out of git: a 2.7GB .zst blob turned
 /// the vault push into a multi-hour hang (2026-07-18, codex session with
 /// zstd-encoded bodies the outer seal couldn't shrink).
@@ -600,47 +729,49 @@ fn exclude_from_commit(vault: &Path, sealed: &Path, size: u64) {
     }
 }
 
-pub async fn compress_sweep(vault: &Path, idle: Duration) -> bool {
+pub async fn compress_sweep(vault: &Path, idle: Duration) -> Result<(), String> {
     if !which("zstd") {
-        eprintln!("[compress] zstd not on PATH");
-        return false;
+        return Err("zstd not on PATH".into());
     }
     let claude = ledger_latest(vault, "claude");
     let codex = ledger_latest(vault, "codex");
     let jobs = job_sids();
     let mut sealed = 0u32;
-    for (sid, path) in turns_files(vault, false) {
+    for (sid, path) in turns_files(vault, false)? {
+        let detached = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("turns.jsonl.sealing-"));
         // job self-captures seal without waiting for learn — they are never dispatched
         let learned = learned_current(&claude, &sid, &path) && learned_current(&codex, &sid, &path);
-        if !(learned || jobs.contains(&sid)) || !idle_for(&path, idle) {
+        if !detached && (!(learned || jobs.contains(&sid)) || !idle_for(&path, idle)) {
             continue;
         }
-        // Never seal a raw generation with an open reservation or undrained stage:
-        // the delta lineage isn't final until every prepared sequence has drained.
-        if crate::capture::has_open_capture(vault, &sid) {
+        let Some(generation) =
+            crate::capture::detach_generation(vault, &sid, path.parent().unwrap()).await?
+        else {
             continue;
-        }
-        if !scrub(&path).await {
-            continue; // unscrubbed data must not leave the machine
-        }
-        let before = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        let path_s = path.display().to_string();
-        let herdr = path.with_file_name("herdr.jsonl");
+        };
+        let before = std::fs::metadata(&generation.path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        let herdr = generation.path.with_file_name("herdr.jsonl");
         if herdr.is_file() {
             if let Err(e) = seal_file(&herdr).await {
                 eprintln!("[compress] {sid}: herdr.jsonl seal skipped ({e}); next sweep retries");
                 continue;
             }
         }
-        match seal_file(&path).await {
-            Ok(()) => {
+        match seal_detached(&generation).await {
+            Ok(sealed_path) => {
                 sealed += 1;
-                let after = std::fs::metadata(format!("{path_s}.zst"))
+                let after = std::fs::metadata(&sealed_path)
                     .map(|m| m.len())
                     .unwrap_or(0);
                 if after > COMMIT_CAP {
-                    exclude_from_commit(vault, &seal_sibling(&path), after);
+                    exclude_from_commit(vault, &sealed_path, after);
                 }
+                let path_s = sealed_path.display().to_string();
                 let rel = path_s.split("/sessions/").nth(1).unwrap_or(&path_s);
                 println!(
                     "[compress] {rel}: {:.1}MB -> {:.1}MB",
@@ -649,7 +780,9 @@ pub async fn compress_sweep(vault: &Path, idle: Duration) -> bool {
                 );
             }
             Err(e) => {
-                eprintln!("[compress] {sid}: turns.jsonl seal skipped ({e}); next sweep retries");
+                eprintln!(
+                    "[compress] {sid}: detached generation seal skipped ({e}); next sweep retries"
+                );
             }
         }
     }
@@ -661,7 +794,7 @@ pub async fn compress_sweep(vault: &Path, idle: Duration) -> bool {
             Ok(p) => p.to_str().unwrap_or(".").to_string(),
             Err(_) => {
                 println!("[compress] sealed {sealed}, commit skipped: sessions root has no parent");
-                return true;
+                return Ok(());
             }
         };
         run30(&["git", "-C", &repo, "add", "-A", "sessions"]).await;
@@ -679,7 +812,7 @@ pub async fn compress_sweep(vault: &Path, idle: Duration) -> bool {
     } else {
         println!("[compress] nothing to seal");
     }
-    true
+    Ok(())
 }
 
 /// Read a capture file's envelope lines, decompressing `.zst` transparently.
@@ -943,8 +1076,8 @@ mod tests {
         )
         .unwrap();
 
-        let claude = eligible_sessions(&sessions, Duration::ZERO, 10, "claude");
-        let codex = eligible_sessions(&sessions, Duration::ZERO, 10, "codex");
+        let claude = eligible_sessions(&sessions, Duration::ZERO, 10, "claude").unwrap();
+        let codex = eligible_sessions(&sessions, Duration::ZERO, 10, "codex").unwrap();
         assert!(claude.iter().any(|p| p.ends_with(codex_id)));
         assert!(!claude.iter().any(|p| p.ends_with(claude_id)));
         assert!(codex.iter().any(|p| p.ends_with(claude_id)));
@@ -976,7 +1109,7 @@ mod tests {
             std::fs::write(d.join("turns.jsonl"), "{}\n").unwrap();
         }
 
-        let raw = turns_files(&sessions, false);
+        let raw = turns_files(&sessions, false).unwrap();
         assert_eq!(raw.len(), 1, "only the dated session, got {raw:?}");
         assert_eq!(raw[0].0, sid);
         assert_eq!(raw[0].1, dated.join("turns.jsonl"));
@@ -984,7 +1117,7 @@ mod tests {
         // include_compressed also picks up sealed sessions, still date-filtered.
         std::fs::remove_file(dated.join("turns.jsonl")).unwrap();
         std::fs::write(dated.join("turns.jsonl.zst"), "sealed").unwrap();
-        let all = turns_files(&sessions, true);
+        let all = turns_files(&sessions, true).unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].1, dated.join("turns.jsonl.zst"));
 
@@ -1024,7 +1157,7 @@ mod tests {
         )
         .unwrap();
 
-        let stuck = stuck_captures(&sessions, Duration::ZERO);
+        let stuck = stuck_captures(&sessions, Duration::ZERO).unwrap();
         let state = |sid: &str| {
             stuck
                 .iter()
@@ -1045,7 +1178,9 @@ mod tests {
         assert!(!stuck.iter().any(|s| s.sid == "already-sealed"));
 
         // freshly written files are idle ~0s: an age gate must exempt them all
-        assert!(stuck_captures(&sessions, Duration::from_secs(3600)).is_empty());
+        assert!(stuck_captures(&sessions, Duration::from_secs(3600))
+            .unwrap()
+            .is_empty());
 
         let _ = std::fs::remove_dir_all(root);
     }
@@ -1064,7 +1199,7 @@ mod tests {
         std::fs::create_dir_all(root.join("learnings")).unwrap();
 
         // tick 1: not ledgered, not leased -> eligible (this is the dispatch that runs)
-        let first = eligible_sessions(&sessions, Duration::ZERO, 10, "claude");
+        let first = eligible_sessions(&sessions, Duration::ZERO, 10, "claude").unwrap();
         assert!(
             first.iter().any(|p| p.ends_with(sid)),
             "un-ledgered session should be eligible"
@@ -1074,7 +1209,7 @@ mod tests {
         claim_inflight(&sessions, "claude", &[sid.to_string()], epoch_now() + 3600);
 
         // tick 2 while the pass is still running (ledger not yet written): must be excluded
-        let during = eligible_sessions(&sessions, Duration::ZERO, 10, "claude");
+        let during = eligible_sessions(&sessions, Duration::ZERO, 10, "claude").unwrap();
         assert!(
             !during.iter().any(|p| p.ends_with(sid)),
             "in-flight session must NOT be re-dispatched (this was the duplicate-prompt bug)"
@@ -1087,7 +1222,7 @@ mod tests {
             &[sid.to_string()],
             epoch_now().saturating_sub(1),
         );
-        let after = eligible_sessions(&sessions, Duration::ZERO, 10, "claude");
+        let after = eligible_sessions(&sessions, Duration::ZERO, 10, "claude").unwrap();
         assert!(
             after.iter().any(|p| p.ends_with(sid)),
             "expired lease must stop excluding"
@@ -1142,13 +1277,13 @@ mod tests {
         .unwrap();
 
         // watchdog: codex covered the resumed generation, claude did not
-        let stuck = stuck_captures(&sessions, Duration::ZERO);
+        let stuck = stuck_captures(&sessions, Duration::ZERO).unwrap();
         let entry = stuck.iter().find(|s| s.sid == sid).expect("reported stuck");
         assert_eq!(entry.state, "half-learned:claude");
 
         // eligibility mirrors that: claude re-learns, codex does not
-        let claude = eligible_sessions(&sessions, Duration::ZERO, 10, "claude");
-        let codex = eligible_sessions(&sessions, Duration::ZERO, 10, "codex");
+        let claude = eligible_sessions(&sessions, Duration::ZERO, 10, "claude").unwrap();
+        let codex = eligible_sessions(&sessions, Duration::ZERO, 10, "codex").unwrap();
         assert!(claude.iter().any(|p| p.ends_with(sid)));
         assert!(!codex.iter().any(|p| p.ends_with(sid)));
 
@@ -1198,6 +1333,74 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(root);
     }
+
+    #[tokio::test]
+    async fn detached_generation_retry_after_destination_rename_is_exactly_once() {
+        if !which("zstd") {
+            eprintln!("zstd not on PATH; skipping");
+            return;
+        }
+        let root =
+            std::env::temp_dir().join(format!("plant-detached-seal-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("sessions");
+        let sid = "detached-generation";
+        let dir = vault.join("2026/07/20").join(sid);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(dir.join("turns.jsonl"), "generation-one\n").unwrap();
+        let first = crate::capture::detach_generation(&vault, sid, &dir)
+            .await
+            .unwrap()
+            .unwrap();
+        seal_detached(&first).await.unwrap();
+
+        std::fs::write(dir.join("turns.jsonl"), "generation-two\n").unwrap();
+        let second = crate::capture::detach_generation(&vault, sid, &dir)
+            .await
+            .unwrap()
+            .unwrap();
+        let dest = dir.join("turns.jsonl.zst");
+        let frame = dir.join("manual-frame.zst");
+        let result = run(
+            &[
+                "zstd",
+                "-19",
+                "-T0",
+                "-q",
+                "-f",
+                "-o",
+                frame.to_str().unwrap(),
+                second.path.to_str().unwrap(),
+            ],
+            Duration::from_secs(60),
+        )
+        .await;
+        assert!(
+            result.ok,
+            "fixture compression: {}",
+            result.failure_detail()
+        );
+        let merged = dir.join("manual-merged.zst");
+        {
+            use std::io::Write;
+            let mut out = std::fs::File::create(&merged).unwrap();
+            out.write_all(&std::fs::read(&dest).unwrap()).unwrap();
+            out.write_all(&std::fs::read(&frame).unwrap()).unwrap();
+            out.sync_all().unwrap();
+        }
+        std::fs::rename(&merged, &dest).unwrap();
+
+        seal_detached(&second).await.unwrap();
+        assert!(!second.path.exists(), "committed transaction cleaned");
+        let decoded = zstd::decode_all(std::fs::File::open(&dest).unwrap()).unwrap();
+        assert_eq!(
+            String::from_utf8(decoded).unwrap(),
+            "generation-one\ngeneration-two\n"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn job_sid_registry_parses_lines() {
         let f = std::env::temp_dir().join(format!("plant-jobsids-{}", std::process::id()));

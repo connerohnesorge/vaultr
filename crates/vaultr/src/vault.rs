@@ -138,7 +138,10 @@ pub fn session_dir(root: &Path, session: &Session) -> Result<PathBuf> {
         }
     }
     // Fallback: scan YYYY/MM/DD for the id (lazy walk, stops at the first hit).
-    if let Some((_, dir)) = walk_session_dirs(root).find(|(sid, _)| *sid == session.id) {
+    if let Some((_, dir)) = walk_session_dirs(root)?
+        .into_iter()
+        .find(|(sid, _)| *sid == session.id)
+    {
         return Ok(dir);
     }
     bail!(
@@ -148,7 +151,8 @@ pub fn session_dir(root: &Path, session: &Session) -> Result<PathBuf> {
     )
 }
 
-/// The capture file inside a session dir: raw `turns.jsonl` or `.zst`.
+/// The capture file inside a session dir: raw `turns.jsonl`, `.zst`, or an
+/// immutable generation detached while sealing.
 pub fn capture_file(dir: &Path) -> Result<PathBuf> {
     let raw = dir.join("turns.jsonl");
     if raw.is_file() {
@@ -158,43 +162,72 @@ pub fn capture_file(dir: &Path) -> Result<PathBuf> {
     if zst.is_file() {
         return Ok(zst);
     }
+    let mut detached = Vec::new();
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("read session directory {}", dir.display()))?
+    {
+        let path = entry
+            .with_context(|| format!("read session entry under {}", dir.display()))?
+            .path();
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("turns.jsonl.sealing-"))
+        {
+            detached.push(path);
+        }
+    }
+    if detached.len() == 1 {
+        return Ok(detached.remove(0));
+    }
+    if detached.len() > 1 {
+        bail!("multiple detached capture generations in {}", dir.display());
+    }
     bail!("no turns.jsonl or turns.jsonl.zst in {}", dir.display())
 }
 
-/// Walk `<root>/YYYY/MM/DD/<session-id>` lazily, yielding `(session_id, session_dir)`
+/// Walk `<root>/YYYY/MM/DD/<session-id>`, yielding `(session_id, session_dir)`
 /// in sorted (oldest date first) order. Only all-ASCII-digit directory names count as
-/// date levels, so index dirs like `.meta` at the root are never entered. Unreadable
-/// dirs are skipped.
-pub fn walk_session_dirs(root: &Path) -> impl Iterator<Item = (String, PathBuf)> {
-    read_dirs(root).into_iter().flat_map(|y| {
-        read_dirs(&y).into_iter().flat_map(|m| {
-            read_dirs(&m).into_iter().flat_map(|d| {
+/// date levels, so index dirs like `.meta` at the root are never entered.
+pub fn walk_session_dirs(root: &Path) -> Result<Vec<(String, PathBuf)>> {
+    let mut sessions = Vec::new();
+    for year in read_dirs(root)? {
+        for month in read_dirs(&year)? {
+            for day in read_dirs(&month)? {
                 // Session ids are UUID-like, so the leaf level takes any dir name.
-                read_dirs_where(&d, |_| true)
-                    .into_iter()
-                    .filter_map(|sess| {
-                        let sid = sess.file_name()?.to_str()?.to_string();
-                        Some((sid, sess))
-                    })
-            })
-        })
-    })
+                for session in read_dirs_where(&day, |_| true)? {
+                    let Some(sid) = session
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .map(String::from)
+                    else {
+                        continue;
+                    };
+                    sessions.push((sid, session));
+                }
+            }
+        }
+    }
+    Ok(sessions)
 }
 
 /// Sorted subdirectories of `path` whose (UTF-8) name passes `keep`.
-fn read_dirs_where(path: &Path, keep: fn(&str) -> bool) -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = std::fs::read_dir(path)
-        .map(|rd| {
-            rd.flatten()
-                .map(|e| e.path())
-                .filter(|p| p.is_dir() && p.file_name().and_then(|n| n.to_str()).is_some_and(keep))
-                .collect()
-        })
-        .unwrap_or_default();
+fn read_dirs_where(path: &Path, keep: fn(&str) -> bool) -> Result<Vec<PathBuf>> {
+    let entries =
+        std::fs::read_dir(path).with_context(|| format!("read directory {}", path.display()))?;
+    let mut dirs = Vec::new();
+    for entry in entries {
+        let path = entry
+            .with_context(|| format!("read directory entry under {}", path.display()))?
+            .path();
+        if path.is_dir() && path.file_name().and_then(|n| n.to_str()).is_some_and(keep) {
+            dirs.push(path);
+        }
+    }
     dirs.sort();
-    dirs
+    Ok(dirs)
 }
 
-fn read_dirs(path: &Path) -> Vec<PathBuf> {
+fn read_dirs(path: &Path) -> Result<Vec<PathBuf>> {
     read_dirs_where(path, |n| n.chars().all(|c| c.is_ascii_digit()))
 }

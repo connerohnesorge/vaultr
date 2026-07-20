@@ -93,7 +93,12 @@ async fn handle(req: Request<hyper::body::Incoming>, ctx: Arc<ProxyCtx>) -> Resp
         .unwrap_or_default();
 
     if path == "/health" {
-        let body = serde_json::json!({ "ok": true, "harness": adapter.harness, "upstream": upstream_base });
+        let body = serde_json::json!({
+            "service": "plant",
+            "ok": true,
+            "harness": adapter.harness,
+            "upstream": upstream_base
+        });
         return Response::builder()
             .header("content-type", "application/json")
             .body(full(body.to_string()))

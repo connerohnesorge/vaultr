@@ -221,3 +221,31 @@ fn session_dir_scan_fallback() {
     let dir = vault::session_dir(tmp.path(), &s).unwrap();
     assert!(dir.ends_with("2026/07/11/aaaa1111-0000-0000-0000-000000000001"));
 }
+
+#[test]
+fn session_walker_distinguishes_missing_and_empty_roots() {
+    let tmp = TempDir::new().unwrap();
+    let empty = tmp.path().join("empty");
+    fs::create_dir(&empty).unwrap();
+    assert!(vault::walk_session_dirs(&empty).unwrap().is_empty());
+
+    let missing = tmp.path().join("missing");
+    let error = vault::walk_session_dirs(&missing).unwrap_err().to_string();
+    assert!(error.contains(&missing.display().to_string()), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn session_walker_propagates_an_unreadable_date_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new().unwrap();
+    let day = tmp.path().join("2026/07/20");
+    fs::create_dir_all(&day).unwrap();
+    fs::set_permissions(&day, fs::Permissions::from_mode(0o000)).unwrap();
+    let error = vault::walk_session_dirs(tmp.path())
+        .unwrap_err()
+        .to_string();
+    fs::set_permissions(&day, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(error.contains(&day.display().to_string()), "{error}");
+}

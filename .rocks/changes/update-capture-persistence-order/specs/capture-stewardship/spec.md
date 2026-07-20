@@ -29,11 +29,15 @@ reservation or completed stage.
 ### Requirement: Capture persistence recovery
 
 Plant MUST recover every ordering journal and completed stage before accepting
-proxy traffic or permitting Sealing. Recovery MUST preserve every real request
-delta, MUST NOT invent response output, and MUST fail startup without altering
-persisted bytes when journal, identity, or persisted-tail evidence conflicts.
-Durability under this requirement covers Plant process crashes, not sudden host
-power loss.
+proxy traffic or permitting Sealing, and only after retaining both harness
+listeners. Recovery MUST inventory only the canonical current root while
+retaining each discovered journal, Session Capture, and stage path. It MUST
+require valid journals and mandatory stage root, sequence, request, and
+Envelope identity; MUST reconcile retired stages only against exact committed
+evidence; MUST surface cleanup failures; MUST preserve every real request
+delta; and MUST NOT invent response output. Conflicting or malformed evidence
+MUST fail startup without altering persisted capture bytes. Durability under
+this requirement covers Plant process crashes, not sudden host power loss.
 
 #### Scenario: Plant restarts with abandoned preparations
 
@@ -53,6 +57,12 @@ power loss.
 - THEN recovery may remove only that incomplete tail and append the full staged Envelope
 - AND any nonmatching or conflicting tail remains untouched and causes startup to fail
 
+#### Scenario: Incomplete Envelope append is retried
+
+- WHEN recovery retries an abandoned reservation whose identical incomplete Envelope is already complete or present as an exact partial prefix
+- THEN recovery leaves or replaces the tail so exactly one complete incomplete Envelope remains
+- AND conflicting persisted content remains unchanged and fails startup
+
 #### Scenario: Legacy state has no ordering fields
 
 - WHEN a legacy `state.json` has a valid request delta base and no private stage backlog
@@ -62,6 +72,71 @@ power loss.
 
 - WHEN private stages exist without a readable journal for the same canonical Session Capture root and session
 - THEN Plant leaves persisted evidence unchanged and fails startup with actionable session and sequence diagnostics
+
+#### Scenario: Persisted evidence moved within the current root
+
+- WHEN recovery discovers a journal or stage at a Session Capture path different from mutable metadata or a cached date
+- THEN it reconciles that exact discovered path without creating a new dated directory
+
+#### Scenario: Persisted recovery evidence is invalid
+
+- WHEN a journal is missing, corrupt, or wrongly shaped, or a stage omits or conflicts on root, sequence, request, or Envelope identity
+- THEN Plant rejects the evidence without treating it as an empty legacy state
+
+#### Scenario: Retired stage remains after journal commit
+
+- WHEN a stage below `next_to_drain` exactly matches the final committed Envelope
+- THEN recovery removes the retired stage without appending it again
+- AND any mismatch fails while preserving the stage and capture bytes
+
+#### Scenario: Stage cleanup fails
+
+- WHEN a reconciled stage cannot be removed
+- THEN recovery reports the cleanup failure and preserves the stage for an idempotent retry
+
+### Requirement: Immutable generation Sealing
+
+Plant MUST recheck Sealing eligibility under the per-session capture mutex and
+atomically detach the eligible raw generation so subsequent captures write a
+fresh raw file. The detached generation MUST remain reconstructable and
+digest-identified until its zstd frame is committed exactly once. A retry MUST
+distinguish an uncommitted destination from the exact post-rename,
+pre-detached-removal state. Existing Envelope and concatenated-zstd generation
+formats MUST remain readable.
+
+#### Scenario: Capture finishes at the Sealing boundary
+
+- WHEN response completion and generation detachment contend for the same session mutex
+- THEN the completed Envelope is either included in the detached generation or keeps that generation ineligible
+- AND no Envelope is lost
+
+#### Scenario: Plant restarts with a detached generation
+
+- WHEN Plant restarts after detachment, destination rename, or detached-file removal
+- THEN Sealing resumes or recognizes the committed generation without omission or duplication
+
+#### Scenario: Reconstruction overlaps Sealing
+
+- WHEN sealed, detached, and newer live raw generations coexist
+- THEN Reconstruction reads every generation exactly once in chronological order
+- AND errors identify only locations rather than captured content
+
+### Requirement: Complete daemon ownership before recovery
+
+Plant MUST bind and retain both configured harness listeners before capture
+recovery or scheduler startup. On any partial collision it MUST release acquired
+listeners and exit zero only when both health endpoints identify the expected
+complete incumbent Plant; otherwise it MUST fail nonzero.
+
+#### Scenario: Complete incumbent already owns both harnesses
+
+- WHEN another Plant identifies itself correctly on both configured health endpoints
+- THEN the losing process exits zero without running recovery
+
+#### Scenario: Only one port is occupied
+
+- WHEN one harness listener is occupied without a complete matching incumbent
+- THEN Plant releases any listener it acquired, exits nonzero, and performs no recovery mutation
 
 ### Requirement: Complete Envelope record reconstruction
 

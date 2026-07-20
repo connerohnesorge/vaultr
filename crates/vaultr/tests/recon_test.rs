@@ -150,6 +150,52 @@ fn mixed_generations_reconstruct_from_either_sibling() {
 }
 
 #[test]
+fn detached_generation_reconstructs_once_before_and_after_commit() {
+    let full = fs::read_to_string(fixture("claude_append.jsonl")).unwrap();
+    let mut lines = full.lines();
+    let first = lines.next().unwrap();
+    let second = lines.next().unwrap();
+    let expected = recon::reconstruct(&fixture("claude_append.jsonl")).unwrap();
+    let tmp = tempfile::TempDir::new().unwrap();
+    let sealed = tmp.path().join("turns.jsonl.zst");
+    let first_frame = zstd::encode_all(format!("{first}\n").as_bytes(), 3).unwrap();
+    fs::write(&sealed, &first_frame).unwrap();
+    let detached = tmp.path().join(format!(
+        "turns.jsonl.sealing-{}-{}",
+        first_frame.len(),
+        "0".repeat(64)
+    ));
+    fs::write(&detached, format!("{second}\n")).unwrap();
+
+    let before = recon::reconstruct(&detached).unwrap();
+    assert_eq!(before.envelopes, 2);
+    assert_eq!(before.messages, expected.messages);
+
+    let second_frame = zstd::encode_all(format!("{second}\n").as_bytes(), 3).unwrap();
+    let mut committed = first_frame;
+    committed.extend(second_frame);
+    fs::write(&sealed, committed).unwrap();
+    let after = recon::reconstruct(&detached).unwrap();
+    assert_eq!(
+        after.envelopes, 2,
+        "detached evidence is not replayed twice"
+    );
+    assert_eq!(after.messages, expected.messages);
+}
+
+#[test]
+fn detached_generation_errors_do_not_echo_captured_content() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let detached = tmp
+        .path()
+        .join(format!("turns.jsonl.sealing-0-{}", "0".repeat(64)));
+    fs::write(&detached, "TOP-SECRET-CAPTURED-CONTENT\n").unwrap();
+    let error = recon::reconstruct(&detached).unwrap_err().to_string();
+    assert!(error.contains("sealed record 1"), "{error}");
+    assert!(!error.contains("TOP-SECRET"), "{error}");
+}
+
+#[test]
 fn permissive_sse_parser_keeps_only_valid_data_json() {
     let events = recon::parse_sse(
         "event: message\n\

@@ -18,9 +18,10 @@ server-side pieces make restarts actually safe:
    (stow-linked from `Library/LaunchAgents/` in this repo) respawns plant
    whenever it dies, mid-session included. Previously only the SessionStart
    hook started it, so a crash left live sessions dead until the next session
-   launch. plant's existing "port already bound → exit 0" behavior makes the
-   launchd copy and hook-started copies coexist safely: whoever binds first
-   wins, the loser exits 0. Logs: `~/.local/state/plant/launchd.log`.
+   launch. plant binds both harness ports before recovery or scheduler work.
+   A losing copy exits 0 only when both health endpoints identify a complete
+   incumbent plant; partial or foreign ownership fails without mutating
+   recovery state. Logs: `~/.local/state/plant/launchd.log`.
 
 2. **Listeners released before drain** — on SIGTERM/SIGINT, `main.rs` aborts
    the accept loops (dropping the listeners) *before* the 30s in-flight drain

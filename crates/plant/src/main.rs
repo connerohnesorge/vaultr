@@ -58,8 +58,21 @@ async fn subcommand(argv: &[String]) -> Option<i32> {
         (Some("sessions"), Some("eligible")) => {
             let max = flag("--max").and_then(|v| v.parse().ok()).unwrap_or(10);
             let learner = flag("--learner").unwrap_or_else(|| "claude".to_string());
-            let list = sweep::eligible_sessions(&vault_root(), idle, max, &learner);
-            let (total, ledgered) = sweep::eligibility_stats(&vault_root(), &learner);
+            let vault = vault_root();
+            let list = match sweep::eligible_sessions(&vault, idle, max, &learner) {
+                Ok(list) => list,
+                Err(e) => {
+                    eprintln!("sessions eligible: {e}");
+                    return Some(2);
+                }
+            };
+            let (total, ledgered) = match sweep::eligibility_stats(&vault, &learner) {
+                Ok(stats) => stats,
+                Err(e) => {
+                    eprintln!("sessions eligible: {e}");
+                    return Some(2);
+                }
+            };
             eprintln!(
                 "[eligible:{learner}] {} of {total} sessions ({ledgered} ledgered)",
                 list.len()
@@ -133,7 +146,13 @@ async fn subcommand(argv: &[String]) -> Option<i32> {
             let age = flag("--age")
                 .and_then(|v| jobs::parse_duration(&v))
                 .unwrap_or(Duration::from_secs(24 * 3600));
-            let stuck = sweep::stuck_captures(&vault_root(), age);
+            let stuck = match sweep::stuck_captures(&vault_root(), age) {
+                Ok(stuck) => stuck,
+                Err(e) => {
+                    eprintln!("sessions stuck: {e}");
+                    return Some(2);
+                }
+            };
             for s in &stuck {
                 println!("{} {} idle={}h", s.state, s.sid, s.idle_secs / 3600);
             }
@@ -150,10 +169,12 @@ async fn subcommand(argv: &[String]) -> Option<i32> {
             )
         }
         (Some("compress"), Some("once")) => {
-            Some(if sweep::compress_sweep(&vault_root(), idle).await {
-                0
-            } else {
-                1
+            Some(match sweep::compress_sweep(&vault_root(), idle).await {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("compress once: {e}");
+                    2
+                }
             })
         }
         (Some("jobs"), Some("run")) => {
@@ -271,6 +292,30 @@ pub fn http_client() -> reqwest::Client {
         .expect("reqwest client")
 }
 
+async fn complete_incumbent() -> bool {
+    let client = http_client();
+    for adapter in adapter::adapters() {
+        let url = format!("http://127.0.0.1:{}/health", adapter.port);
+        let response =
+            match tokio::time::timeout(Duration::from_secs(2), client.get(url).send()).await {
+                Ok(Ok(response)) if response.status().is_success() => response,
+                _ => return false,
+            };
+        let Ok(health) = response.json::<serde_json::Value>().await else {
+            return false;
+        };
+        if health.get("service").and_then(|v| v.as_str()) != Some("plant")
+            || health.get("ok").and_then(|v| v.as_bool()) != Some(true)
+            || health.get("harness").and_then(|v| v.as_str()) != Some(adapter.harness)
+            || health.get("upstream").and_then(|v| v.as_str())
+                != Some(adapter.upstream.trim_end_matches('/'))
+        {
+            return false;
+        }
+    }
+    true
+}
+
 #[tokio::main]
 async fn main() {
     if std::env::args().any(|a| a == "--self-test") {
@@ -308,18 +353,8 @@ async fn main() {
 
     let vault = vault_root();
 
-    // Recover ordered-capture journals and staged Envelopes BEFORE binding ports
-    // or arming the scheduler (which may seal). Failing closed preserves evidence.
-    if let Err(e) = capture::recover_all(&vault) {
-        eprintln!("[plant] capture recovery failed: {e}");
-        record_exit(started, "exit:1");
-        std::process::exit(1);
-    }
-
-    let otel = Arc::new(otel::Otel::new());
-    let client = http_client();
-
-    // Bind both ports first: collision => yield to the live instance (exit 0).
+    // Own both harness listeners before recovery or scheduler work. A partial
+    // bind is released before checking whether a complete incumbent owns both.
     let mut servers = vec![];
     for a in adapter::adapters() {
         match proxy::bind(a.port).await {
@@ -328,16 +363,33 @@ async fn main() {
                 servers.push((listener, a));
             }
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                println!("[vaultr] port already bound, another instance owns it — exiting 0");
-                record_exit(started, "exit:0");
-                std::process::exit(0);
+                drop(servers);
+                if complete_incumbent().await {
+                    println!("[plant] complete incumbent owns both harnesses — exiting 0");
+                    record_exit(started, "exit:0");
+                    std::process::exit(0);
+                }
+                eprintln!("[plant] incomplete port ownership: {e}");
+                record_exit(started, "exit:1");
+                std::process::exit(1);
             }
             Err(e) => {
+                drop(servers);
+                eprintln!("[plant] bind failed: {e}");
                 record_exit(started, "exit:1");
-                panic!("bind failed: {e}");
+                std::process::exit(1);
             }
         }
     }
+
+    if let Err(e) = capture::recover_all(&vault) {
+        eprintln!("[plant] capture recovery failed: {e}");
+        record_exit(started, "exit:1");
+        std::process::exit(1);
+    }
+
+    let otel = Arc::new(otel::Otel::new());
+    let client = http_client();
     println!("vault={}", vault.display());
 
     let mut accept_loops = vec![];
