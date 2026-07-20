@@ -284,6 +284,7 @@ async fn handle(req: Request<hyper::body::Incoming>, ctx: Arc<ProxyCtx>) -> Resp
             &resp,
             &events,
         );
+        drop(events);
         if let Err(e) = capture::finish_capture(&ctx2.vault, &ctx2.adapter, pending, &resp).await {
             eprintln!("capture failed: {e}");
         }

@@ -64,8 +64,9 @@ of manufacturing phantom loss from resume carryover.
 
 - Affected specs: `capture-stewardship`
 - Affected code: `crates/vaultr/src/recon.rs` (shared Envelope traversal),
-  `crates/plant/src/sweep.rs` (coverage computation),
-  `crates/plant/src/main.rs` (subcommand wiring), focused tests
+  `crates/plant/src/coverage.rs` (coverage computation),
+  `crates/plant/src/main.rs` (subcommand wiring), `crates/plant/STRESS.md`
+  (release RSS evidence), focused tests
 - Related change: `update-capture-persistence-order` owns the in-window
   durability residual; this change only measures it, it does not repair it.
 - No change to the capture write path — measurement is read-only over Session

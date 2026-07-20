@@ -71,9 +71,10 @@ decoded archive or generated fixture is committed.
 
 Envelope harness identity is wire truth. Codex has no comparable native
 `assistant.requestId` denominator, so the command fails explicitly instead of
-inventing a proxy. A Claude transcript with zero comparable native IDs also
-fails. The percentage function is reached only for a non-zero supported
-denominator, so `0/0` can never print as `100%`.
+inventing a proxy. A Claude window with zero in-window native IDs also fails,
+including a nonempty transcript whose IDs are all carryover. The percentage
+function is reached only for a non-zero supported in-window denominator, so
+`0/0` can never print a percentage.
 
 ## ADRs
 

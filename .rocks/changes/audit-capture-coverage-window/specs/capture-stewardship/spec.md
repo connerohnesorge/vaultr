@@ -20,9 +20,10 @@ Native `requestId`s whose first transcript occurrence precedes the window start
 MUST be reported as out-of-scope carryover (not as missing capture), and the
 audit MUST report in-window coverage as captured over in-window native together
 with the list of residual missing `request-id`s. Harness support MUST be derived
-from Envelope truth. Codex Captures and Claude windows with zero comparable
-native IDs MUST fail explicitly and MUST NOT print a percentage. The audit MUST
-NOT mutate any Session Capture or transcript.
+from Envelope truth. Codex Captures and Claude windows with zero in-window
+comparable native IDs, including nonempty all-carryover transcripts, MUST fail
+explicitly and MUST NOT print a percentage. The audit MUST NOT mutate any
+Session Capture or transcript.
 
 #### Scenario: Resumed session with pre-proxy history
 
@@ -64,8 +65,9 @@ NOT mutate any Session Capture or transcript.
 - THEN the audit fails with explicit unsupported or no-comparable-ID text
 - AND it does not print a percentage
 
-#### Scenario: Claude has zero comparable native IDs
+#### Scenario: Claude has zero in-window comparable native IDs
 
-- WHEN a Claude transcript contains no comparable assistant `requestId`
+- WHEN a Claude transcript contains no comparable assistant `requestId` at or
+  after the observation-window start, including when every ID is carryover
 - THEN the audit fails with explicit no-comparable-ID text
-- AND it does not report `0/0` as 100%
+- AND it does not print a percentage

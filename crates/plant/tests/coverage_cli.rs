@@ -49,12 +49,13 @@ fn coverage(root: &Path, sid: &str) -> Output {
 }
 
 #[test]
-fn coverage_cli_rejects_unsupported_and_empty_denominators() {
+fn coverage_cli_rejects_unsupported_empty_and_all_carryover_denominators() {
     let root = std::env::temp_dir().join(format!("plant-coverage-cli-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let codex = "00000000-0000-4000-8000-000000000028";
     let empty = "00000000-0000-4000-8000-000000000029";
     let complete = "00000000-0000-4000-8000-000000000030";
+    let carryover = "00000000-0000-4000-8000-000000000031";
     add_session(&root, codex, "codex", &["req_codex"]);
     add_session(&root, empty, "claude-code", &["req_captured"]);
     std::fs::write(
@@ -63,6 +64,12 @@ fn coverage_cli_rejects_unsupported_and_empty_denominators() {
     )
     .unwrap();
     add_session(&root, complete, "claude-code", &["req_A", "req_B"]);
+    add_session(&root, carryover, "claude-code", &["req_old"]);
+    std::fs::write(
+        root.join(format!("{carryover}.transcript.jsonl")),
+        "{\"type\":\"assistant\",\"requestId\":\"req_old\",\"timestamp\":\"2026-07-17T18:59:59.000Z\"}\n",
+    )
+    .unwrap();
 
     let output = coverage(&root, codex);
     assert_eq!(output.status.code(), Some(1));
@@ -71,8 +78,15 @@ fn coverage_cli_rejects_unsupported_and_empty_denominators() {
 
     let output = coverage(&root, empty);
     assert_eq!(output.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&output.stderr).contains("no comparable native request IDs"));
-    assert!(!String::from_utf8_lossy(&output.stdout).contains("100.0%"));
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("no comparable in-window native request IDs"));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains('%'));
+
+    let output = coverage(&root, carryover);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("no comparable in-window native request IDs"));
+    assert!(!String::from_utf8_lossy(&output.stdout).contains('%'));
 
     let output = coverage(&root, complete);
     assert_eq!(output.status.code(), Some(0));

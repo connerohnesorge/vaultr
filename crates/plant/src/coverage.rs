@@ -95,13 +95,6 @@ pub fn coverage(vault: &Path, query: &str) -> Result<Coverage, String> {
             .and_modify(|seen_before| *seen_before |= predates_window)
             .or_insert(predates_window);
     }
-    if first_seen.is_empty() {
-        return Err(format!(
-            "no comparable native request IDs for {}",
-            session.id
-        ));
-    }
-
     let mut in_window_native = 0usize;
     let mut carryover = 0usize;
     let mut missing = vec![];
@@ -114,6 +107,12 @@ pub fn coverage(vault: &Path, query: &str) -> Result<Coverage, String> {
                 missing.push(rid.clone());
             }
         }
+    }
+    if in_window_native == 0 {
+        return Err(format!(
+            "no comparable in-window native request IDs for {}",
+            session.id
+        ));
     }
     missing.sort();
 
@@ -337,7 +336,7 @@ mod tests {
         );
         let error = coverage(&empty, "cov00000").unwrap_err();
         assert!(
-            error.contains("no comparable native request IDs"),
+            error.contains("no comparable in-window native request IDs"),
             "{error}"
         );
         let _ = std::fs::remove_dir_all(empty);
