@@ -153,10 +153,19 @@ pub fn cleanup_policy(requested: WorkspaceCleanup, cfg: &Cfg) -> WorkspaceCleanu
 /// `command` bypasses the user's interactive-shell aliases (a `codex='codex --yolo'`
 /// alias duplicated our flag, clap refused, and the prompt got typed into bare zsh).
 pub fn launch_line(harness: Harness, model: Option<&str>, args: Option<&str>) -> String {
+    // Stamp PLANT_AGENT=1 into the spawned agent so a nested `plant agent run` (a job-spawned
+    // agent that wanders into a job script and copies its dispatch line) is refused — see the
+    // guard in the AgentRun handler. Claude's Bash tool inherits the pane env, so a var prefix
+    // reaches it. Codex's shell tool uses inherit="core" and strips custom vars, so inject the
+    // marker via a set-override (`-c`), which wins last and only applies to this plant launch.
     let mut s = match harness {
-        Harness::ClaudeCode => "command claude --dangerously-skip-permissions".to_string(),
+        Harness::ClaudeCode => {
+            "PLANT_AGENT=1 command claude --dangerously-skip-permissions".to_string()
+        }
         // sandboxed codex blocks on its first approval prompt — background panes can't answer
-        Harness::Codex => "command codex --dangerously-bypass-approvals-and-sandbox".to_string(),
+        Harness::Codex => "command codex --dangerously-bypass-approvals-and-sandbox \
+             -c 'shell_environment_policy.set.PLANT_AGENT=\"1\"'"
+            .to_string(),
     };
     if let Some(m) = model {
         match harness {
@@ -410,12 +419,13 @@ mod tests {
                 Some("gpt-5.6-sol"),
                 Some("-c model_reasoning_effort=xhigh")
             ),
-            "command codex --dangerously-bypass-approvals-and-sandbox -m 'gpt-5.6-sol' \
+            "command codex --dangerously-bypass-approvals-and-sandbox \
+             -c 'shell_environment_policy.set.PLANT_AGENT=\"1\"' -m 'gpt-5.6-sol' \
              -c model_reasoning_effort=xhigh"
         );
         assert_eq!(
             launch_line(Harness::ClaudeCode, Some("opus[1m]"), None),
-            "command claude --dangerously-skip-permissions --model='opus[1m]'"
+            "PLANT_AGENT=1 command claude --dangerously-skip-permissions --model='opus[1m]'"
         );
     }
 

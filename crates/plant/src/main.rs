@@ -158,6 +158,16 @@ async fn dispatch(command: Command) -> i32 {
             }
         }
         Command::AgentRun(args) => {
+            // No nesting: a job-spawned agent must never spawn another (jobs spawning jobs).
+            // launch_line stamps PLANT_AGENT=1 into every agent plant starts; if it's set here
+            // we're already inside one, so refuse rather than fork a duplicate.
+            if std::env::var_os("PLANT_AGENT").is_some() {
+                eprintln!(
+                    "agent run: refused — already inside a plant-spawned agent; \
+                     do the work in-process, don't spawn another agent"
+                );
+                return 1;
+            }
             let mut prompt = String::new();
             use std::io::Read;
             if std::io::stdin().read_to_string(&mut prompt).is_err() || prompt.trim().is_empty() {
