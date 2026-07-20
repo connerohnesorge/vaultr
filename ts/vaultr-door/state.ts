@@ -399,8 +399,13 @@ async function readPublishedLockOwner(
     try {
       return lockOwner(store, name);
     } catch (error) {
-      if (!(error instanceof IncompleteLockOwner)) throw error;
-      if (attempt < 3) await Bun.sleep(10);
+      if (!(error instanceof IncompleteLockOwner)
+        && !(error instanceof StableFileIdentityError)) throw error;
+      if (attempt < 3) {
+        await Bun.sleep(10);
+        continue;
+      }
+      if (error instanceof StableFileIdentityError) throw error;
     }
   }
   throw new Error(

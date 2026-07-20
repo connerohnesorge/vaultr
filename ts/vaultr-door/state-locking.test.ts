@@ -10,6 +10,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import { door } from "./index.ts";
+import { acquireLock } from "./state.ts";
 import {
   landFile,
   legacyKey,
@@ -494,7 +495,33 @@ test("an incomplete legacy lock is reread while its publisher finishes", async (
   expect(stubCalls()).toBe(0);
 });
 
-test("lock control reads reject FIFO, symlink, oversize, swap, and post-open removal", async () => {
+test("a contender retries when the observed owner releases its published lock", async () => {
+  const name = "release-race";
+  const first = await acquireLock(name);
+  if (!first) throw new Error("first lease not acquired");
+  const path = join(tmp, "state", `${name}.lock`);
+  const original = JSON.parse(readFileSync(path, "utf8"));
+  let released = false;
+  testHooks.afterMetadataStat = (relativePath) => {
+    if (relativePath !== `${name}.lock` || released) return;
+    released = true;
+    first.release();
+  };
+
+  const contender = await acquireLock(name);
+  if (!contender) throw new Error("contender lease not acquired");
+  expect(released).toBe(true);
+  const successor = JSON.parse(readFileSync(path, "utf8"));
+  expect(successor.token).not.toBe(original.token);
+  expect(await acquireLock(name)).toBeUndefined();
+  expect(JSON.parse(readFileSync(path, "utf8"))).toEqual(successor);
+
+  delete testHooks.afterMetadataStat;
+  contender.release();
+  expect(existsSync(path)).toBe(false);
+});
+
+test("lock control reads reject FIFO, symlink, oversize, and swap but retry removal", async () => {
   landFile("mail/a.md", 1000);
   const state = join(tmp, "state");
   mkdirSync(state, { recursive: true });
@@ -552,11 +579,11 @@ test("lock control reads reject FIFO, symlink, oversize, swap, and post-open rem
       watch: "mail/*.md",
       prompt: () => "must not launch",
     });
-    expect(result.code).toBe(1);
+    expect(result.code).toBe(mode === "missing" ? 0 : 1);
     expect(changed).toBe(true);
     delete testHooks.afterMetadataStat;
   }
-  expect(stubCalls()).toBe(0);
+  expect(stubCalls()).toBe(1);
 });
 
 test("a crash while preparing owner metadata leaves only an ignorable temp lock", async () => {
