@@ -129,12 +129,28 @@ impl Segment {
 }
 
 /// Accumulated reconstruction state, shared across a capture's segments.
+#[derive(Clone, Copy)]
+enum HarnessState {
+    Unknown,
+    ProvisionalCodex,
+    Explicit(Harness),
+}
+
+impl HarnessState {
+    fn value(self) -> Option<Harness> {
+        match self {
+            HarnessState::Unknown => None,
+            HarnessState::ProvisionalCodex => Some(Harness::Codex),
+            HarnessState::Explicit(harness) => Some(harness),
+        }
+    }
+}
+
 struct ReconState {
     msgs: Vec<Value>,
     hash_dict: HashMap<String, Value>,
     key: String,
-    harness: Option<Harness>,
-    explicit_harness: Option<Harness>,
+    harness: HarnessState,
     trailing: Vec<Value>,
     envelopes: usize,
 }
@@ -145,8 +161,7 @@ impl ReconState {
             msgs: Vec::new(),
             hash_dict: HashMap::new(),
             key: String::from("messages"),
-            harness: None,
-            explicit_harness: None,
+            harness: HarnessState::Unknown,
             trailing: Vec::new(),
             envelopes: 0,
         }
@@ -159,20 +174,18 @@ impl ReconState {
             .get("harness")
             .and_then(Value::as_str)
             .and_then(Harness::from_label);
-        if explicit_harness
-            .zip(self.explicit_harness)
-            .is_some_and(|(next, first)| next != first)
-        {
-            anyhow::bail!("conflicting explicit harness labels");
-        }
         let history = env.pointer("/request/body_delta/history");
-        let inferred_harness = (history.and_then(|h| h.get("key")).and_then(Value::as_str)
-            == Some("input"))
-        .then_some(Harness::Codex);
-        let harness = explicit_harness
-            .or(self.explicit_harness)
-            .or(self.harness)
-            .or(inferred_harness);
+        let provisional_codex =
+            history.and_then(|h| h.get("key")).and_then(Value::as_str) == Some("input");
+        let next_harness = match (self.harness, explicit_harness, provisional_codex) {
+            (HarnessState::Explicit(first), Some(next), _) if first != next => {
+                anyhow::bail!("conflicting explicit harness labels");
+            }
+            (_, Some(harness), _) => HarnessState::Explicit(harness),
+            (HarnessState::Unknown, None, true) => HarnessState::ProvisionalCodex,
+            (state, None, _) => state,
+        };
+        let harness = next_harness.value();
 
         if let Some(h) = history {
             apply_delta(h, &mut self.msgs, &mut self.hash_dict)?;
@@ -181,8 +194,7 @@ impl ReconState {
             }
         }
 
-        self.explicit_harness = explicit_harness.or(self.explicit_harness);
-        self.harness = harness;
+        self.harness = next_harness;
         self.envelopes += 1;
         // The response of every envelope *before* the last is reflected in the
         // next request's history delta; only the final envelope's completed
@@ -213,7 +225,7 @@ impl ReconState {
         self.msgs.extend(self.trailing);
         Recon {
             key: self.key,
-            harness: self.harness,
+            harness: self.harness.value(),
             history_len,
             messages: self.msgs,
             trailing_appended,

@@ -77,14 +77,16 @@ pub fn fork(root: &Path, id: &str, target: Target, opts: &ForkOptions) -> Result
         )
     })?;
     let cwd_str = cwd.to_string_lossy().to_string();
-    let config_root = match target {
-        Target::Claude => claude_config_dir(opts)?,
-        Target::Codex => codex_home(opts)?,
-    };
     let git_branch = session.meta.git_branch.as_deref();
 
     let (new_id, path, launch) = match target {
         Target::Claude => {
+            let config_root = config_root(
+                opts.claude_config_dir.as_deref(),
+                "CLAUDE_CONFIG_DIR",
+                ".claude",
+                "Claude config root",
+            )?;
             let messages: Vec<Value> = if source == Harness::Claude {
                 recon.messages.clone()
             } else {
@@ -105,6 +107,12 @@ pub fn fork(root: &Path, id: &str, target: Target, opts: &ForkOptions) -> Result
             (id, path, launch)
         }
         Target::Codex => {
+            let config_root = config_root(
+                opts.codex_home.as_deref(),
+                "CODEX_HOME",
+                ".codex",
+                "Codex home",
+            )?;
             let (items, base_instructions) = if source == Harness::Codex {
                 prepare_codex_passthrough(&recon.messages)
             } else {
@@ -158,41 +166,26 @@ pub fn launch(outcome: &ForkOutcome) -> Result<()> {
     }
 }
 
-fn claude_config_dir(opts: &ForkOptions) -> Result<PathBuf> {
-    let root = if let Some(root) = &opts.claude_config_dir {
-        root.clone()
-    } else if let Some(root) =
-        std::env::var_os("CLAUDE_CONFIG_DIR").filter(|value| !value.is_empty())
-    {
-        PathBuf::from(root)
+fn config_root(
+    override_root: Option<&Path>,
+    env_var: &str,
+    default_leaf: &str,
+    label: &str,
+) -> Result<PathBuf> {
+    let root = if let Some(root) = override_root {
+        root.to_path_buf()
+    } else if let Some(root) = std::env::var_os(env_var).filter(|value| !value.is_empty()) {
+        root.into()
     } else {
-        home()?.join(".claude")
+        PathBuf::from(
+            std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .context("HOME is missing or empty (nothing was written)")?,
+        )
+        .join(default_leaf)
     };
-    absolute_config_root(root, "Claude config root")
-}
-
-fn codex_home(opts: &ForkOptions) -> Result<PathBuf> {
-    let root = if let Some(root) = &opts.codex_home {
-        root.clone()
-    } else if let Some(root) = std::env::var_os("CODEX_HOME").filter(|value| !value.is_empty()) {
-        PathBuf::from(root)
-    } else {
-        home()?.join(".codex")
-    };
-    absolute_config_root(root, "Codex home")
-}
-
-fn home() -> Result<PathBuf> {
-    let home = std::env::var_os("HOME")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from)
-        .context("HOME is missing or empty (nothing was written)")?;
-    absolute_config_root(home, "HOME")
-}
-
-fn absolute_config_root(root: PathBuf, name: &str) -> Result<PathBuf> {
     if !root.is_absolute() {
-        bail!("{name} must be absolute (nothing was written)");
+        bail!("{label} must be absolute (nothing was written)");
     }
     Ok(root)
 }
@@ -204,32 +197,23 @@ fn absolute_config_root(root: PathBuf, name: &str) -> Result<PathBuf> {
 /// everything else (including reasoning items with encrypted_content) passes
 /// through opaquely.
 pub fn prepare_codex_passthrough(messages: &[Value]) -> (Vec<Value>, Option<String>) {
-    let mut base_instructions: Option<String> = None;
-    let mut items: Vec<Value> = Vec::new();
-    let mut lifted_dev = false;
-    let mut retained = false;
-    for m in messages {
-        let ty = m.get("type").and_then(Value::as_str);
-        if ty == Some("additional_tools") {
-            continue;
-        }
-        if !retained
-            && !lifted_dev
-            && ty == Some("message")
-            && m.get("role").and_then(Value::as_str) == Some("developer")
+    let mut items = messages
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) != Some("additional_tools"));
+    match items.next() {
+        Some(first)
+            if first.get("type").and_then(Value::as_str) == Some("message")
+                && first.get("role").and_then(Value::as_str) == Some("developer") =>
         {
-            lifted_dev = true;
-            base_instructions = m
+            let base_instructions = first
                 .get("content")
                 .and_then(Value::as_array)
                 .and_then(|a| a.first())
                 .and_then(|b| b.get("text"))
                 .and_then(Value::as_str)
                 .map(String::from);
-            continue;
+            (items.cloned().collect(), base_instructions)
         }
-        retained = true;
-        items.push(m.clone());
+        first => (first.into_iter().chain(items).cloned().collect(), None),
     }
-    (items, base_instructions)
 }

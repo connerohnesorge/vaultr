@@ -368,46 +368,35 @@ pub fn scan(content_root: &Path) -> Result<Report> {
             continue;
         };
         let mut in_sources = false;
-        for line in &raw {
-            if !line.starts_with([' ', '\t', '-']) {
-                let Some((key, value)) = line.split_once(':') else {
+        let source_values = raw.iter().filter_map(|line| {
+            if line.starts_with([' ', '\t', '-']) {
+                return in_sources.then(|| line.trim().trim_start_matches('-').trim());
+            }
+            match line.split_once(':') {
+                Some((key, value)) => {
+                    in_sources = key.trim() == "sources";
+                    in_sources.then_some(value)
+                }
+                None => {
                     in_sources = false;
-                    continue;
-                };
-                in_sources = key.trim() == "sources";
-                if in_sources {
-                    for token in value
-                        .split(|c: char| c.is_ascii_whitespace() || matches!(c, '[' | ']' | ','))
-                    {
-                        if let Some(item) = source_session_id(token) {
-                            if !meta_dir.join(format!("{item}.json")).is_file() {
-                                report.findings.push(Finding {
-                                    severity: Severity::Warning,
-                                    kind: "sources",
-                                    file: rel.clone(),
-                                    line: 0,
-                                    detail: format!("source session {item} not in sessions/.meta"),
-                                });
-                            }
-                        }
-                    }
+                    None
                 }
-                continue;
             }
-            if !in_sources {
-                continue;
-            }
-            let item = line.trim().trim_start_matches('-').trim();
-            if let Some(item) = source_session_id(item) {
-                if !meta_dir.join(format!("{item}.json")).is_file() {
-                    report.findings.push(Finding {
-                        severity: Severity::Warning,
-                        kind: "sources",
-                        file: rel.clone(),
-                        line: 0,
-                        detail: format!("source session {item} not in sessions/.meta"),
-                    });
-                }
+        });
+        for item in source_values
+            .flat_map(|value| {
+                value.split(|c: char| c.is_ascii_whitespace() || matches!(c, '[' | ']' | ','))
+            })
+            .filter_map(source_session_id)
+        {
+            if !meta_dir.join(format!("{item}.json")).is_file() {
+                report.findings.push(Finding {
+                    severity: Severity::Warning,
+                    kind: "sources",
+                    file: rel.clone(),
+                    line: 0,
+                    detail: format!("source session {item} not in sessions/.meta"),
+                });
             }
         }
     }
