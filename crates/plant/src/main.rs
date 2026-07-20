@@ -5,6 +5,7 @@
 mod adapter;
 mod capture;
 mod cli;
+mod domain;
 mod fsutil;
 mod herdr;
 mod jobs;
@@ -14,8 +15,8 @@ mod proxy;
 mod selftest;
 mod sweep;
 
-use adapter::Harness;
 use cli::Command;
+use domain::Harness;
 use proxy::ProxyCtx;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -75,7 +76,7 @@ async fn dispatch(command: Command) -> i32 {
             let (total, ledgered) = sweep::eligibility_stats(&vault, args.learner);
             eprintln!(
                 "[eligible:{}] {} of {total} sessions ({ledgered} ledgered)",
-                args.learner,
+                args.learner.ledger_label(),
                 list.len()
             );
             if list.is_empty() {
@@ -160,11 +161,8 @@ async fn dispatch(command: Command) -> i32 {
                 eprintln!("agent run: prompt expected on stdin");
                 return 1;
             }
-            let mut launch = jobs::launch_line(
-                args.cli.cli_label(),
-                args.model.as_deref(),
-                args.args.as_deref(),
-            );
+            let mut launch =
+                jobs::launch_line(args.cli, args.model.as_deref(), args.args.as_deref());
             if args.cli == Harness::ClaudeCode {
                 let sid = uuid::Uuid::new_v4().to_string();
                 sweep::register_job_sid(&sid);

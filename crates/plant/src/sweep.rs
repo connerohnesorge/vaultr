@@ -3,7 +3,7 @@
 //! eligible` / `plant compress once` subcommands and called directly by the built-in Rust jobs.
 //! Every failure path non-fatal: capture uptime is sacred. All heavy work shells out.
 
-use crate::adapter::Harness;
+use crate::domain::Harness;
 use crate::process::{run, run30, which};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -100,7 +100,7 @@ fn inflight_path(vault: &Path, learner: Harness) -> Result<PathBuf, String> {
     let root = vaultr::validate::content_root(vault).map_err(|e| e.to_string())?;
     Ok(root
         .join("learnings")
-        .join(format!(".inflight-{learner}.json")))
+        .join(format!(".inflight-{}.json", learner.ledger_label())))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -228,7 +228,9 @@ impl fmt::Display for StuckState {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::SealBlocked => formatter.write_str("seal-blocked"),
-            Self::HalfLearned(learner) => write!(formatter, "half-learned:{learner}"),
+            Self::HalfLearned(learner) => {
+                write!(formatter, "half-learned:{}", learner.ledger_label())
+            }
             Self::Unlearned => formatter.write_str("unlearned"),
             Self::SubThreshold => formatter.write_str("sub-threshold"),
             Self::JobCapture => formatter.write_str("job-capture"),

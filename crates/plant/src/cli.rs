@@ -1,4 +1,4 @@
-use crate::adapter::Harness;
+use crate::domain::Harness;
 use crate::herdr::WorkspaceCleanup;
 use crate::jobs;
 use std::collections::HashSet;
@@ -95,9 +95,8 @@ fn parse_eligible(args: &[String]) -> Result<EligibleArgs, String> {
                 let value = args
                     .get(i + 1)
                     .ok_or("sessions eligible: --learner requires claude|codex")?;
-                parsed.learner = value
-                    .parse()
-                    .map_err(|_| "sessions eligible: --learner requires claude|codex")?;
+                parsed.learner = Harness::parse_ledger_label(value)
+                    .ok_or("sessions eligible: --learner requires claude|codex")?;
                 i += 2;
             }
             "--idle" => {
@@ -157,9 +156,8 @@ fn parse_agent(args: &[String]) -> Result<AgentRunArgs, String> {
         match flag {
             "--cli" => {
                 cli = Some(
-                    value
-                        .parse()
-                        .map_err(|_| "agent run: --cli requires claude|codex")?,
+                    Harness::parse_cli_label(value)
+                        .ok_or("agent run: --cli requires claude|codex")?,
                 );
             }
             "--model" => model = Some(value.clone()),

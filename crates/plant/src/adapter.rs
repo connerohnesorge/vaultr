@@ -1,8 +1,7 @@
 //! Harness adapters — mirrors ADAPTERS in wireproxy.ts.
 
+use crate::domain::Harness;
 use serde_json::Value;
-use std::fmt;
-use std::str::FromStr;
 
 #[derive(Debug, Default, Clone)]
 pub struct Identity {
@@ -17,49 +16,6 @@ pub struct TokenUsage {
     pub output: u64,
     pub cache_read: u64,
     pub cache_creation: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Harness {
-    ClaudeCode,
-    Codex,
-}
-
-impl Harness {
-    pub fn capture_label(self) -> &'static str {
-        match self {
-            Self::ClaudeCode => "claude-code",
-            Self::Codex => "codex",
-        }
-    }
-
-    pub fn cli_label(self) -> &'static str {
-        match self {
-            Self::ClaudeCode => "claude",
-            Self::Codex => "codex",
-        }
-    }
-
-    pub fn ledger_label(self) -> &'static str {
-        self.cli_label()
-    }
-}
-
-impl fmt::Display for Harness {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.ledger_label())
-    }
-}
-
-impl FromStr for Harness {
-    type Err = ();
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        [Self::ClaudeCode, Self::Codex]
-            .into_iter()
-            .find(|harness| harness.cli_label() == value)
-            .ok_or(())
-    }
 }
 
 pub struct Adapter {
@@ -291,16 +247,6 @@ mod tests {
     }
     fn codex() -> Adapter {
         adapters().remove(1)
-    }
-
-    #[test]
-    fn harness_preserves_capture_and_cli_ledger_labels() {
-        assert_eq!(Harness::ClaudeCode.capture_label(), "claude-code");
-        assert_eq!(Harness::ClaudeCode.cli_label(), "claude");
-        assert_eq!(Harness::ClaudeCode.ledger_label(), "claude");
-        assert_eq!("claude".parse(), Ok(Harness::ClaudeCode));
-        assert_eq!("codex".parse(), Ok(Harness::Codex));
-        assert!("claude-code".parse::<Harness>().is_err());
     }
 
     #[test]
