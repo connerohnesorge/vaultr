@@ -269,23 +269,30 @@ async fn sealing_retry_accepts_a_different_valid_frame_representation() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn compressor_timeout_kills_and_reaps_the_child() {
-    let mut child = tokio::process::Command::new("sleep")
-        .arg("30")
-        .spawn()
-        .unwrap();
-    let pid = child.id().unwrap() as libc::pid_t;
-    let error = wait_for_compressor(&mut child, Duration::from_millis(20))
+async fn inherited_compressor_stderr_cannot_strand_the_directory_transaction() {
+    let root = std::env::temp_dir().join(format!("plant-compressor-pipe-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&root).unwrap();
+    let generation = detached(&root, "turns.jsonl", b"detached evidence\n", 0);
+    let destination = root.join("turns.jsonl.zst");
+    let started = std::time::Instant::now();
+    let error = seal_generation_with(&generation, &destination, FrameCompressor::InheritedStderr)
         .await
         .unwrap_err();
-    assert!(error.contains("killed and reaped"), "{error}");
-    assert!(child.id().is_none());
-    // SAFETY: signal 0 only probes the former pid.
-    assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
-    assert_eq!(
-        std::io::Error::last_os_error().raw_os_error(),
-        Some(libc::ESRCH)
+    assert!(error.contains("timed out"), "{error}");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "descendant-held stderr delayed sealing for {:?}",
+        started.elapsed()
     );
+    assert!(generation.path.exists());
+    assert!(!destination.exists());
+    SessionDirectory::open(&root)
+        .unwrap()
+        .try_lock_exclusive()
+        .expect("failed compressor must release the directory transaction");
+    // The direct shell is owned and reaped. Its detached descendant is not
+    // claimed; dropping the captured pipe is what bounds the transaction.
+    let _ = std::fs::remove_dir_all(root);
 }
 
 #[tokio::test]

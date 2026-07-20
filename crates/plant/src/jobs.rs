@@ -274,45 +274,31 @@ const SCRIPT_BACKSTOP: Duration = Duration::from_secs(3 * 3600);
 
 pub async fn run_job(job: &Job) -> i32 {
     let started = SystemTime::now();
-    // This is also the explicit `plant jobs run <name>` path. In particular,
-    // running the compression marker manually executes its ownership-checking
-    // wrapper; scheduled dispatch below never reaches this function for it.
-    // Exec the script directly: the shebang picks the interpreter. A missing
-    // shebang or exec bit fails at spawn (ENOEXEC/EACCES) and is recorded below.
-    let mut cmd = tokio::process::Command::new(&job.path);
-    cmd.current_dir(expand_home("~/.dotfiles"))
-        .env("PATH", script_path_env())
-        .env(
-            "PLANT_LAST_TS",
-            last_record_ts(&job.name).unwrap_or(0).to_string(),
-        )
-        .kill_on_drop(true)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped());
-    let child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            record(&job.name, "failed", started, &format!("spawn: {e}"));
-            return 1;
-        }
-    };
-    let out = match tokio::time::timeout(SCRIPT_BACKSTOP, child.wait_with_output()).await {
-        Ok(Ok(out)) => out,
-        Ok(Err(e)) => {
-            record(&job.name, "failed", started, &format!("wait: {e}"));
-            return 1;
-        }
-        Err(_) => {
-            // kill_on_drop reaped the child when the future was dropped by timeout
+    let worktree = PathBuf::from(expand_home("~/.dotfiles"));
+    let out = execute_script(job, &worktree, SCRIPT_BACKSTOP).await;
+    let detail = tail_line(&out.out)
+        .or_else(|| tail_line(&out.stderr))
+        .unwrap_or_else(|| "no output".to_string());
+    let code = match out.end {
+        crate::process::RunEnd::Exited(code) => code,
+        crate::process::RunEnd::TimedOut => {
             record(&job.name, "failed", started, "killed: 3h backstop");
             return 1;
         }
+        crate::process::RunEnd::SpawnFailed => {
+            record(
+                &job.name,
+                "failed",
+                started,
+                &format!("spawn: {}", out.stderr),
+            );
+            return 1;
+        }
+        crate::process::RunEnd::WaitFailed | crate::process::RunEnd::OutputFailed => {
+            record(&job.name, "failed", started, &out.failure_detail());
+            return 1;
+        }
     };
-    let detail = tail_line(&String::from_utf8_lossy(&out.stdout))
-        .or_else(|| tail_line(&String::from_utf8_lossy(&out.stderr)))
-        .unwrap_or_else(|| "no output".to_string());
-    let code = out.status.code();
     match outcome_for(code) {
         Some(outcome) => record(&job.name, outcome, started, &detail),
         None => println!("[job:{}] retry next tick ({detail})", job.name),
@@ -322,6 +308,29 @@ pub async fn run_job(job: &Job) -> i32 {
         Some(75) => 75,
         _ => 1,
     }
+}
+
+async fn execute_script(
+    job: &Job,
+    worktree: &std::path::Path,
+    timeout: Duration,
+) -> crate::process::RunResult {
+    // This is also the explicit `plant jobs run <name>` path. In particular,
+    // running the compression marker manually executes its ownership-checking
+    // wrapper; scheduled dispatch below never reaches this function for it.
+    // Exec the script directly: the shebang picks the interpreter. A missing
+    // shebang or exec bit fails at spawn (ENOEXEC/EACCES) and is recorded below.
+    let mut cmd = tokio::process::Command::new(&job.path);
+    cmd.current_dir(worktree)
+        .env("PATH", script_path_env())
+        .env(
+            "PLANT_LAST_TS",
+            last_record_ts(&job.name).unwrap_or(0).to_string(),
+        )
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    crate::process::run_command(cmd, timeout).await
 }
 
 async fn run_compress_job(job: &Job, vault: &std::path::Path) -> i32 {
@@ -504,5 +513,84 @@ mod tests {
         assert_eq!(tail_line(""), None);
         let long = format!("first\n{}", "x".repeat(400));
         assert_eq!(tail_line(&long).unwrap().len(), 300);
+    }
+
+    #[cfg(unix)]
+    fn executable(path: &std::path::Path, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+
+        std::fs::write(path, body).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn script_action_preserves_cwd_env_pipes_and_retry_status() {
+        let root = std::env::temp_dir().join(format!("plant-job-config-{}", uuid::Uuid::new_v4()));
+        let worktree = root.join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let script = root.join("retry.sh");
+        executable(
+            &script,
+            "#!/bin/sh\nprintf '%s:%s' \"$PWD\" \"$PLANT_LAST_TS\"\nprintf err >&2\nexit 75\n",
+        );
+        let job = Job {
+            name: format!("retry-{}", uuid::Uuid::new_v4()),
+            path: script,
+            every: Duration::from_secs(1),
+            action: JobAction::Script,
+        };
+
+        let result = execute_script(&job, &worktree, Duration::from_secs(2)).await;
+
+        assert_eq!(result.end, crate::process::RunEnd::Exited(Some(75)));
+        assert_eq!(
+            result.out,
+            format!("{}:0", std::fs::canonicalize(&worktree).unwrap().display())
+        );
+        assert_eq!(result.stderr, "err");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_script_action_reaps_before_any_late_effect() {
+        let root = std::env::temp_dir().join(format!("plant-job-timeout-{}", uuid::Uuid::new_v4()));
+        let worktree = root.join("worktree");
+        std::fs::create_dir_all(&worktree).unwrap();
+        let script = root.join("late.sh");
+        let pid_path = root.join("pid");
+        let marker_path = root.join("late-marker");
+        executable(
+            &script,
+            &format!(
+                "#!/bin/sh\nprintf '%s' $$ > '{}'\nsleep 1\nprintf late > '{}'\n",
+                pid_path.display(),
+                marker_path.display()
+            ),
+        );
+        let job = Job {
+            name: format!("timeout-{}", uuid::Uuid::new_v4()),
+            path: script,
+            every: Duration::from_secs(1),
+            action: JobAction::Script,
+        };
+
+        let result = execute_script(&job, &worktree, Duration::from_millis(200)).await;
+
+        assert_eq!(result.end, crate::process::RunEnd::TimedOut);
+        let cleanup = result.cleanup.expect("timeout cleanup diagnostics");
+        assert!(cleanup.kill_error.is_none(), "{cleanup:?}");
+        assert!(cleanup.reap_error.is_none(), "{cleanup:?}");
+        let pid: libc::pid_t = std::fs::read_to_string(&pid_path).unwrap().parse().unwrap();
+        // SAFETY: signal 0 only probes whether the explicitly reaped pid exists.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(!marker_path.exists());
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -202,6 +202,37 @@ pub struct CaptureGenerations {
     pub raw: Option<PathBuf>,
 }
 
+pub(crate) enum CaptureGenerationName {
+    Raw,
+    Sealed,
+    Detached { base_len: u64, digest: String },
+}
+
+pub(crate) fn parse_capture_generation_name(name: &str) -> Result<Option<CaptureGenerationName>> {
+    match name {
+        "turns.jsonl" => Ok(Some(CaptureGenerationName::Raw)),
+        "turns.jsonl.zst" => Ok(Some(CaptureGenerationName::Sealed)),
+        _ => {
+            let Some(rest) = name.strip_prefix("turns.jsonl.sealing-") else {
+                return Ok(None);
+            };
+            let (base_len, digest) = rest
+                .split_once('-')
+                .ok_or_else(|| anyhow::anyhow!("invalid detached generation name"))?;
+            let base_len = base_len
+                .parse::<u64>()
+                .context("invalid detached generation base length")?;
+            if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                bail!("invalid detached generation digest");
+            }
+            Ok(Some(CaptureGenerationName::Detached {
+                base_len,
+                digest: digest.to_ascii_lowercase(),
+            }))
+        }
+    }
+}
+
 impl CaptureGenerations {
     pub fn load(dir: &Path) -> Result<Self> {
         let mut generations = Self {
@@ -218,12 +249,11 @@ impl CaptureGenerations {
             let Some(name) = entry.file_name().to_str().map(String::from) else {
                 continue;
             };
-            let capture_name = name == "turns.jsonl"
-                || name == "turns.jsonl.zst"
-                || name.starts_with("turns.jsonl.sealing-");
-            if !capture_name {
+            let Some(kind) = parse_capture_generation_name(&name)
+                .with_context(|| format!("invalid detached generation at {}", path.display()))?
+            else {
                 continue;
-            }
+            };
             if !entry
                 .file_type()
                 .with_context(|| format!("inspect capture generation {}", path.display()))?
@@ -234,21 +264,11 @@ impl CaptureGenerations {
                     path.display()
                 );
             }
-            match name.as_str() {
-                "turns.jsonl" => generations.raw = Some(path),
-                "turns.jsonl.zst" => generations.sealed = Some(path),
-                _ => {
-                    let rest = name.strip_prefix("turns.jsonl.sealing-").unwrap();
-                    let (base_len, digest) = rest.split_once('-').ok_or_else(|| {
-                        anyhow::anyhow!("invalid detached generation at {}", path.display())
-                    })?;
-                    let base_len = base_len.parse::<u64>().with_context(|| {
-                        format!("invalid detached generation at {}", path.display())
-                    })?;
-                    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-                        bail!("invalid detached generation at {}", path.display());
-                    }
-                    if sha256_file(&path)? != digest.to_ascii_lowercase() {
+            match kind {
+                CaptureGenerationName::Raw => generations.raw = Some(path),
+                CaptureGenerationName::Sealed => generations.sealed = Some(path),
+                CaptureGenerationName::Detached { base_len, digest } => {
+                    if sha256_file(&path)? != digest {
                         bail!("detached generation digest mismatch at {}", path.display());
                     }
                     if generations

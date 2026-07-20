@@ -15,6 +15,17 @@ pub(super) struct SessionDirectory {
     file: File,
 }
 
+impl Drop for SessionDirectory {
+    fn drop(&mut self) {
+        // A forked subprocess can briefly retain this open-file description
+        // until exec applies O_CLOEXEC. Unlock explicitly so that inherited
+        // duplicate does not extend a completed maintenance transaction.
+        // A failed unlock cannot be reported from Drop.
+        // SAFETY: the retained directory descriptor is valid until File drops.
+        let _ = unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 impl SessionDirectory {
     pub(super) fn open(path: &Path) -> Result<Self, String> {
         let file = std::fs::OpenOptions::new()
@@ -399,6 +410,25 @@ mod tests {
         );
         drop(first);
         second.try_lock_exclusive().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn drop_unlocks_before_an_inherited_duplicate_closes() {
+        let root =
+            std::env::temp_dir().join(format!("plant-session-unlock-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let first = SessionDirectory::open(&root).unwrap();
+        first.lock_exclusive().unwrap();
+        let inherited = first.file.try_clone().unwrap();
+
+        drop(first);
+
+        let second = SessionDirectory::open(&root).unwrap();
+        second
+            .try_lock_exclusive()
+            .expect("explicit Drop unlock must not wait for a duplicate fd");
+        drop(inherited);
         let _ = std::fs::remove_dir_all(root);
     }
 

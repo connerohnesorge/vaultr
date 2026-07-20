@@ -4,6 +4,7 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::process::Command;
 
 /// How a subprocess run ended. Distinguishes the cases `ok: false` collapses.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -11,6 +12,14 @@ pub enum RunEnd {
     Exited(Option<i32>),
     TimedOut,
     SpawnFailed,
+    WaitFailed,
+    OutputFailed,
+}
+
+#[derive(Debug, Default)]
+pub struct CleanupDiagnostics {
+    pub kill_error: Option<String>,
+    pub reap_error: Option<String>,
 }
 
 pub struct RunResult {
@@ -18,6 +27,7 @@ pub struct RunResult {
     pub out: String,
     pub stderr: String,
     pub end: RunEnd,
+    pub cleanup: Option<CleanupDiagnostics>,
 }
 
 impl RunResult {
@@ -27,12 +37,26 @@ impl RunResult {
             RunEnd::Exited(None) => "killed by signal".to_string(),
             RunEnd::TimedOut => "timed out".to_string(),
             RunEnd::SpawnFailed => "spawn failed".to_string(),
+            RunEnd::WaitFailed => "wait failed".to_string(),
+            RunEnd::OutputFailed => "output read failed".to_string(),
         };
+        let mut diagnostics = Vec::new();
         let error: String = self.stderr.trim().chars().take(200).collect();
-        if error.is_empty() {
+        if !error.is_empty() {
+            diagnostics.push(error);
+        }
+        if let Some(cleanup) = &self.cleanup {
+            if let Some(error) = &cleanup.kill_error {
+                diagnostics.push(format!("kill failed: {error}"));
+            }
+            if let Some(error) = &cleanup.reap_error {
+                diagnostics.push(format!("reap failed: {error}"));
+            }
+        }
+        if diagnostics.is_empty() {
             how
         } else {
-            format!("{how}: {error}")
+            format!("{how}: {}", diagnostics.join("; "))
         }
     }
 }
@@ -55,34 +79,38 @@ pub fn augmented_path() -> String {
     parts.join(":")
 }
 
-async fn read_all(mut reader: impl AsyncRead + Unpin) -> std::io::Result<Vec<u8>> {
+async fn read_all(reader: Option<impl AsyncRead + Unpin>) -> std::io::Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    reader.read_to_end(&mut bytes).await?;
+    if let Some(mut reader) = reader {
+        reader.read_to_end(&mut bytes).await?;
+    }
     Ok(bytes)
 }
 
-async fn kill_and_reap(child: &mut tokio::process::Child) -> Option<String> {
-    let kill = child.start_kill().err();
-    let wait = child.wait().await.err();
-    match (kill, wait) {
-        (None, None) => None,
-        (Some(kill), None) if kill.kind() == std::io::ErrorKind::InvalidInput => None,
-        (Some(kill), None) => Some(format!("kill failed: {kill}")),
-        (None, Some(wait)) => Some(format!("reap failed: {wait}")),
-        (Some(kill), Some(wait)) => Some(format!("kill failed: {kill}; reap failed: {wait}")),
+async fn kill_and_reap(child: &mut tokio::process::Child) -> CleanupDiagnostics {
+    let kill_error = child.start_kill().err().map(|error| error.to_string());
+    let reap_error = child.wait().await.err().map(|error| error.to_string());
+    CleanupDiagnostics {
+        kill_error,
+        reap_error,
     }
 }
 
-pub async fn run(command: &[&str], timeout: Duration) -> RunResult {
-    let mut child = match tokio::process::Command::new(command[0])
-        .args(&command[1..])
-        .env("PATH", augmented_path())
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true)
-        .spawn()
-    {
+enum CompletionError {
+    Wait(std::io::Error),
+    Stdout(std::io::Error),
+    Stderr(std::io::Error),
+}
+
+/// Run a fully configured command under one deadline covering the direct child
+/// and every pipe the caller requested. Inherited pipes are dropped before the
+/// direct child is explicitly killed and reaped. Callers must await this future
+/// to completion; external task abortion retains only `kill_on_drop` as a
+/// cancellation backstop and cannot promise explicit reap.
+pub async fn run_command(mut command: Command, timeout: Duration) -> RunResult {
+    let deadline = tokio::time::Instant::now() + timeout;
+    command.kill_on_drop(true);
+    let mut child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
             return RunResult {
@@ -90,32 +118,49 @@ pub async fn run(command: &[&str], timeout: Duration) -> RunResult {
                 out: String::new(),
                 stderr: error.to_string(),
                 end: RunEnd::SpawnFailed,
+                cleanup: None,
             };
         }
     };
-    let stdout = child.stdout.take().expect("piped stdout");
-    let stderr = child.stderr.take().expect("piped stderr");
-    let completed = tokio::time::timeout(timeout, async {
-        tokio::try_join!(child.wait(), read_all(stdout), read_all(stderr))
-    })
-    .await;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let completed = {
+        let joined = async {
+            tokio::try_join!(
+                async { child.wait().await.map_err(CompletionError::Wait) },
+                async { read_all(stdout).await.map_err(CompletionError::Stdout) },
+                async { read_all(stderr).await.map_err(CompletionError::Stderr) }
+            )
+        };
+        tokio::time::timeout_at(deadline, joined).await
+    };
+    // The joined future and its optional drain handles are dropped before any
+    // cleanup borrows the retained Child below.
     match completed {
         Ok(Ok((status, stdout, stderr))) => RunResult {
             ok: status.success(),
             out: String::from_utf8_lossy(&stdout).into_owned(),
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
             end: RunEnd::Exited(status.code()),
+            cleanup: None,
         },
         Ok(Err(error)) => {
             let cleanup = kill_and_reap(&mut child).await;
+            let (end, error) = match error {
+                CompletionError::Wait(error) => (RunEnd::WaitFailed, error.to_string()),
+                CompletionError::Stdout(error) => {
+                    (RunEnd::OutputFailed, format!("read stdout: {error}"))
+                }
+                CompletionError::Stderr(error) => {
+                    (RunEnd::OutputFailed, format!("read stderr: {error}"))
+                }
+            };
             RunResult {
                 ok: false,
                 out: String::new(),
-                stderr: match cleanup {
-                    Some(cleanup) => format!("{error}; {cleanup}"),
-                    None => error.to_string(),
-                },
-                end: RunEnd::SpawnFailed,
+                stderr: error,
+                end,
+                cleanup: Some(cleanup),
             }
         }
         Err(_) => {
@@ -123,11 +168,23 @@ pub async fn run(command: &[&str], timeout: Duration) -> RunResult {
             RunResult {
                 ok: false,
                 out: String::new(),
-                stderr: cleanup.unwrap_or_default(),
+                stderr: String::new(),
                 end: RunEnd::TimedOut,
+                cleanup: Some(cleanup),
             }
         }
     }
+}
+
+pub async fn run(command: &[&str], timeout: Duration) -> RunResult {
+    let mut configured = Command::new(command[0]);
+    configured
+        .args(&command[1..])
+        .env("PATH", augmented_path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    run_command(configured, timeout).await
 }
 
 pub async fn run30(command: &[&str]) -> RunResult {
@@ -199,5 +256,51 @@ mod tests {
             "inherited pipe held the runner for {:?}",
             started.elapsed()
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn preconfigured_file_stdio_drains_only_requested_stderr() {
+        use std::fs::File;
+
+        let root =
+            std::env::temp_dir().join(format!("plant-process-stdio-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("source");
+        let frame = root.join("frame");
+        std::fs::write(&source, b"descriptor input\n").unwrap();
+        let mut command = Command::new("sh");
+        command
+            .args(["-c", "cat; printf compressor-warning >&2"])
+            .stdin(Stdio::from(File::open(&source).unwrap()))
+            .stdout(Stdio::from(File::create(&frame).unwrap()))
+            .stderr(Stdio::piped());
+
+        let result = run_command(command, Duration::from_secs(2)).await;
+
+        assert_eq!(result.end, RunEnd::Exited(Some(0)));
+        assert!(result.ok);
+        assert!(
+            result.out.is_empty(),
+            "file stdout was unexpectedly captured"
+        );
+        assert_eq!(result.stderr, "compressor-warning");
+        assert_eq!(std::fs::read(&frame).unwrap(), b"descriptor input\n");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn exit_75_and_spawn_failure_remain_typed() {
+        let retry = run(&["sh", "-c", "exit 75"], Duration::from_secs(2)).await;
+        assert_eq!(retry.end, RunEnd::Exited(Some(75)));
+        assert!(!retry.ok);
+
+        let missing = run(
+            &["plant-command-that-does-not-exist"],
+            Duration::from_secs(2),
+        )
+        .await;
+        assert_eq!(missing.end, RunEnd::SpawnFailed);
+        assert!(missing.cleanup.is_none());
     }
 }

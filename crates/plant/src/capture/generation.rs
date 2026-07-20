@@ -258,29 +258,28 @@ fn detach_capture(
     })
 }
 
-async fn wait_for_compressor(
-    child: &mut tokio::process::Child,
+async fn run_frame_command(
+    mut command: tokio::process::Command,
+    source: &File,
+    frame: &File,
     timeout: Duration,
-) -> Result<std::process::ExitStatus, String> {
-    match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(Ok(status)) => Ok(status),
-        Ok(Err(error)) => {
-            let _ = child.start_kill();
-            let _ = child.wait().await;
-            Err(format!("wait for zstd: {error}"))
-        }
-        Err(_) => {
-            let kill_error = child.start_kill().err();
-            let reap = child.wait().await;
-            match (kill_error, reap) {
-                (_, Ok(_)) => Err("zstd timed out; killed and reaped".into()),
-                (Some(kill), Err(wait)) => Err(format!(
-                    "zstd timed out; kill failed: {kill}; reap failed: {wait}"
-                )),
-                (None, Err(wait)) => Err(format!("zstd timed out; reap failed: {wait}")),
-            }
-        }
+) -> Result<(), String> {
+    frame
+        .set_len(0)
+        .map_err(|error| format!("truncate compression temp: {error}"))?;
+    let input = clone_at_start(source)?;
+    let output = clone_at_start(frame)?;
+    command
+        .stdin(Stdio::from(input))
+        .stdout(Stdio::from(output))
+        .stderr(Stdio::piped());
+    let result = crate::process::run_command(command, timeout).await;
+    if !result.ok {
+        return Err(format!("zstd {}", result.failure_detail()));
     }
+    frame
+        .sync_all()
+        .map_err(|error| format!("sync compression temp: {error}"))
 }
 
 async fn compress_frame_with_timeout(
@@ -288,58 +287,16 @@ async fn compress_frame_with_timeout(
     frame: &File,
     timeout: Duration,
 ) -> Result<(), String> {
-    use tokio::io::AsyncReadExt;
-
     let source_len = source
         .metadata()
         .map_err(|error| format!("inspect detached generation: {error}"))?
         .len();
-    frame
-        .set_len(0)
-        .map_err(|error| format!("truncate compression temp: {error}"))?;
-    let input = clone_at_start(source)?;
-    let output = clone_at_start(frame)?;
     let stream_size = format!("--stream-size={source_len}");
     let mut command = tokio::process::Command::new("zstd");
     command
         .args(["-19", "-T0", "-q", "-c", &stream_size])
-        .env("PATH", crate::process::augmented_path())
-        .stdin(Stdio::from(input))
-        .stdout(Stdio::from(output))
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("spawn zstd: {error}"))?;
-    let mut stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| "capture zstd stderr unavailable".to_string())?;
-    let (status, stderr) = tokio::join!(wait_for_compressor(&mut child, timeout), async move {
-        let mut bytes = Vec::new();
-        stderr
-            .read_to_end(&mut bytes)
-            .await
-            .map(|_| bytes)
-            .map_err(|error| format!("read zstd stderr: {error}"))
-    });
-    let status = status?;
-    let stderr = stderr?;
-    if !status.success() {
-        let stderr: String = String::from_utf8_lossy(&stderr)
-            .trim()
-            .chars()
-            .take(200)
-            .collect();
-        return Err(if stderr.is_empty() {
-            format!("zstd exit {status}")
-        } else {
-            format!("zstd exit {status}: {stderr}")
-        });
-    }
-    frame
-        .sync_all()
-        .map_err(|error| format!("sync compression temp: {error}"))
+        .env("PATH", crate::process::augmented_path());
+    run_frame_command(command, source, frame, timeout).await
 }
 
 #[derive(Clone, Copy)]
@@ -347,6 +304,8 @@ enum FrameCompressor {
     Zstd,
     #[cfg(test)]
     CorruptSuccess,
+    #[cfg(test)]
+    InheritedStderr,
 }
 
 async fn write_frame(
@@ -368,6 +327,12 @@ async fn write_frame(
             frame
                 .sync_all()
                 .map_err(|error| format!("sync corrupt-success fixture: {error}"))
+        }
+        #[cfg(test)]
+        FrameCompressor::InheritedStderr => {
+            let mut command = tokio::process::Command::new("sh");
+            command.args(["-c", "sleep 5 >&2 & exit 0"]);
+            run_frame_command(command, source, frame, Duration::from_millis(50)).await
         }
     }
 }
@@ -394,7 +359,9 @@ async fn seal_generation_with(
     })?;
     let directory = SessionDirectory::open(directory_path)?;
     directory.lock_exclusive()?;
-    seal_generation_in(&directory, generation, destination, compressor).await
+    let result = seal_generation_in(&directory, generation, destination, compressor).await;
+    drop(directory);
+    result
 }
 
 async fn seal_generation_in(

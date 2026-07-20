@@ -83,3 +83,12 @@
 - [x] 11.5 Reduce sweep to typed inventory policy and orchestration, and route Herdr snapshot persistence through capture-owned APIs
 - [x] 11.6 Move transaction fixtures with the implementation and cover capture, Herdr, and cooperating compressor serialization
 - [x] 11.7 Bound the shared runner across child wait and output drains, explicitly reap timeout/error children, and cover direct-child and inherited-pipe regressions
+
+## 12. Stable reconstruction and unified subprocess ownership
+
+- [x] 12.1 Build a private shared-locked no-follow Reconstruction snapshot with retained sealed, detached, and raw descriptors
+- [x] 12.2 Bound every segment to its captured length; verify detached and committed-suffix digests from retained handles; reject unsafe or duplicate-inode entries
+- [x] 12.3 Prove deterministic Sealing replace/unlink overlap and live-raw growth without duplication, loss, or transient path failure
+- [x] 12.4 Generalize the shared runner for preconfigured commands, optional pipes, one absolute deadline, and typed explicit-reap cleanup
+- [x] 12.5 Route jobs and zstd through the shared runner and cover cwd/env/status, file stdio, direct-child reap, and inherited-stderr transaction release
+- [x] 12.6 Explicitly unlock retained session directories before close and prove a live duplicated descriptor cannot extend the transaction

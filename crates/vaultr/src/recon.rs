@@ -7,12 +7,15 @@
 use anyhow::{Context, Result};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Map, Value};
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufRead, BufReader, Read};
-use std::path::Path;
+use std::collections::{HashMap, HashSet};
+use std::ffi::CString;
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Take};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
 
-use crate::vault::CaptureGenerations;
+use crate::vault::{parse_capture_generation_name, CaptureGenerationName};
 
 /// Harness identity of a capture, derived once during reconstruction.
 ///
@@ -60,6 +63,258 @@ pub struct Recon {
     pub envelopes: usize,
 }
 
+struct SnapshotFile {
+    name: String,
+    file: File,
+    len: u64,
+}
+
+struct SnapshotDetached {
+    segment: SnapshotFile,
+    base_len: u64,
+    digest: String,
+}
+
+struct ReconstructionSnapshot {
+    directory: PathBuf,
+    sealed: Option<SnapshotFile>,
+    detached: Option<SnapshotDetached>,
+    raw: Option<SnapshotFile>,
+}
+
+struct SnapshotDirectory {
+    path: PathBuf,
+    file: File,
+}
+
+impl SnapshotDirectory {
+    fn open(path: &Path) -> Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path)
+            .with_context(|| format!("open session directory {}", path.display()))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+        })
+    }
+
+    fn lock_shared(&self) -> Result<()> {
+        loop {
+            // SAFETY: the retained directory descriptor remains valid for this
+            // object's lifetime and flock does not take ownership of it.
+            if unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_SH) } == 0 {
+                return Ok(());
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error)
+                    .with_context(|| format!("lock session directory {}", self.path.display()));
+            }
+        }
+    }
+
+    fn name(&self, name: &str) -> Result<CString> {
+        if name.is_empty()
+            || Path::new(name).file_name().and_then(|part| part.to_str()) != Some(name)
+        {
+            anyhow::bail!("invalid capture generation under {}", self.path.display());
+        }
+        CString::new(name)
+            .with_context(|| format!("invalid capture generation under {}", self.path.display()))
+    }
+
+    fn open_generation(&self, name: &str) -> Result<SnapshotFile> {
+        let name_c = self.name(name)?;
+        // SAFETY: name_c is NUL-terminated, the retained directory descriptor
+        // is valid, and a successful descriptor is transferred into File.
+        let descriptor = unsafe {
+            libc::openat(
+                self.file.as_raw_fd(),
+                name_c.as_ptr(),
+                libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
+                0,
+            )
+        };
+        if descriptor < 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!("open capture generation {}", self.path.join(name).display())
+            });
+        }
+        // SAFETY: openat returned a new owned descriptor.
+        let file = unsafe { File::from_raw_fd(descriptor) };
+        let metadata = file.metadata().with_context(|| {
+            format!(
+                "inspect capture generation {}",
+                self.path.join(name).display()
+            )
+        })?;
+        if !metadata.is_file() {
+            anyhow::bail!(
+                "capture generation is not a regular file at {}",
+                self.path.join(name).display()
+            );
+        }
+        Ok(SnapshotFile {
+            name: name.to_string(),
+            file,
+            len: metadata.len(),
+        })
+    }
+
+    fn same_file(left: &File, right: &File) -> Result<bool> {
+        let left = left.metadata().context("inspect retained capture entry")?;
+        let right = right.metadata().context("inspect current capture entry")?;
+        Ok(left.is_file()
+            && right.is_file()
+            && left.dev() == right.dev()
+            && left.ino() == right.ino())
+    }
+
+    fn revalidate_entry(&self, expected: &SnapshotFile) -> Result<()> {
+        let current = self.open_generation(&expected.name)?;
+        if !Self::same_file(&current.file, &expected.file)? {
+            anyhow::bail!(
+                "capture generation changed during inventory at {}",
+                self.path.join(&expected.name).display()
+            );
+        }
+        Ok(())
+    }
+
+    fn revalidate_path(&self) -> Result<()> {
+        let current = Self::open(&self.path)?;
+        let retained = self
+            .file
+            .metadata()
+            .with_context(|| format!("inspect session directory {}", self.path.display()))?;
+        let current = current
+            .file
+            .metadata()
+            .with_context(|| format!("reinspect session directory {}", self.path.display()))?;
+        if retained.dev() != current.dev() || retained.ino() != current.ino() {
+            anyhow::bail!(
+                "session directory changed during inventory at {}",
+                self.path.display()
+            );
+        }
+        Ok(())
+    }
+
+    fn entry_names(&self) -> Result<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(&self.path)
+            .with_context(|| format!("read session directory {}", self.path.display()))?
+        {
+            let entry = entry
+                .with_context(|| format!("read session entry under {}", self.path.display()))?;
+            if let Some(name) = entry.file_name().to_str() {
+                names.push(name.to_string());
+            }
+        }
+        Ok(names)
+    }
+}
+
+impl ReconstructionSnapshot {
+    fn with_hook(dir: &Path, retained: impl FnOnce()) -> Result<Self> {
+        let directory = SnapshotDirectory::open(dir)?;
+        directory.lock_shared()?;
+        directory.revalidate_path()?;
+
+        let mut snapshot = Self {
+            directory: dir.to_path_buf(),
+            sealed: None,
+            detached: None,
+            raw: None,
+        };
+        for name in directory.entry_names()? {
+            let kind = parse_capture_generation_name(&name).with_context(|| {
+                format!(
+                    "invalid detached generation at {}",
+                    directory.path.join(&name).display()
+                )
+            })?;
+            let Some(kind) = kind else {
+                continue;
+            };
+            let segment = directory.open_generation(&name)?;
+            match kind {
+                CaptureGenerationName::Raw => snapshot.raw = Some(segment),
+                CaptureGenerationName::Sealed => snapshot.sealed = Some(segment),
+                CaptureGenerationName::Detached { base_len, digest } => {
+                    if snapshot.detached.is_some() {
+                        anyhow::bail!("multiple detached capture generations in {}", dir.display());
+                    }
+                    let actual = crate::vault::sha256_reader(segment.reader()?)?;
+                    if actual != digest {
+                        anyhow::bail!(
+                            "detached generation digest mismatch at {}",
+                            dir.join(&segment.name).display()
+                        );
+                    }
+                    snapshot.detached = Some(SnapshotDetached {
+                        segment,
+                        base_len,
+                        digest,
+                    });
+                }
+            }
+        }
+
+        let mut identities = HashSet::new();
+        for segment in snapshot.segments() {
+            let metadata = segment.file.metadata().with_context(|| {
+                format!(
+                    "inspect capture generation {}",
+                    dir.join(&segment.name).display()
+                )
+            })?;
+            if !identities.insert((metadata.dev(), metadata.ino())) {
+                anyhow::bail!("duplicate capture generation inode in {}", dir.display());
+            }
+            directory.revalidate_entry(segment)?;
+        }
+        directory.revalidate_path()?;
+        retained();
+        Ok(snapshot)
+    }
+
+    fn segments(&self) -> impl Iterator<Item = &SnapshotFile> {
+        self.sealed
+            .iter()
+            .chain(self.detached.iter().map(|detached| &detached.segment))
+            .chain(self.raw.iter())
+    }
+}
+
+impl SnapshotFile {
+    fn reader(&self) -> Result<Take<File>> {
+        let mut file = self
+            .file
+            .try_clone()
+            .context("clone retained capture generation")?;
+        file.seek(SeekFrom::Start(0))
+            .context("seek retained capture generation")?;
+        Ok(file.take(self.len))
+    }
+
+    fn decoded_suffix_digest(&self, offset: u64) -> Result<String> {
+        if offset > self.len {
+            anyhow::bail!("sealed destination is shorter than detached base");
+        }
+        let mut file = self
+            .file
+            .try_clone()
+            .context("clone retained sealed generation")?;
+        file.seek(SeekFrom::Start(offset))
+            .context("seek retained sealed generation")?;
+        let decoder = zstd::Decoder::new(file.take(self.len - offset)).context("zstd decoder")?;
+        crate::vault::sha256_reader(decoder)
+    }
+}
+
 /// Reconstruct from a capture file path (`.zst` handled transparently).
 ///
 /// A resumed capture can have sealed, detached-sealing, and live raw
@@ -70,61 +325,7 @@ pub fn reconstruct(path: &Path) -> Result<Recon> {
     let canonical = matches!(name, Some("turns.jsonl" | "turns.jsonl.zst"))
         || name.is_some_and(|name| name.starts_with("turns.jsonl.sealing-"));
     if canonical {
-        let dir = path.parent().unwrap_or_else(|| Path::new(""));
-        let generations = CaptureGenerations::load(dir)?;
-        let mut st = ReconState::new();
-
-        let sealed_len = match &generations.sealed {
-            Some(sealed) => Some(
-                std::fs::metadata(sealed)
-                    .with_context(|| format!("inspect {}", sealed.display()))?
-                    .len(),
-            ),
-            None => None,
-        };
-        if let Some(sealed) = &generations.sealed {
-            let file = File::open(sealed).with_context(|| format!("open {}", sealed.display()))?;
-            let dec = zstd::Decoder::new(file).context("zstd decoder")?;
-            run_segment(BufReader::new(dec), Segment::Sealed, &mut st)?;
-        }
-        if let Some(detached) = &generations.detached {
-            let sealed = dir.join("turns.jsonl.zst");
-            match sealed_len {
-                Some(len) if len < detached.base_len => anyhow::bail!(
-                    "reconstruct: sealed destination shorter than detached base at {}",
-                    sealed.display()
-                ),
-                None if detached.base_len > 0 => anyhow::bail!(
-                    "reconstruct: detached generation has no sealed base at {}",
-                    sealed.display()
-                ),
-                Some(len) if len > detached.base_len => {
-                    let suffix = File::open(&sealed)
-                        .with_context(|| format!("open {}", sealed.display()))?;
-                    let digest =
-                        crate::vault::decoded_zstd_suffix_digest(suffix, detached.base_len)
-                            .with_context(|| {
-                                format!("verify detached suffix at {}", sealed.display())
-                            })?;
-                    if digest != detached.digest {
-                        anyhow::bail!(
-                            "reconstruct: sealed suffix conflicts with detached generation at {}",
-                            sealed.display()
-                        );
-                    }
-                }
-                _ => {
-                    let file = File::open(&detached.path)
-                        .with_context(|| format!("open {}", detached.path.display()))?;
-                    run_segment(BufReader::new(file), Segment::Sealed, &mut st)?;
-                }
-            }
-        }
-        if let Some(raw) = &generations.raw {
-            let file = File::open(raw).with_context(|| format!("open {}", raw.display()))?;
-            run_segment(BufReader::new(file), Segment::LiveRaw, &mut st)?;
-        }
-        return Ok(st.finish());
+        return reconstruct_canonical(path);
     }
 
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
@@ -134,6 +335,62 @@ pub fn reconstruct(path: &Path) -> Result<Recon> {
         run_segment(BufReader::new(dec), Segment::Sealed, &mut st)?;
     } else {
         run_segment(BufReader::new(file), Segment::LiveRaw, &mut st)?;
+    }
+    Ok(st.finish())
+}
+
+fn reconstruct_canonical(path: &Path) -> Result<Recon> {
+    reconstruct_canonical_with_hook(path, || {})
+}
+
+fn reconstruct_canonical_with_hook(path: &Path, retained: impl FnOnce()) -> Result<Recon> {
+    let dir = path.parent().unwrap_or_else(|| Path::new(""));
+    let snapshot = ReconstructionSnapshot::with_hook(dir, retained)?;
+    reconstruct_snapshot(snapshot)
+}
+
+fn reconstruct_snapshot(snapshot: ReconstructionSnapshot) -> Result<Recon> {
+    let mut st = ReconState::new();
+    if let Some(sealed) = &snapshot.sealed {
+        let dec = zstd::Decoder::new(sealed.reader()?).context("zstd decoder")?;
+        run_segment(BufReader::new(dec), Segment::Sealed, &mut st)?;
+    }
+    if let Some(detached) = &snapshot.detached {
+        let sealed_path = snapshot.directory.join("turns.jsonl.zst");
+        match snapshot.sealed.as_ref().map(|sealed| sealed.len) {
+            Some(len) if len < detached.base_len => anyhow::bail!(
+                "reconstruct: sealed destination shorter than detached base at {}",
+                sealed_path.display()
+            ),
+            None if detached.base_len > 0 => anyhow::bail!(
+                "reconstruct: detached generation has no sealed base at {}",
+                sealed_path.display()
+            ),
+            Some(len) if len > detached.base_len => {
+                let digest = snapshot
+                    .sealed
+                    .as_ref()
+                    .expect("sealed length came from retained segment")
+                    .decoded_suffix_digest(detached.base_len)
+                    .with_context(|| {
+                        format!("verify detached suffix at {}", sealed_path.display())
+                    })?;
+                if digest != detached.digest {
+                    anyhow::bail!(
+                        "reconstruct: sealed suffix conflicts with detached generation at {}",
+                        sealed_path.display()
+                    );
+                }
+            }
+            _ => run_segment(
+                BufReader::new(detached.segment.reader()?),
+                Segment::Sealed,
+                &mut st,
+            )?,
+        }
+    }
+    if let Some(raw) = &snapshot.raw {
+        run_segment(BufReader::new(raw.reader()?), Segment::LiveRaw, &mut st)?;
     }
     Ok(st.finish())
 }
@@ -598,6 +855,150 @@ mod tests {
         let raw = format!("{a}\nnot json at all\n{}\n", env_append(1, "user", "b"));
         let err = reconstruct_reader(raw.as_bytes()).unwrap_err().to_string();
         assert!(err.contains("raw record 2"), "locates the record: {err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retained_snapshot_survives_sealed_replace_and_detached_unlink() {
+        let root = tempfile::TempDir::new().unwrap();
+        let first = format!("{}\n", env_append(0, "user", "first"));
+        let second = format!("{}\n", env_append(1, "user", "second"));
+        let first_frame = zstd::encode_all(first.as_bytes(), 3).unwrap();
+        let second_frame = zstd::encode_all(second.as_bytes(), 3).unwrap();
+        let sealed = root.path().join("turns.jsonl.zst");
+        std::fs::write(&sealed, &first_frame).unwrap();
+        let detached = root.path().join(format!(
+            "turns.jsonl.sealing-{}-{}",
+            first_frame.len(),
+            crate::vault::sha256_hex(second.as_bytes())
+        ));
+        std::fs::write(&detached, second.as_bytes()).unwrap();
+        let merged = root.path().join(".merged");
+        let mut committed = first_frame;
+        committed.extend(second_frame);
+        std::fs::write(&merged, committed).unwrap();
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (go_tx, go_rx) = std::sync::mpsc::channel();
+        let (blocked_tx, blocked_rx) = std::sync::mpsc::channel();
+        let writer_root = root.path().to_path_buf();
+        let writer_detached = detached.clone();
+        let writer = std::thread::spawn(move || {
+            let directory = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                .open(&writer_root)
+                .unwrap();
+            ready_tx.send(()).unwrap();
+            go_rx.recv().unwrap();
+            // SAFETY: directory remains open and flock borrows its descriptor.
+            assert_ne!(
+                unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB,) },
+                0,
+                "writer acquired EX while reconstruction retained SH"
+            );
+            let error = std::io::Error::last_os_error().raw_os_error();
+            assert!(
+                error == Some(libc::EWOULDBLOCK) || error == Some(libc::EAGAIN),
+                "unexpected flock error: {error:?}"
+            );
+            blocked_tx.send(()).unwrap();
+            loop {
+                // SAFETY: directory remains open and flock borrows its descriptor.
+                if unsafe { libc::flock(directory.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                    break;
+                }
+                assert_eq!(
+                    std::io::Error::last_os_error().kind(),
+                    std::io::ErrorKind::Interrupted
+                );
+            }
+            std::fs::rename(
+                writer_root.join(".merged"),
+                writer_root.join("turns.jsonl.zst"),
+            )
+            .unwrap();
+            std::fs::remove_file(writer_detached).unwrap();
+        });
+        ready_rx.recv().unwrap();
+
+        let snapshot = ReconstructionSnapshot::with_hook(root.path(), || {
+            go_tx.send(()).unwrap();
+            blocked_rx.recv().unwrap();
+        })
+        .unwrap();
+        writer.join().unwrap();
+        let retained = reconstruct_snapshot(snapshot).unwrap();
+
+        assert_eq!(retained.envelopes, 2);
+        assert_eq!(retained.messages[0]["content"], "first");
+        assert_eq!(retained.messages[1]["content"], "second");
+        let fresh = reconstruct(&sealed).unwrap();
+        assert_eq!(fresh.messages, retained.messages);
+        assert_eq!(fresh.envelopes, 2);
+    }
+
+    #[test]
+    fn retained_live_raw_reader_stops_at_its_snapshot_length() {
+        use std::io::Write;
+
+        let root = tempfile::TempDir::new().unwrap();
+        let raw = root.path().join("turns.jsonl");
+        let first = format!("{}\n", env_append(0, "user", "first"));
+        let second = format!("{}\n", env_append(1, "user", "second"));
+        std::fs::write(&raw, first).unwrap();
+
+        let retained = reconstruct_canonical_with_hook(&raw, || {
+            let mut file = OpenOptions::new().append(true).open(&raw).unwrap();
+            file.write_all(second.as_bytes()).unwrap();
+        })
+        .unwrap();
+
+        assert_eq!(retained.envelopes, 1);
+        assert_eq!(retained.messages[0]["content"], "first");
+        let fresh = reconstruct(&raw).unwrap();
+        assert_eq!(fresh.envelopes, 2);
+        assert_eq!(fresh.messages[1]["content"], "second");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_rejects_symlink_fifo_directory_and_duplicate_inode_generations() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::TempDir::new().unwrap();
+        let outside = root.path().join("outside");
+        std::fs::write(&outside, b"outside evidence\n").unwrap();
+        let raw = root.path().join("turns.jsonl");
+        symlink(&outside, &raw).unwrap();
+        assert!(reconstruct(&raw).unwrap_err().to_string().contains("open"));
+        assert_eq!(std::fs::read(&outside).unwrap(), b"outside evidence\n");
+        std::fs::remove_file(&raw).unwrap();
+
+        let fifo_name = CString::new(raw.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: fifo_name is a valid NUL-terminated pathname.
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        assert!(reconstruct(&raw)
+            .unwrap_err()
+            .to_string()
+            .contains("not a regular file"));
+        std::fs::remove_file(&raw).unwrap();
+
+        std::fs::create_dir(&raw).unwrap();
+        assert!(reconstruct(&raw)
+            .unwrap_err()
+            .to_string()
+            .contains("not a regular file"));
+        std::fs::remove_dir(&raw).unwrap();
+
+        let sealed = root.path().join("turns.jsonl.zst");
+        let body = format!("{}\n", env_append(0, "user", "first"));
+        std::fs::write(&sealed, zstd::encode_all(body.as_bytes(), 3).unwrap()).unwrap();
+        std::fs::hard_link(&sealed, &raw).unwrap();
+        assert!(reconstruct(&raw)
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate capture generation inode"));
     }
 
     /// Test-only inverse of `encode_delta`: replay set/remove over the prior

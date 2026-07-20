@@ -150,21 +150,37 @@ fresh `turns.jsonl` without touching the detached generation. Persistence never
 calls sweep or mutates a generation; sweep and Herdr call only the narrow
 capture-owned transaction and sidecar-append APIs.
 
-Vaultr owns one canonical capture-generation inventory that validates the
-sealed, raw, and digest-identified detached paths. Reconstruction, maintenance,
-and Plant Sealing all consume that inventory. Plant sweep retains the complete
-inventory in a typed session-generation selection with an explicit raw, sealed,
-or detached kind. Learning eligibility, pending-Sealing selection, and capture
-decoding use that kind and never re-derive evidence type from a filename or
-extension. Sealing regenerates the detached generation's zstd frame. The prior
-destination length identifies the commit boundary: a destination at that
-length is uncommitted; a longer destination is the
+Vaultr owns one canonical capture-generation filename grammar. Maintenance and
+Plant Sealing consume its validated path inventory; Reconstruction materializes
+a distinct private retained-handle snapshot from the same grammar because a
+path inventory cannot remain coherent across a Sealing rename. Plant sweep
+retains the complete path inventory in a typed session-generation selection
+with an explicit raw, sealed, or detached kind. Learning eligibility,
+pending-Sealing selection, and capture decoding use that kind and never
+re-derive evidence type from a filename or extension. Sealing regenerates the
+detached generation's zstd frame. The prior destination length identifies the
+commit boundary: a destination at that length is uncommitted; a longer
+destination is the
 post-rename/pre-detached-removal state only when the canonical decoded-suffix
 proof matches the detached raw digest. This content proof deliberately accepts
 different valid zstd frame representations for the same generation. Any other
-state fails without deleting evidence. Reconstruction reads sealed, detached,
-and new live raw generations in order and reuses that same proof. Sealed length
-alone is never proof.
+state fails without deleting evidence. Reconstruction reuses the same decoded
+suffix proof against its retained sealed descriptor. Sealed length alone is
+never proof.
+
+The private Reconstruction snapshot opens the session directory
+`O_DIRECTORY|O_NOFOLLOW`, takes a blocking shared advisory flock with
+interrupted calls retried, enumerates the canonical generation grammar, and
+opens every recognized entry relative to that directory with
+`O_RDONLY|O_NOFOLLOW|O_NONBLOCK`. While locked it requires regular files,
+rejects duplicate device/inode identities, retains each fstat length, verifies
+the detached digest from its retained descriptor, reopens every entry to
+revalidate device/inode/type, and proves that the lexical directory pathname
+still identifies the retained directory. It then drops the shared lock and
+streams only the retained handles, with every reader bounded to its captured
+length. A live append therefore belongs to the next snapshot, while rename and
+unlink cannot invalidate the current one. Sealed, detached, and raw ordering is
+unchanged.
 
 Detached conflicts and scrubbing, compression, rename, or cleanup failures
 preserve the evidence and propagate as operational failures. Manual compression
@@ -187,6 +203,10 @@ precondition, no second Plant process can create or retire another compressor's
 temporary entry. Same-account writers that ignore the advisory lock are outside
 this contract; device/inode checks reject static or pre-operation substitutions
 but do not claim atomic rejection of a hostile swap in the syscall gap.
+`SessionDirectory` explicitly applies `LOCK_UN` before its retained file closes:
+a concurrent fork can briefly inherit the same open-file description before
+exec honors `O_CLOEXEC`, but that duplicate cannot extend a completed
+transaction's lock.
 
 Hashing, compression input/output, suffix comparison, rename, and cleanup use
 retained regular-file descriptors. Directory-relative rename and unlink do not
@@ -208,12 +228,18 @@ symlinks, non-regular entries, forbidden names, and near misses fail closed. A
 timed-out zstd child is explicitly killed and reaped before its retained output
 is cleaned.
 
-All orchestration callers share one subprocess runner. Its deadline covers the
-direct child wait and both output drains concurrently. A timeout, wait error, or
-drain error drops the drain futures, explicitly kills the retained child, and
-waits to reap it before returning. If a background descendant inherits an
-output pipe after the direct child exits, the still-open pipe cannot extend the
-deadline.
+All orchestration callers share one subprocess runner that accepts an already
+configured Tokio command without replacing its stdin, stdout, or stderr. Jobs
+configure null stdin and both output pipes; zstd configures retained source and
+frame descriptors plus only piped stderr. One absolute deadline covers the
+direct child wait and every optional drain concurrently. A timeout, wait error,
+or drain error first drops the joined drain future, then calls `start_kill` and
+waits unconditionally to reap the retained direct child before returning typed
+end and cleanup diagnostics. If a background descendant inherits an output
+pipe after the direct child exits, the still-open pipe cannot extend the
+deadline. Detached descendants are not owned or terminated. Callers must await
+the runner to completion; external task abortion retains only `kill_on_drop` as
+a cancellation backstop.
 
 The detached filename and location diagnostics contain no captured content.
 Legacy Envelope files and concatenated zstd frames remain unchanged.
@@ -226,6 +252,10 @@ and do not reclassify an accepted stage as lost.
 
 Deepen the existing Reconstruction path:
 
+- Take a private shared-locked, no-follow, regular-file descriptor snapshot of
+  sealed, detached, and raw generations before streaming.
+- Bound every segment to its retained fstat length, reject duplicate inodes,
+  and never reopen a generation pathname after the snapshot.
 - Ignore whitespace-only terminated records.
 - Recover every complete concatenated JSON Envelope value from a terminated
   non-whitespace record.
@@ -234,8 +264,9 @@ Deepen the existing Reconstruction path:
 - Ignore an unterminated final fragment only for a live raw `turns.jsonl`.
 - Fail on incomplete or malformed trailing content in a sealed capture.
 
-Embedded SSE parsing, legacy Envelope decoding, and issue #16 mixed-generation
-sibling selection remain separate contracts.
+Embedded SSE parsing and legacy Envelope decoding remain separate contracts.
+Issue #16 mixed-generation sibling selection keeps its semantics but now
+consumes the stable descriptor snapshot.
 
 ## Context
 

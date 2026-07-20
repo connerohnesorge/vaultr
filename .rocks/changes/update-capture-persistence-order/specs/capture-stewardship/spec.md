@@ -184,16 +184,25 @@ session-directory lock from temp recovery through commit and cleanup. Under that
 single-owner precondition, rename and cleanup MUST verify that each directory
 entry still identifies the retained inode and MUST use directory-relative
 operations that do not follow symlinks. Hostile same-account writers that ignore
-the advisory lock are outside this contract. Source or merged file data and the
-committed destination name MUST be durable before detached evidence is removed,
-and the final removal MUST also be directory-durable.
-Vaultr MUST provide one validated canonical
-generation inventory consumed by Reconstruction, maintenance, and Plant
-Sealing. Plant maintenance MUST retain that inventory in a typed selection with
-an explicit generation kind; learning, pending-Sealing, and decoding decisions
-MUST consume the typed selection without filename- or extension-based
-classification. Detached evidence MUST be omitted only after the sealed suffix
-at the recorded base decodes to the detached digest. Detached conflicts and
+the advisory lock are outside this contract. The retained directory owner MUST
+explicitly unlock before closing its file descriptor so a concurrent
+fork-before-exec duplicate cannot extend a completed transaction. Source or
+merged file data and the committed destination name MUST be durable before
+detached evidence is removed, and the final removal MUST also be
+directory-durable.
+Vaultr MUST provide one canonical generation grammar. Maintenance and Plant
+Sealing MUST consume its validated path inventory, while Reconstruction MUST
+materialize a private retained-handle snapshot from that same grammar under a
+cooperative shared session-directory flock. Plant maintenance MUST retain its
+inventory in a typed selection with an explicit generation kind; learning,
+pending-Sealing, and decoding decisions MUST consume the typed selection
+without filename- or extension-based classification. Reconstruction MUST open
+every generation no-follow relative to its retained directory, require regular
+and pairwise-distinct device/inode identities, verify detached digest evidence
+from the retained handle, and bound every segment to the length captured from
+that handle. Detached evidence MUST be omitted only after the sealed suffix at
+the recorded base through the captured sealed length decodes from the same
+retained sealed handle to the detached digest. Detached conflicts and
 scrubbing, compression, rename, or cleanup failures MUST preserve evidence and
 propagate as operational failures. Existing Envelope and concatenated-zstd
 generation formats MUST remain readable. Capture MUST own one
@@ -230,6 +239,12 @@ capture-owned APIs rather than mutating generations or rebuilding locks.
 - WHEN two Plant processes attempt maintenance in one session directory
 - THEN the retained exclusive directory lock serializes temp recovery, commit, and cleanup
 - AND one compressor cannot retire the other cooperating compressor's temp evidence
+
+#### Scenario: A subprocess fork inherits the locked directory description
+
+- WHEN a concurrent fork temporarily duplicates the session-directory open-file description before exec applies `O_CLOEXEC`
+- THEN dropping the transaction owner explicitly unlocks before closing its descriptor
+- AND the inherited duplicate cannot delay the next maintenance owner
 
 #### Scenario: A previous-version temp remains after upgrade
 
@@ -268,14 +283,33 @@ capture-owned APIs rather than mutating generations or rebuilding locks.
 #### Scenario: A shared subprocess exceeds its complete deadline
 
 - WHEN a direct child remains alive past the deadline or exits while a background descendant retains stdout or stderr
-- THEN the deadline bounds the child wait and both output drains
+- THEN one absolute deadline bounds the child wait and every caller-requested output drain
 - AND Plant drops the drains, explicitly kills and reaps the direct child, and returns without waiting for the inherited pipe
+- AND it does not claim to terminate detached descendants
+
+#### Scenario: Callers configure subprocess descriptors
+
+- WHEN a job requests null stdin and two pipes or zstd requests retained file stdin, retained file stdout, and one stderr pipe
+- THEN the shared runner preserves that preconfigured standard I/O and drains only pipe handles returned by the spawned child
+- AND exit 75, spawn failure, timeout, wait failure, output failure, and cleanup diagnostics remain distinguishable
 
 #### Scenario: Reconstruction overlaps Sealing
 
 - WHEN sealed, detached, and newer live raw generations coexist
-- THEN Reconstruction reads every generation exactly once in chronological order
+- THEN Reconstruction retains a shared-locked no-follow snapshot before Sealing can replace the destination and remove detached evidence
+- AND it releases the shared lock before streaming retained handles exactly once in chronological order
 - AND errors identify only locations rather than captured content
+
+#### Scenario: Live raw grows after its reconstruction snapshot
+
+- WHEN a live raw append completes after Reconstruction captures the retained raw descriptor length
+- THEN the current snapshot reads only through that captured length with live-tail tolerance
+- AND a fresh Reconstruction observes the appended Envelope
+
+#### Scenario: Unsafe reconstruction generation entries
+
+- WHEN a canonical generation name resolves to a symlink, FIFO, directory, other non-regular entry, or an inode already retained under another generation name
+- THEN Reconstruction rejects the snapshot without following or decoding that entry
 
 #### Scenario: Sealed length advances without matching evidence
 

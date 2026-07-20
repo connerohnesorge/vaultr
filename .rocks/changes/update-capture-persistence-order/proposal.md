@@ -30,7 +30,12 @@ must reconcile that durable backlog before new capture or Sealing begins.
   of treating an incomplete inventory as successful work.
 - Keep Session Index and Herdr snapshot timing at durable stage acceptance.
 - Make Reconstruction recover complete concatenated legacy Envelopes while
-  rejecting unrecoverable terminated records and malformed sealed tails.
+  rejecting unrecoverable terminated records and malformed sealed tails, and
+  retain one no-follow, length-bounded generation snapshot across concurrent
+  Sealing rename and cleanup.
+- Supervise preconfigured job and compressor commands through one complete
+  deadline covering the direct-child wait and only the requested output pipes,
+  with explicit kill and reap before transaction cleanup.
 - Preserve the current live-raw exception for one unterminated final fragment.
 
 ## Impact
