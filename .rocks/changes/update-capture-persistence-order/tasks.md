@@ -82,3 +82,4 @@
 - [x] 11.4 Move readiness, Capture and Herdr detachment, compressor lifecycle, and exact-once Sealing behind one capture-owned transaction API
 - [x] 11.5 Reduce sweep to typed inventory policy and orchestration, and route Herdr snapshot persistence through capture-owned APIs
 - [x] 11.6 Move transaction fixtures with the implementation and cover capture, Herdr, and cooperating compressor serialization
+- [x] 11.7 Bound the shared runner across child wait and output drains, explicitly reap timeout/error children, and cover direct-child and inherited-pipe regressions

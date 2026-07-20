@@ -49,6 +49,7 @@ must reconcile that durable backlog before new capture or Sealing begins.
   - #20: complete two-listener ownership and daemon-only scheduled compression
   - #21: path-exact, strict, fail-closed recovery
   - #22: byte-exact idempotent recovery append reconciliation
+  - #30: bounded subprocess timeout with explicit child kill and reap
   - #32: explicit maintenance traversal failure propagation
 - Related historical issue: #16 documents the legacy concatenated-record and
   mixed-generation Reconstruction evidence

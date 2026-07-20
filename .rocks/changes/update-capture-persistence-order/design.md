@@ -208,6 +208,13 @@ symlinks, non-regular entries, forbidden names, and near misses fail closed. A
 timed-out zstd child is explicitly killed and reaped before its retained output
 is cleaned.
 
+All orchestration callers share one subprocess runner. Its deadline covers the
+direct child wait and both output drains concurrently. A timeout, wait error, or
+drain error drops the drain futures, explicitly kills the retained child, and
+waits to reap it before returning. If a background descendant inherits an
+output pipe after the direct child exits, the still-open pipe cannot extend the
+deadline.
+
 The detached filename and location diagnostics contain no captured content.
 Legacy Envelope files and concatenated zstd frames remain unchanged.
 

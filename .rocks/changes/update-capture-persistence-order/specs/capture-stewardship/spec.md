@@ -265,6 +265,12 @@ capture-owned APIs rather than mutating generations or rebuilding locks.
 - WHEN zstd exceeds the compression timeout
 - THEN Plant kills and reaps the child before returning and cleaning its descriptor-owned temp
 
+#### Scenario: A shared subprocess exceeds its complete deadline
+
+- WHEN a direct child remains alive past the deadline or exits while a background descendant retains stdout or stderr
+- THEN the deadline bounds the child wait and both output drains
+- AND Plant drops the drains, explicitly kills and reaps the direct child, and returns without waiting for the inherited pipe
+
 #### Scenario: Reconstruction overlaps Sealing
 
 - WHEN sealed, detached, and newer live raw generations coexist
