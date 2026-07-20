@@ -74,9 +74,21 @@ async fn dispatch(command: Command) -> i32 {
                         return 2;
                     }
                 },
-                None => sweep::eligible_sessions(&vault, args.idle, args.max, args.learner),
+                None => match sweep::eligible_sessions(&vault, args.idle, args.max, args.learner) {
+                    Ok(list) => list,
+                    Err(error) => {
+                        eprintln!("sessions eligible: inventory failed: {error}");
+                        return 2;
+                    }
+                },
             };
-            let (total, ledgered) = sweep::eligibility_stats(&vault, args.learner);
+            let (total, ledgered) = match sweep::eligibility_stats(&vault, args.learner) {
+                Ok(stats) => stats,
+                Err(error) => {
+                    eprintln!("sessions eligible: inventory failed: {error}");
+                    return 2;
+                }
+            };
             eprintln!(
                 "[eligible:{}] {} of {total} sessions ({ledgered} ledgered)",
                 args.learner.ledger_label(),
@@ -130,7 +142,13 @@ async fn dispatch(command: Command) -> i32 {
             }
         },
         Command::SessionsStuck(age) => {
-            let stuck = sweep::stuck_captures(&vault_root(), age);
+            let stuck = match sweep::stuck_captures(&vault_root(), age) {
+                Ok(stuck) => stuck,
+                Err(error) => {
+                    eprintln!("sessions stuck: inventory failed: {error}");
+                    return 2;
+                }
+            };
             for capture in &stuck {
                 println!(
                     "{} {} idle={}h",
@@ -158,7 +176,13 @@ async fn dispatch(command: Command) -> i32 {
                     return 2;
                 }
             };
-            i32::from(!sweep::compress_sweep(&vault, idle).await)
+            match sweep::compress_sweep(&vault, idle).await {
+                Ok(()) => 0,
+                Err(error) => {
+                    eprintln!("compress once: {error}");
+                    1
+                }
+            }
         }
         Command::JobsRun(name) => {
             match jobs::load_jobs().into_iter().find(|job| job.name == name) {

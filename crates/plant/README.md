@@ -8,6 +8,13 @@ and `~/.dotfiles/.claude/SESSIONS.md` for the behavioral contract.
 - Health: `curl http://127.0.0.1:18923/health`
 - Verify: `target/release/plant --self-test`
 
+## Capture maintenance ownership
+
+Sweep selects validated generation inventories and policy; the private capture
+maintenance module alone rechecks journal/stage readiness, detaches Capture and
+Herdr generations, and seals them through one retained no-follow
+session-directory boundary.
+
 ## Surviving restarts (launchd supervision)
 
 Clients (Claude Code's SDK) already retry failed API requests with backoff, so
@@ -18,9 +25,10 @@ server-side pieces make restarts actually safe:
    (stow-linked from `Library/LaunchAgents/` in this repo) respawns plant
    whenever it dies, mid-session included. Previously only the SessionStart
    hook started it, so a crash left live sessions dead until the next session
-   launch. plant's existing "port already bound → exit 0" behavior makes the
-   launchd copy and hook-started copies coexist safely: whoever binds first
-   wins, the loser exits 0. Logs: `~/.local/state/plant/launchd.log`.
+   launch. plant binds both harness ports before recovery or scheduler work.
+   A losing copy exits 0 only when both health endpoints identify a complete
+   incumbent plant; partial or foreign ownership fails without mutating
+   recovery state. Logs: `~/.local/state/plant/launchd.log`.
 
 2. **Listeners retained through a fixed-set drain** — on SIGTERM/SIGINT, each
    listener stops accepting, closes its owned capture-task tracker, and

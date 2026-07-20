@@ -10,7 +10,9 @@
 //! scheduling state (due when now - last.ts >= every). Exit code contract:
 //! 0 = success, 75 = retry next tick without recording (EX_TEMPFAIL, e.g. herdr down),
 //! anything else = failed. The job set is rescanned every tick — edits and interval
-//! renames take effect without a restart.
+//! renames take effect without a restart. Discovery assigns the `compress`
+//! cadence marker an in-process action; the listener-owning daemon is the only
+//! scheduler that may run compression, and it never executes the marker script.
 
 #[cfg(test)]
 use std::collections::HashMap;
@@ -593,10 +595,9 @@ async fn execute_script_with_timeout(job: &Job, timeout: Duration) -> JobExecuti
 }
 
 async fn execute_compression(vault: &Path) -> JobExecution {
-    if crate::sweep::compress_sweep(vault, Duration::from_secs(3600)).await {
-        JobExecution::Succeeded("in-process compression complete".to_string())
-    } else {
-        JobExecution::Failed("in-process compression failed".to_string())
+    match crate::sweep::compress_sweep(vault, Duration::from_secs(3600)).await {
+        Ok(()) => JobExecution::Succeeded("in-process compression complete".to_string()),
+        Err(error) => JobExecution::Failed(format!("in-process compression failed: {error}")),
     }
 }
 
@@ -692,7 +693,6 @@ async fn dispatch_scheduled(
     let execution = execute_scheduled(job, vault, script_timeout).await;
     ScheduledDispatch::Finished(finish_execution(job, attempt, started, execution))
 }
-
 pub async fn scheduler(cfg: Cfg, vault: PathBuf) {
     if cfg.get("PLANT_JOBS").as_deref() == Some("0") {
         println!("[jobs] disabled (PLANT_JOBS=0)");

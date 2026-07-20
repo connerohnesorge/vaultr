@@ -3,9 +3,8 @@
 //! assertions, header allowlist, 502 path, OTLP payload assertions, scrub.
 
 use crate::adapter::adapters;
-use crate::capture::session_dir;
+use crate::capture::{scrub, session_dir};
 use crate::proxy::{self, ProxyCtx};
-use crate::sweep;
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
@@ -582,7 +581,7 @@ pub async fn self_test() {
             json!({ "out": format!("token={tok} sid={uuid}") }).to_string() + "\n",
         )
         .unwrap();
-        assert!(sweep::scrub(&sf).await);
+        assert!(scrub(&sf).await);
         let scrubbed = std::fs::read_to_string(&sf).unwrap();
         assert!(!scrubbed.contains(&tok) && scrubbed.contains("[REDACTED]"));
         assert!(
@@ -608,7 +607,7 @@ pub async fn self_test() {
         .unwrap();
         let prev_home = std::env::var("HOME").ok();
         std::env::set_var("HOME", &home);
-        let ok = sweep::scrub(&df).await;
+        let ok = scrub(&df).await;
         match prev_home {
             Some(h) => std::env::set_var("HOME", h),
             None => std::env::remove_var("HOME"),

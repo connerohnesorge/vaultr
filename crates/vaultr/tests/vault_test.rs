@@ -221,3 +221,78 @@ fn session_dir_scan_fallback() {
     let dir = vault::session_dir(tmp.path(), &s).unwrap();
     assert!(dir.ends_with("2026/07/11/aaaa1111-0000-0000-0000-000000000001"));
 }
+
+#[cfg(unix)]
+#[test]
+fn session_dir_rejects_a_symlinked_fast_path() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = TempDir::new().unwrap();
+    let outside = TempDir::new().unwrap();
+    let sid = "aaaa1111-0000-0000-0000-000000000001";
+    fs::create_dir_all(outside.path().join("07/10").join(sid)).unwrap();
+    symlink(outside.path(), tmp.path().join("2026")).unwrap();
+    let session = vault::Session {
+        id: sid.to_string(),
+        meta: vault::Meta {
+            original_start: Some("2026-07-10T00:00:00Z".into()),
+            ..Default::default()
+        },
+    };
+
+    let error = vault::session_dir(tmp.path(), &session)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("symlinked session path level"), "{error}");
+}
+
+#[test]
+fn session_walker_distinguishes_missing_and_empty_roots() {
+    let tmp = TempDir::new().unwrap();
+    let empty = tmp.path().join("empty");
+    fs::create_dir(&empty).unwrap();
+    assert!(vault::walk_session_dirs(&empty).unwrap().is_empty());
+
+    let missing = tmp.path().join("missing");
+    let error = vault::walk_session_dirs(&missing).unwrap_err().to_string();
+    assert!(error.contains(&missing.display().to_string()), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn session_walker_propagates_an_unreadable_date_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new().unwrap();
+    let day = tmp.path().join("2026/07/20");
+    fs::create_dir_all(&day).unwrap();
+    fs::set_permissions(&day, fs::Permissions::from_mode(0o000)).unwrap();
+    let error = vault::walk_session_dirs(tmp.path())
+        .unwrap_err()
+        .to_string();
+    fs::set_permissions(&day, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(error.contains(&day.display().to_string()), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn session_walker_rejects_symlinked_date_and_session_levels() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = TempDir::new().unwrap();
+    let sessions = tmp.path().join("sessions");
+    let outside = tmp.path().join("outside");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::create_dir_all(outside.join("07/20/session")).unwrap();
+    symlink(&outside, sessions.join("2026")).unwrap();
+    assert!(vault::walk_session_dirs(&sessions).is_err());
+
+    fs::remove_file(sessions.join("2026")).unwrap();
+    fs::create_dir_all(sessions.join("2026/07/20")).unwrap();
+    symlink(
+        outside.join("07/20/session"),
+        sessions.join("2026/07/20/session"),
+    )
+    .unwrap();
+    assert!(vault::walk_session_dirs(&sessions).is_err());
+}

@@ -365,7 +365,7 @@ async fn handle(
                     method,
                     path,
                     content_encoding,
-                    body_sha256: capture::sha256_hex(&decoded),
+                    body_sha256: vaultr::vault::sha256_hex(&decoded),
                     ids,
                     started_at,
                 };

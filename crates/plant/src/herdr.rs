@@ -1,9 +1,8 @@
-use crate::capture::{cached_session_ids, iso_now, session_dir};
+use crate::capture::{append_herdr_snapshot, cached_session_ids, current_herdr_snapshot, iso_now};
 use crate::process::{run30, RunResult};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -640,25 +639,6 @@ fn interval() -> Duration {
     )
 }
 
-fn last_snapshot(path: &Path) -> String {
-    use std::io::BufRead;
-    let Some(line) = std::fs::File::open(path)
-        .ok()
-        .and_then(|f| std::io::BufReader::new(f).lines().last())
-        .and_then(Result::ok)
-    else {
-        return String::new();
-    };
-    let Ok(mut value) = serde_json::from_str::<Value>(&line) else {
-        return String::new();
-    };
-    let Some(object) = value.as_object_mut() else {
-        return String::new();
-    };
-    object.remove("ts");
-    serde_json::to_string(&value).unwrap_or_default()
-}
-
 fn snapshot(bound: &Pane, panes: &[Pane]) -> Snapshot {
     Snapshot {
         pane: BoundPane {
@@ -695,11 +675,10 @@ pub fn maybe_snapshot(vault: &Path) {
             cached_session_ids(&vault)
                 .into_iter()
                 .filter(|sid| {
-                    let path = session_dir(&vault, sid).ok().map(|d| d.join("herdr.jsonl"));
                     let entry = state.entry(sid.clone()).or_insert_with(|| {
                         (
                             now.checked_sub(wait).unwrap_or(now),
-                            path.as_deref().map(last_snapshot).unwrap_or_default(),
+                            current_herdr_snapshot(&vault, sid),
                         )
                     });
                     if now.duration_since(entry.0) < wait {
@@ -727,24 +706,15 @@ pub fn maybe_snapshot(vault: &Path) {
             let Ok(sans_ts) = serde_json::to_string(&snapshot) else {
                 continue;
             };
-            let mut guard = SNAPSHOTS.lock().unwrap();
-            let state = guard.get_or_insert_with(HashMap::new);
-            let Some(entry) = state.get_mut(&sid) else {
-                continue;
-            };
-            if entry.1 == sans_ts {
+            if SNAPSHOTS
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|state| state.get(&sid))
+                .is_none_or(|entry| entry.1 == sans_ts)
+            {
                 continue;
             }
-            let Ok(dir) = session_dir(&vault, &sid) else {
-                continue;
-            };
-            let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(dir.join("herdr.jsonl"))
-            else {
-                continue;
-            };
             let Ok(line) = serde_json::to_string(&TimestampedSnapshot {
                 ts: iso_now(),
                 pane: &snapshot.pane,
@@ -752,8 +722,18 @@ pub fn maybe_snapshot(vault: &Path) {
             }) else {
                 continue;
             };
-            if writeln!(file, "{}", line).is_ok() {
-                entry.1 = sans_ts;
+            if append_herdr_snapshot(&vault, &sid, &sans_ts, &line)
+                .await
+                .is_ok_and(|appended| appended)
+            {
+                if let Some(entry) = SNAPSHOTS
+                    .lock()
+                    .unwrap()
+                    .get_or_insert_with(HashMap::new)
+                    .get_mut(&sid)
+                {
+                    entry.1 = sans_ts;
+                }
             }
         }
     });

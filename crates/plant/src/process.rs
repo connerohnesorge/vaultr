@@ -195,16 +195,6 @@ pub(crate) async fn run(cmd: &[&str], timeout: Duration) -> RunResult {
     run_command(&mut command, timeout).await
 }
 
-pub(crate) async fn run_inherit_stderr(cmd: &[&str], timeout: Duration) -> RunResult {
-    let mut command = tokio::process::Command::new(cmd[0]);
-    command
-        .args(&cmd[1..])
-        .env("PATH", augmented_path())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
-    run_command(&mut command, timeout).await
-}
-
 pub(crate) async fn run30(cmd: &[&str]) -> RunResult {
     run(cmd, Duration::from_secs(30)).await
 }
