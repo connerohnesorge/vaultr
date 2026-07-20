@@ -32,12 +32,17 @@ Plant MUST recover every ordering journal and completed stage before accepting
 proxy traffic or permitting Sealing, and only after retaining both harness
 listeners. Recovery MUST inventory only the canonical current root while
 retaining each discovered journal, Session Capture, and stage path. It MUST
-require valid journals and mandatory stage root, sequence, request, and
-Envelope identity; MUST reconcile retired stages only against exact committed
-evidence; MUST surface cleanup failures; MUST preserve every real request
-delta; and MUST NOT invent response output. Conflicting or malformed evidence
-MUST fail startup without altering persisted capture bytes. Durability under
-this requirement covers Plant process crashes, not sudden host power loss.
+reject symlinked numeric date or session levels and any canonical session path
+outside the canonical root. A private strict Journal loader MUST explicitly
+validate legacy state and, when `capture_order` is present, require every
+ordering field and valid bound and request identity. Recovery MUST retain the
+parsed Journal through application; require mandatory stage root, sequence,
+request, and Envelope identity; reconcile retired stages only against exact
+committed evidence; surface journal and cleanup failures; preserve every real
+request delta; and MUST NOT invent response output. Conflicting or malformed
+evidence MUST fail startup without altering persisted capture bytes. Durability
+under this requirement covers Plant process crashes, not sudden host power
+loss.
 
 #### Scenario: Plant restarts with abandoned preparations
 
@@ -94,6 +99,22 @@ this requirement covers Plant process crashes, not sudden host power loss.
 - WHEN a reconciled stage cannot be removed
 - THEN recovery reports the cleanup failure and preserves the stage for an idempotent retry
 
+#### Scenario: Append succeeds before journal retirement
+
+- WHEN exact Envelope bytes reach `turns.jsonl` but journal retirement fails
+- THEN the operation reports failure and preserves the stage
+- AND retry persists retirement and cleanup with exactly one Envelope record
+
+#### Scenario: Crash prefix splits a UTF-8 code point
+
+- WHEN the final live bytes are an exact staged-Envelope prefix ending inside a multibyte UTF-8 code point
+- THEN recovery repairs the prefix using byte equality and persists the exact Envelope once
+
+#### Scenario: Session traversal encounters a symlink escape
+
+- WHEN a numeric date or session level is a symlink or canonicalizes outside the Session Capture root
+- THEN recovery fails before mutating the symlink target or any retained evidence
+
 ### Requirement: Immutable generation Sealing
 
 Plant MUST recheck Sealing eligibility under the per-session capture mutex and
@@ -101,7 +122,12 @@ atomically detach the eligible raw generation so subsequent captures write a
 fresh raw file. The detached generation MUST remain reconstructable and
 digest-identified until its zstd frame is committed exactly once. A retry MUST
 distinguish an uncommitted destination from the exact post-rename,
-pre-detached-removal state. Existing Envelope and concatenated-zstd generation
+pre-detached-removal state. Vaultr MUST provide one validated canonical
+generation inventory consumed by Reconstruction, maintenance, and Plant
+Sealing. Detached evidence MUST be omitted only after the sealed suffix at the
+recorded base decodes to the detached digest. Detached conflicts and scrubbing,
+compression, rename, or cleanup failures MUST preserve evidence and propagate
+as operational failures. Existing Envelope and concatenated-zstd generation
 formats MUST remain readable.
 
 #### Scenario: Capture finishes at the Sealing boundary
@@ -121,12 +147,27 @@ formats MUST remain readable.
 - THEN Reconstruction reads every generation exactly once in chronological order
 - AND errors identify only locations rather than captured content
 
+#### Scenario: Sealed length advances without matching evidence
+
+- WHEN a sealed destination is longer than a detached generation's recorded base but its decoded suffix does not match the detached digest
+- THEN Reconstruction fails without omitting the detached evidence
+
+#### Scenario: Detached Sealing conflicts
+
+- WHEN the sealed destination cannot be proven uncommitted or exactly committed for the detached generation
+- THEN Sealing preserves both generations and reports operational failure
+- AND manual compression exits 2 while scheduled compression records failure
+
 ### Requirement: Complete daemon ownership before recovery
 
 Plant MUST bind and retain both configured harness listeners before capture
 recovery or scheduler startup. On any partial collision it MUST release acquired
 listeners and exit zero only when both health endpoints identify the expected
-complete incumbent Plant; otherwise it MUST fail nonzero.
+complete incumbent Plant; otherwise it MUST fail nonzero. Scheduled compression
+MUST run in-process in that listener-owning daemon. Manual compression MUST
+acquire and retain both listeners, recover capture persistence, and only then
+sweep or refuse to run. A gracefully draining daemon MUST retain both listeners
+until no in-flight task can append.
 
 #### Scenario: Complete incumbent already owns both harnesses
 
@@ -137,6 +178,18 @@ complete incumbent Plant; otherwise it MUST fail nonzero.
 
 - WHEN one harness listener is occupied without a complete matching incumbent
 - THEN Plant releases any listener it acquired, exits nonzero, and performs no recovery mutation
+
+#### Scenario: Manual compression contends with live capture
+
+- WHEN the listener-owning daemon enters graceful shutdown with an in-flight append and another process requests manual compression
+- THEN manual compression exits 2 without scrubbing, renaming, or sealing any generation
+- AND the daemon completes the append exactly once
+
+#### Scenario: Scheduled compression is due
+
+- WHEN the compression cadence is due in the listener-owning daemon
+- THEN that daemon invokes the sweep directly without spawning a child Plant
+- AND any operational failure is recorded as a failed job outcome
 
 ### Requirement: Complete Envelope record reconstruction
 

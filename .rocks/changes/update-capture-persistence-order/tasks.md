@@ -33,3 +33,13 @@
 - [x] 5.3 Make recovery inventory current-root-only, path-exact, strict about journal/stage identity, and explicit about cleanup failures
 - [x] 5.4 Reconcile abandoned incomplete Envelope appends through the existing exact-tail seam
 - [x] 5.5 Cover concurrent detachment, Sealing retry, two-process ownership, strict evidence fixtures, and incomplete append retries
+
+## 6. Acceptance-critical review fixes
+
+- [x] 6.1 Move Journal, stage, byte-exact commit, and retained recovery state into one private persistence module
+- [x] 6.2 Validate legacy and ordered journal shapes through one loader used by preparation, draining, recovery, and detachment
+- [x] 6.3 Reconcile live and recovery commits through one exact-byte transaction and cover UTF-8-split prefixes, journal failure, and cleanup failure
+- [x] 6.4 Centralize sealed, raw, and detached generation validation and require digest proof before omitting detached evidence
+- [x] 6.5 Reject symlinked or escaping Session Capture traversal before recovery mutation
+- [x] 6.6 Run scheduled compression in the listener owner, gate manual compression on both listeners, and propagate Sealing failures
+- [x] 6.7 Prove graceful-drain append exclusion and scheduled failure recording with independent processes

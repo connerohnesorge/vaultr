@@ -10,7 +10,9 @@
 //! scheduling state (due when now - last.ts >= every). Exit code contract:
 //! 0 = success, 75 = retry next tick without recording (EX_TEMPFAIL, e.g. herdr down),
 //! anything else = failed. The job set is rescanned every tick — edits and interval
-//! renames take effect without a restart.
+//! renames take effect without a restart. The `compress` cadence marker runs
+//! its sweep directly in the listener-owning daemon; every other job executes
+//! its script.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -299,7 +301,21 @@ pub async fn run_job(job: &Job) -> i32 {
     }
 }
 
-pub async fn scheduler(cfg: Cfg) {
+async fn run_compress_job(job: &Job, vault: &std::path::Path) -> i32 {
+    let started = SystemTime::now();
+    match crate::sweep::compress_sweep(vault, Duration::from_secs(3600)).await {
+        Ok(()) => {
+            record(&job.name, "success", started, "in-process sweep complete");
+            0
+        }
+        Err(error) => {
+            record(&job.name, "failed", started, &error);
+            1
+        }
+    }
+}
+
+pub async fn scheduler(cfg: Cfg, vault: PathBuf) {
     if cfg.get("PLANT_JOBS").as_deref() == Some("0") {
         println!("[jobs] disabled (PLANT_JOBS=0)");
         return;
@@ -342,9 +358,14 @@ pub async fn scheduler(cfg: Cfg) {
             }
             running.lock().unwrap().insert(job.name.clone());
             let (sem, running) = (sem.clone(), running.clone());
+            let vault = vault.clone();
             tokio::spawn(async move {
                 let _permit = sem.acquire().await;
-                let _ = run_job(&job).await;
+                if job.name == "compress" {
+                    run_compress_job(&job, &vault).await;
+                } else {
+                    run_job(&job).await;
+                }
                 running.lock().unwrap().remove(&job.name);
             });
         }

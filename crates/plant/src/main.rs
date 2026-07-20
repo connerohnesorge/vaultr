@@ -169,7 +169,19 @@ async fn subcommand(argv: &[String]) -> Option<i32> {
             )
         }
         (Some("compress"), Some("once")) => {
-            Some(match sweep::compress_sweep(&vault_root(), idle).await {
+            let _ownership = match bind_all().await {
+                Ok(ownership) => ownership,
+                Err(error) => {
+                    eprintln!("compress once: daemon ownership unavailable: {error}");
+                    return Some(2);
+                }
+            };
+            let vault = vault_root();
+            if let Err(error) = capture::recover_all(&vault) {
+                eprintln!("compress once: capture recovery failed: {error}");
+                return Some(2);
+            }
+            Some(match sweep::compress_sweep(&vault, idle).await {
                 Ok(()) => 0,
                 Err(e) => {
                     eprintln!("compress once: {e}");
@@ -316,6 +328,20 @@ async fn complete_incumbent() -> bool {
     true
 }
 
+async fn bind_all() -> std::io::Result<Vec<(tokio::net::TcpListener, u16, adapter::Adapter)>> {
+    let mut listeners = Vec::new();
+    for adapter in adapter::adapters() {
+        match proxy::bind(adapter.port).await {
+            Ok((listener, port)) => listeners.push((listener, port, adapter)),
+            Err(error) => {
+                drop(listeners);
+                return Err(error);
+            }
+        }
+    }
+    Ok(listeners)
+}
+
 #[tokio::main]
 async fn main() {
     if std::env::args().any(|a| a == "--self-test") {
@@ -355,31 +381,29 @@ async fn main() {
 
     // Own both harness listeners before recovery or scheduler work. A partial
     // bind is released before checking whether a complete incumbent owns both.
-    let mut servers = vec![];
-    for a in adapter::adapters() {
-        match proxy::bind(a.port).await {
-            Ok((listener, port)) => {
-                println!("vaultr [{}] 127.0.0.1:{port} -> {}", a.harness, a.upstream);
-                servers.push((listener, a));
+    let servers = match bind_all().await {
+        Ok(servers) => servers,
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            if complete_incumbent().await {
+                println!("[plant] complete incumbent owns both harnesses — exiting 0");
+                record_exit(started, "exit:0");
+                std::process::exit(0);
             }
-            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
-                drop(servers);
-                if complete_incumbent().await {
-                    println!("[plant] complete incumbent owns both harnesses — exiting 0");
-                    record_exit(started, "exit:0");
-                    std::process::exit(0);
-                }
-                eprintln!("[plant] incomplete port ownership: {e}");
-                record_exit(started, "exit:1");
-                std::process::exit(1);
-            }
-            Err(e) => {
-                drop(servers);
-                eprintln!("[plant] bind failed: {e}");
-                record_exit(started, "exit:1");
-                std::process::exit(1);
-            }
+            eprintln!("[plant] incomplete port ownership: {error}");
+            record_exit(started, "exit:1");
+            std::process::exit(1);
         }
+        Err(error) => {
+            eprintln!("[plant] bind failed: {error}");
+            record_exit(started, "exit:1");
+            std::process::exit(1);
+        }
+    };
+    for (_, port, adapter) in &servers {
+        println!(
+            "vaultr [{}] 127.0.0.1:{port} -> {}",
+            adapter.harness, adapter.upstream
+        );
     }
 
     if let Err(e) = capture::recover_all(&vault) {
@@ -392,15 +416,20 @@ async fn main() {
     let client = http_client();
     println!("vault={}", vault.display());
 
-    let mut accept_loops = vec![];
-    for (listener, a) in servers {
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+    let mut _accept_loops = vec![];
+    for (listener, _, a) in servers {
         let ctx = Arc::new(ProxyCtx {
             adapter: a,
             vault: vault.clone(),
             client: client.clone(),
             otel: otel.clone(),
         });
-        accept_loops.push(tokio::spawn(proxy::serve(listener, ctx)));
+        _accept_loops.push(tokio::spawn(proxy::serve_until_shutdown(
+            listener,
+            ctx,
+            shutdown_rx.clone(),
+        )));
     }
 
     if otel.enabled {
@@ -415,7 +444,7 @@ async fn main() {
         });
     }
 
-    tokio::spawn(jobs::scheduler(jobs::Cfg::load(&vault)));
+    tokio::spawn(jobs::scheduler(jobs::Cfg::load(&vault), vault.clone()));
 
     // hourly RSS breadcrumb for the leak investigation
     tokio::spawn(async {
@@ -443,11 +472,9 @@ async fn main() {
         _ = usr2.recv() => "signal:SIGUSR2",
     };
     if why == "signal:SIGTERM" || why == "signal:SIGINT" {
-        // drop listeners first so a replacement can bind immediately; per-connection
-        // tasks are independent spawns, so in-flight streams still get the 30s drain
-        for h in &accept_loops {
-            h.abort();
-        }
+        // Stop accepting while retaining both listeners. Releasing ownership before
+        // in-flight capture tasks finish would let another process compress their files.
+        let _ = shutdown_tx.send(true);
         println!("[plant] {why}, draining up to 30s");
         tokio::time::sleep(Duration::from_secs(30)).await;
         record_exit(started, "exit:0");

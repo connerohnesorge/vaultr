@@ -11,6 +11,7 @@ uuid = { version = "1", features = ["v4", "v7"] }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

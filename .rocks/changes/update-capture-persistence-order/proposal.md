@@ -29,8 +29,10 @@ must reconcile that durable backlog before new capture or Sealing begins.
 
 - Affected specs: `capture-stewardship`
 - Affected code: `crates/plant/src/capture.rs`,
-  `crates/plant/src/proxy.rs`, `crates/plant/src/main.rs`,
-  `crates/plant/src/sweep.rs`, `crates/vaultr/src/recon.rs`, and focused tests
+  `crates/plant/src/capture/persistence.rs`, `crates/plant/src/proxy.rs`,
+  `crates/plant/src/main.rs`, `crates/plant/src/jobs.rs`,
+  `crates/plant/src/sweep.rs`, `crates/vaultr/src/vault.rs`,
+  `crates/vaultr/src/recon.rs`, and focused tests
 - Related issue: https://github.com/connerohnesorge/vaultr/issues/16
 - Existing proposals: distinct from draft PR #12, whose Plant generation
   lifecycle was superseded by merged PR #14

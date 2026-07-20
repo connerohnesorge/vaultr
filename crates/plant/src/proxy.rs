@@ -51,8 +51,41 @@ pub async fn bind(port: u16) -> std::io::Result<(TcpListener, u16)> {
 }
 
 pub async fn serve(listener: TcpListener, ctx: Arc<ProxyCtx>) {
+    serve_with_shutdown(listener, ctx, std::future::pending()).await;
+}
+
+pub async fn serve_until_shutdown(
+    listener: TcpListener,
+    ctx: Arc<ProxyCtx>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    serve_with_shutdown(listener, ctx, async move {
+        while !*shutdown.borrow() {
+            if shutdown.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+        }
+    })
+    .await;
+}
+
+async fn serve_with_shutdown(
+    listener: TcpListener,
+    ctx: Arc<ProxyCtx>,
+    shutdown: impl std::future::Future<Output = ()>,
+) {
+    tokio::pin!(shutdown);
     loop {
-        let (stream, _) = match listener.accept().await {
+        let accepted = tokio::select! {
+            () = &mut shutdown => {
+                // Stop accepting but retain the bound listener until Plant exits,
+                // so a second process cannot mutate captures during the drain.
+                std::future::pending::<()>().await;
+                unreachable!()
+            }
+            accepted = listener.accept() => accepted,
+        };
+        let (stream, _) = match accepted {
             Ok(x) => x,
             Err(e) => {
                 eprintln!("[{}] accept error: {e}", ctx.adapter.harness);
@@ -208,7 +241,7 @@ async fn handle(req: Request<hyper::body::Incoming>, ctx: Arc<ProxyCtx>) -> Resp
                     method,
                     path,
                     content_encoding,
-                    body_sha256: capture::sha256_hex(&decoded),
+                    body_sha256: vaultr::vault::sha256_hex(&decoded),
                     ids,
                     started_at,
                 };

@@ -1,20 +1,29 @@
 ## Implementation Details
 
-Keep the change inside the existing Capture and Reconstruction modules.
+Keep capture construction and response handling in `capture.rs`, persistence
+state in its private concrete submodule, and shared generation truth in Vaultr.
 
 ### Preparation journal
 
 `state.json` remains the request delta base and becomes the single atomically
-replaced per-session journal. In addition to the existing request body, it stores
-private `next_sequence`, `next_to_drain`, and pending request halves. A legacy
-file without ordering fields loads with its delta base preserved and an empty
-journal; sequencing starts lazily on the first new reservation.
+replaced per-session journal. A private persistence module owns one strict
+`Journal` loader, stage representation, ordered commit, and recovery inventory.
+The loader explicitly validates the legacy schema, harness, session identity,
+request body, and optional thread identity. When `capture_order` exists,
+`next_sequence`, `next_to_drain`, `pending`, and `root` are all mandatory and
+their bounds and request identities are validated. A valid legacy file without
+ordering fields keeps its delta base and initializes sequencing lazily on the
+first new reservation.
 
 A `capture.rs`-private per-session async mutex, keyed by canonical Session
 Capture root plus session id, serializes journal mutation, stage publication,
 eligible draining, and raw-generation detachment. It is never held across
 upstream response streaming. Cross-process locking is not added; complete
 ownership of both existing listeners is the process-ownership boundary.
+Scheduled compression therefore runs directly inside the listener-owning
+daemon. A manual `compress once` must first acquire and retain both listeners,
+recover persistence state, and only then sweep, so it refuses while that daemon
+is active.
 
 ### Completed stage files
 
@@ -37,11 +46,18 @@ eligible drain failure returns an error and retains the stage for recovery.
 
 ### Ordered drain
 
-For each eligible sequence, while holding the session mutex:
+Live draining and restart recovery both call one byte-exact `commit_stage`
+transaction. For each eligible sequence, while holding the session mutex:
 
-1. append the exact staged Envelope to `turns.jsonl`;
+1. reconcile or append the exact serialized Envelope bytes to `turns.jsonl`;
 2. atomically advance `next_to_drain` and remove the pending request half;
 3. delete the private stage file.
+
+An exact crash prefix can end at any byte, including inside a multibyte UTF-8
+code point; no lossy text conversion participates in reconciliation. If the
+append succeeds but the journal write fails, or the journal write succeeds but
+stage cleanup fails, retained evidence makes the next attempt converge to one
+record while propagating the failed operation.
 
 Persisted line order remains the Envelope contract. Preparation sequence is not
 added to the public Envelope schema; `request_id` is the idempotency identity.
@@ -53,10 +69,17 @@ Plant binds and retains both proxy listeners before recovery. A partial bind is
 released immediately. An address collision exits zero only when both health
 endpoints identify the expected Plant harness and upstream; a partial or
 unrecognized owner fails nonzero. Recovery and the scheduler therefore run only
-in the process that owns both harnesses.
+in the process that owns both harnesses. On graceful shutdown, accept loops stop
+accepting but retain their bound listeners until the in-flight capture drain
+ends, so a replacement or manual process cannot mutate generations while an old
+append can still finish.
 
 Recovery inventories only the staging hash for the canonical current root and
-the exact Session Capture paths returned by the shared explicit-error walker:
+the exact Session Capture paths returned by the shared explicit-error walker.
+Numeric date and session levels must be real directories, never symlinks, and
+every canonical discovered session must remain beneath the canonical root.
+Each journal is parsed once into a retained `RecoverySession`; validation and
+application consume that same value rather than reopening mutable evidence.
 
 - Every pre-restart reservation without a completed matching stage becomes an
   explicit incomplete Envelope at its reserved position, preserving the real
@@ -71,10 +94,11 @@ the exact Session Capture paths returned by the shared explicit-error walker:
 - Same-id content mismatches, non-tail conflicts, vault-identity mismatches, or
   stages without a readable matching journal leave persisted bytes unchanged
   and fail startup.
-- Missing ordering fields default to an empty journal only when no private stage
-  backlog exists.
+- A valid legacy journal may omit `capture_order`; a present `capture_order`
+  must contain every field and satisfy all bounds and request identities.
 - Journals and stages must have valid object shapes and matching root, sequence,
-  request, Session, and Envelope identity.
+  request, Session, and Envelope identity. Missing and malformed state are never
+  treated as permissive defaults.
 - A discovered journal is recovered at its exact path; metadata is never used to
   invent a replacement dated directory.
 - A retired stage is removed only when it exactly matches the final committed
@@ -85,18 +109,26 @@ the exact Session Capture paths returned by the shared explicit-error walker:
 ### Immutable generation Sealing
 
 `compress_sweep` enters a narrow crate-private Capture transaction. Under the
-session mutex it rechecks the journal and stage backlog, scrubs the closed raw
-file, hashes it, and renames it to
+session mutex it rechecks the strict journal and stage backlog, scrubs the
+closed raw file, hashes it, and renames it to
 `turns.jsonl.sealing-<prior-zstd-length>-<sha256>`. New captures then create a
 fresh `turns.jsonl` without touching the detached generation.
 
-Sealing regenerates the detached generation's zstd frame. The prior destination
-length identifies the commit boundary: a destination at that length is
-uncommitted; a destination whose exact suffix is the regenerated frame is the
-post-rename/pre-detached-removal state and only needs cleanup; any other state
-fails without deleting evidence. Reconstruction reads sealed, detached, and
-new live raw generations in order, omitting detached bytes only when the sealed
-destination has already advanced past the recorded boundary.
+Vaultr owns one canonical capture-generation inventory that validates the
+sealed, raw, and digest-identified detached paths. Reconstruction, maintenance,
+and Plant Sealing all consume that inventory. Sealing regenerates the detached
+generation's zstd frame. The prior destination length identifies the commit
+boundary: a destination at that length is uncommitted; a destination whose
+exact suffix is the regenerated frame is the post-rename/pre-detached-removal
+state and only needs cleanup; any other state fails without deleting evidence.
+Reconstruction reads sealed, detached, and new live raw generations in order.
+It omits detached bytes only after decoding the sealed suffix at the recorded
+base and proving its raw digest; sealed length alone is never proof.
+
+Detached conflicts and scrubbing, compression, rename, or cleanup failures
+preserve the evidence and propagate as operational failures. Manual compression
+exits 2 and the daemon scheduler records `failed`; neither reports “nothing to
+seal” or success.
 
 The detached filename and location diagnostics contain no captured content.
 Legacy Envelope files and concatenated zstd frames remain unchanged.
@@ -140,7 +172,7 @@ preparation order differ in practice.
   without inventing responses, seal each immutable generation exactly once,
   require complete daemon ownership before recovery, and read historical
   concatenated records.
-- Non-Goals: a new trait, public Interface, Module, Adapter, generic queue,
+- Non-Goals: a new trait, public Interface, Adapter, generic queue,
   Envelope sequence field, live gap timeout, public watchdog state,
   cross-process locking, vault-move migration, or clone/cache optimization.
 - Non-Goals: per-request `fsync`/`sync_data` and host power-loss durability.
@@ -157,6 +189,11 @@ preparation order differ in practice.
   cannot publish unsanitized staged responses before scrub.
 - Perform eager startup recovery; lazy recovery would leave completed evidence
   invisible for dormant sessions.
+- Keep scheduled compression in the listener owner and make manual compression
+  compete for both listeners, because a process-local session mutex cannot
+  coordinate a child process.
+- Centralize generation parsing in Vaultr so every consumer makes the same
+  evidence-preserving decision.
 - Do not abandon live gaps by timeout. Normal EOF, stream error, or disconnect
   already completes the existing path, while long model pauses are valid.
 - Cover Plant process crashes using completed writes and atomic replacement.

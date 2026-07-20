@@ -160,12 +160,13 @@ fn detached_generation_reconstructs_once_before_and_after_commit() {
     let sealed = tmp.path().join("turns.jsonl.zst");
     let first_frame = zstd::encode_all(format!("{first}\n").as_bytes(), 3).unwrap();
     fs::write(&sealed, &first_frame).unwrap();
+    let detached_body = format!("{second}\n");
     let detached = tmp.path().join(format!(
         "turns.jsonl.sealing-{}-{}",
         first_frame.len(),
-        "0".repeat(64)
+        vaultr::vault::sha256_hex(detached_body.as_bytes())
     ));
-    fs::write(&detached, format!("{second}\n")).unwrap();
+    fs::write(&detached, &detached_body).unwrap();
 
     let before = recon::reconstruct(&detached).unwrap();
     assert_eq!(before.envelopes, 2);
@@ -184,12 +185,37 @@ fn detached_generation_reconstructs_once_before_and_after_commit() {
 }
 
 #[test]
+fn detached_generation_is_not_omitted_for_an_unproven_sealed_suffix() {
+    let full = fs::read_to_string(fixture("claude_append.jsonl")).unwrap();
+    let mut lines = full.lines();
+    let first = format!("{}\n", lines.next().unwrap());
+    let second = format!("{}\n", lines.next().unwrap());
+    let tmp = tempfile::TempDir::new().unwrap();
+    let first_frame = zstd::encode_all(first.as_bytes(), 3).unwrap();
+    let mut conflicting = first_frame.clone();
+    conflicting.extend(zstd::encode_all(first.as_bytes(), 3).unwrap());
+    fs::write(tmp.path().join("turns.jsonl.zst"), conflicting).unwrap();
+    let detached = tmp.path().join(format!(
+        "turns.jsonl.sealing-{}-{}",
+        first_frame.len(),
+        vaultr::vault::sha256_hex(second.as_bytes())
+    ));
+    fs::write(&detached, second).unwrap();
+
+    let error = recon::reconstruct(&detached).unwrap_err().to_string();
+    assert!(error.contains("sealed suffix conflicts"), "{error}");
+    assert!(!error.contains("Hello there"), "{error}");
+}
+
+#[test]
 fn detached_generation_errors_do_not_echo_captured_content() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let detached = tmp
-        .path()
-        .join(format!("turns.jsonl.sealing-0-{}", "0".repeat(64)));
-    fs::write(&detached, "TOP-SECRET-CAPTURED-CONTENT\n").unwrap();
+    let captured = "TOP-SECRET-CAPTURED-CONTENT\n";
+    let detached = tmp.path().join(format!(
+        "turns.jsonl.sealing-0-{}",
+        vaultr::vault::sha256_hex(captured.as_bytes())
+    ));
+    fs::write(&detached, captured).unwrap();
     let error = recon::reconstruct(&detached).unwrap_err().to_string();
     assert!(error.contains("sealed record 1"), "{error}");
     assert!(!error.contains("TOP-SECRET"), "{error}");

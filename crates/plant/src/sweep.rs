@@ -242,36 +242,15 @@ fn capture_files(vault: &Path) -> Result<Vec<(String, PathBuf)>, String> {
 fn turns_files(vault: &Path, include_compressed: bool) -> Result<Vec<(String, PathBuf)>, String> {
     let mut out = vec![];
     for (sid, sess) in vaultr::vault::walk_session_dirs(vault).map_err(|e| e.to_string())? {
-        let entries = std::fs::read_dir(&sess)
-            .map_err(|e| format!("read session directory {}: {e}", sess.display()))?;
-        let mut raw = None;
-        let mut sealed = None;
-        let mut detached = None;
-        for entry in entries {
-            let path = entry
-                .map_err(|e| format!("read session entry under {}: {e}", sess.display()))?
-                .path();
-            match path.file_name().and_then(|name| name.to_str()) {
-                Some("turns.jsonl") => raw = Some(path),
-                Some("turns.jsonl.zst") => sealed = Some(path),
-                Some(name) if name.starts_with("turns.jsonl.sealing-") => {
-                    if detached.replace(path).is_some() {
-                        return Err(format!(
-                            "multiple detached generations under {}",
-                            sess.display()
-                        ));
-                    }
-                }
-                _ => {}
-            }
-        }
+        let generations =
+            vaultr::vault::CaptureGenerations::load(&sess).map_err(|e| e.to_string())?;
         let f = if include_compressed {
-            raw.or(sealed).or(detached)
+            generations.capture_file()
         } else {
-            detached.or(raw)
+            generations.unsealed_file()
         };
         if let Some(f) = f {
-            out.push((sid, f));
+            out.push((sid, f.to_path_buf()));
         }
     }
     Ok(out)
@@ -621,7 +600,7 @@ fn suffix_matches(path: &Path, offset: u64, suffix: &Path) -> Result<bool, Strin
 /// Commit one immutable detached generation exactly once. The filename records
 /// the sealed destination length at detach time; a retry after the destination
 /// rename verifies the regenerated frame at that exact offset before cleanup.
-async fn seal_detached(generation: &crate::capture::DetachedGeneration) -> Result<PathBuf, String> {
+async fn seal_detached(generation: &vaultr::vault::DetachedGeneration) -> Result<PathBuf, String> {
     let raw_mtime = std::fs::metadata(&generation.path)
         .and_then(|m| m.modified())
         .map_err(|e| format!("stat {}: {e}", generation.path.display()))?;
@@ -738,10 +717,7 @@ pub async fn compress_sweep(vault: &Path, idle: Duration) -> Result<(), String> 
     let jobs = job_sids();
     let mut sealed = 0u32;
     for (sid, path) in turns_files(vault, false)? {
-        let detached = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| name.starts_with("turns.jsonl.sealing-"));
+        let detached = path.file_name().and_then(|name| name.to_str()) != Some("turns.jsonl");
         // job self-captures seal without waiting for learn — they are never dispatched
         let learned = learned_current(&claude, &sid, &path) && learned_current(&codex, &sid, &path);
         if !detached && (!(learned || jobs.contains(&sid)) || !idle_for(&path, idle)) {
@@ -758,8 +734,7 @@ pub async fn compress_sweep(vault: &Path, idle: Duration) -> Result<(), String> 
         let herdr = generation.path.with_file_name("herdr.jsonl");
         if herdr.is_file() {
             if let Err(e) = seal_file(&herdr).await {
-                eprintln!("[compress] {sid}: herdr.jsonl seal skipped ({e}); next sweep retries");
-                continue;
+                return Err(format!("seal {sid} herdr.jsonl: {e}"));
             }
         }
         match seal_detached(&generation).await {
@@ -780,9 +755,7 @@ pub async fn compress_sweep(vault: &Path, idle: Duration) -> Result<(), String> 
                 );
             }
             Err(e) => {
-                eprintln!(
-                    "[compress] {sid}: detached generation seal skipped ({e}); next sweep retries"
-                );
+                return Err(format!("seal detached generation for {sid}: {e}"));
             }
         }
     }
@@ -1398,6 +1371,34 @@ mod tests {
             "generation-one\ngeneration-two\n"
         );
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn detached_sealing_conflict_is_an_operational_failure() {
+        if !which("zstd") {
+            eprintln!("zstd not on PATH; skipping");
+            return;
+        }
+        let root =
+            std::env::temp_dir().join(format!("plant-detached-conflict-{}", uuid::Uuid::new_v4()));
+        let vault = root.join("sessions");
+        let dir = vault.join("2026/07/20/conflict");
+        std::fs::create_dir_all(&dir).unwrap();
+        let body = b"detached evidence\n";
+        let detached = dir.join(format!(
+            "turns.jsonl.sealing-0-{}",
+            vaultr::vault::sha256_hex(body)
+        ));
+        std::fs::write(&detached, body).unwrap();
+        let sealed = dir.join("turns.jsonl.zst");
+        let conflict = zstd::encode_all("different generation\n".as_bytes(), 3).unwrap();
+        std::fs::write(&sealed, &conflict).unwrap();
+
+        let error = compress_sweep(&vault, Duration::ZERO).await.unwrap_err();
+        assert!(error.contains("seal detached generation"), "{error}");
+        assert!(detached.exists(), "detached evidence is preserved");
+        assert_eq!(std::fs::read(&sealed).unwrap(), conflict);
         let _ = std::fs::remove_dir_all(root);
     }
 
