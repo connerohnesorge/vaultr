@@ -1,5 +1,5 @@
 use crate::capture::{cached_session_ids, iso_now, session_dir};
-use crate::sweep::{run, run30};
+use crate::process::{run, run30};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -143,7 +143,7 @@ fn pick_session_id(panes: &[Pane], pane_id: &str) -> Option<String> {
         .map(|s| s.value.clone())
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WorkspaceCleanup {
     Never,
     Always,

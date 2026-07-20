@@ -1,5 +1,6 @@
 //! Harness adapters — mirrors ADAPTERS in wireproxy.ts.
 
+use crate::domain::Harness;
 use serde_json::Value;
 
 #[derive(Debug, Default, Clone)]
@@ -17,15 +18,8 @@ pub struct TokenUsage {
     pub cache_creation: u64,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Harness {
-    ClaudeCode,
-    Codex,
-}
-
 pub struct Adapter {
-    pub harness: &'static str,
-    pub kind: Harness,
+    pub harness: Harness,
     pub port: u16,
     pub upstream: String,
     pub history_key: &'static str,
@@ -47,8 +41,7 @@ fn env_or(var: &str, default: &str) -> String {
 pub fn adapters() -> Vec<Adapter> {
     vec![
         Adapter {
-            harness: "claude-code",
-            kind: Harness::ClaudeCode,
+            harness: Harness::ClaudeCode,
             port: env_port("VAULTR_ANTHROPIC_PORT", 18923),
             upstream: env_or("VAULTR_ANTHROPIC_UPSTREAM", "https://api.anthropic.com"),
             history_key: "messages",
@@ -56,8 +49,7 @@ pub fn adapters() -> Vec<Adapter> {
             terminal_event: "message_stop",
         },
         Adapter {
-            harness: "codex",
-            kind: Harness::Codex,
+            harness: Harness::Codex,
             port: env_port("VAULTR_CODEX_PORT", 18924),
             upstream: env_or(
                 "VAULTR_CODEX_UPSTREAM",
@@ -72,7 +64,7 @@ pub fn adapters() -> Vec<Adapter> {
 
 impl Adapter {
     pub fn captures(&self, method: &str, path: &str) -> bool {
-        match self.kind {
+        match self.harness {
             // Exact match, not a prefix: /v1/messages/count_tokens carries no
             // metadata.user_id, so a prefix match parsed its (full-history) body
             // only to fail identity extraction and drop it — spamming
@@ -84,7 +76,7 @@ impl Adapter {
     }
 
     pub fn identity(&self, headers: &hyper::HeaderMap, body: &Value) -> Identity {
-        match self.kind {
+        match self.harness {
             Harness::ClaudeCode => {
                 let sid = body
                     .pointer("/metadata/user_id")
@@ -129,7 +121,7 @@ impl Adapter {
     }
 
     pub fn usage(&self, events: &[Value]) -> TokenUsage {
-        match self.kind {
+        match self.harness {
             Harness::ClaudeCode => {
                 let start = events
                     .iter()

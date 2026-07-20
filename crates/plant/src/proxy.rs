@@ -55,7 +55,10 @@ pub async fn serve(listener: TcpListener, ctx: Arc<ProxyCtx>) {
         let (stream, _) = match listener.accept().await {
             Ok(x) => x,
             Err(e) => {
-                eprintln!("[{}] accept error: {e}", ctx.adapter.harness);
+                eprintln!(
+                    "[{}] accept error: {e}",
+                    ctx.adapter.harness.capture_label()
+                );
                 continue;
             }
         };
@@ -93,7 +96,11 @@ async fn handle(req: Request<hyper::body::Incoming>, ctx: Arc<ProxyCtx>) -> Resp
         .unwrap_or_default();
 
     if path == "/health" {
-        let body = serde_json::json!({ "ok": true, "harness": adapter.harness, "upstream": upstream_base });
+        let body = serde_json::json!({
+            "ok": true,
+            "harness": adapter.harness.capture_label(),
+            "upstream": upstream_base
+        });
         return Response::builder()
             .header("content-type", "application/json")
             .body(full(body.to_string()))
@@ -160,7 +167,10 @@ async fn handle(req: Request<hyper::body::Incoming>, ctx: Arc<ProxyCtx>) -> Resp
     let upstream = match builder.send().await {
         Ok(r) => r,
         Err(e) => {
-            eprintln!("[{}] upstream fetch failed: {e}", adapter.harness);
+            eprintln!(
+                "[{}] upstream fetch failed: {e}",
+                adapter.harness.capture_label()
+            );
             return json_error(StatusCode::BAD_GATEWAY, &format!("vaultr upstream: {e}"));
         }
     };
@@ -220,7 +230,7 @@ async fn handle(req: Request<hyper::body::Incoming>, ctx: Arc<ProxyCtx>) -> Resp
         match prepared {
             Ok(p) => Some(p),
             Err(e) => {
-                eprintln!("[{}] capture failed: {e}", adapter.harness);
+                eprintln!("[{}] capture failed: {e}", adapter.harness.capture_label());
                 None
             }
         }

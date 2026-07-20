@@ -17,6 +17,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::domain::Harness;
 use crate::herdr::WorkspaceCleanup;
 
 pub fn state_dir() -> PathBuf {
@@ -151,20 +152,17 @@ pub fn cleanup_policy(requested: WorkspaceCleanup, cfg: &Cfg) -> WorkspaceCleanu
 /// Launch line for an agent CLI inside a Herdr pane.
 /// `command` bypasses the user's interactive-shell aliases (a `codex='codex --yolo'`
 /// alias duplicated our flag, clap refused, and the prompt got typed into bare zsh).
-pub fn launch_line(cli: &str, model: Option<&str>, args: Option<&str>) -> String {
-    let codex = cli == "codex";
-    let mut s = if codex {
+pub fn launch_line(harness: Harness, model: Option<&str>, args: Option<&str>) -> String {
+    let mut s = match harness {
+        Harness::ClaudeCode => "command claude --dangerously-skip-permissions".to_string(),
         // sandboxed codex blocks on its first approval prompt — background panes can't answer
-        "command codex --dangerously-bypass-approvals-and-sandbox".to_string()
-    } else {
-        "command claude --dangerously-skip-permissions".to_string()
+        Harness::Codex => "command codex --dangerously-bypass-approvals-and-sandbox".to_string(),
     };
     if let Some(m) = model {
-        s.push_str(&if codex {
-            format!(" -m '{m}'")
-        } else {
-            format!(" --model='{m}'")
-        });
+        match harness {
+            Harness::ClaudeCode => s.push_str(&format!(" --model='{m}'")),
+            Harness::Codex => s.push_str(&format!(" -m '{m}'")),
+        }
     }
     if let Some(a) = args {
         s.push(' ');
@@ -408,7 +406,7 @@ mod tests {
     fn launch_line_bypasses_shell_aliases() {
         assert_eq!(
             launch_line(
-                "codex",
+                Harness::Codex,
                 Some("gpt-5.6-sol"),
                 Some("-c model_reasoning_effort=xhigh")
             ),
@@ -416,7 +414,7 @@ mod tests {
              -c model_reasoning_effort=xhigh"
         );
         assert_eq!(
-            launch_line("claude", Some("opus[1m]"), None),
+            launch_line(Harness::ClaudeCode, Some("opus[1m]"), None),
             "command claude --dangerously-skip-permissions --model='opus[1m]'"
         );
     }

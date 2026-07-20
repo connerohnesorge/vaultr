@@ -131,13 +131,19 @@ impl Otel {
             ("cache_creation", usage.cache_creation),
         ] {
             if value > 0 {
-                let attrs = json!({ "type": typ, "model": model, "harness": adapter.harness });
+                let attrs = json!({
+                    "type": typ,
+                    "model": model,
+                    "harness": adapter.harness.capture_label()
+                });
                 let key = attrs.to_string();
                 st.tokens.entry(key).or_insert((attrs, 0)).1 += value;
             }
         }
         let req_attrs = json!({
-            "status": resp.status.to_string(), "model": model, "harness": adapter.harness,
+            "status": resp.status.to_string(),
+            "model": model,
+            "harness": adapter.harness.capture_label(),
             "complete": resp.complete,
         });
         st.requests
@@ -145,7 +151,10 @@ impl Otel {
             .or_insert((req_attrs, 0))
             .1 += 1;
 
-        let common = json!({ "model": model, "harness": adapter.harness });
+        let common = json!({
+            "model": model,
+            "harness": adapter.harness.capture_label()
+        });
         let key = common.to_string();
         let hist = st.durations.entry(key).or_insert_with(|| HistogramPoint {
             attributes: common,
@@ -169,7 +178,7 @@ impl Otel {
                 json!(req.ids.session_id.as_deref().unwrap_or("unknown")),
             ),
             ("model", json!(model)),
-            ("harness", json!(adapter.harness)),
+            ("harness", json!(adapter.harness.capture_label())),
             ("status", json!(resp.status)),
             ("tokens", json!(usage.input + usage.output)),
             ("duration_ms", json!(duration_ms)),
@@ -179,7 +188,7 @@ impl Otel {
             "observedTimeUnixNano": t,
             "severityNumber": if ok { 9 } else { 13 },
             "severityText": if ok { "INFO" } else { "WARN" },
-            "body": { "stringValue": format!("{} {} request {}{}", adapter.harness, model, resp.status, if resp.complete { "" } else { " incomplete" }) },
+            "body": { "stringValue": format!("{} {} request {}{}", adapter.harness.capture_label(), model, resp.status, if resp.complete { "" } else { " incomplete" }) },
             "attributes": log_attrs,
         }));
         // ponytail: bound outage memory; dropped logs remain recoverable from turns.jsonl.
@@ -246,7 +255,7 @@ impl Otel {
             None => {
                 let out = tokio::process::Command::new("cnb")
                     .args(["auth", "token"])
-                    .env("PATH", crate::sweep::augmented_path())
+                    .env("PATH", crate::process::augmented_path())
                     .output()
                     .await;
                 match out {

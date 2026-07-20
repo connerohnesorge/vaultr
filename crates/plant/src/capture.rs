@@ -3,6 +3,7 @@
 //! Ports capture/sessionDir/updateMeta (wireproxy.ts:122-422).
 
 use crate::adapter::{Adapter, Identity};
+use crate::fsutil::atomic_replace;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -135,18 +136,6 @@ fn find_stage(root: &str, sid: &str, seq: u64) -> Option<PathBuf> {
     })
 }
 
-/// Write-then-rename: atomic replacement within a filesystem. Per-request
-/// `fsync` is intentionally omitted (design non-goal) — process-crash safety
-/// comes from atomic rename, not power-loss durability.
-fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let tmp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
-    fs::File::create(&tmp)?.write_all(bytes)?;
-    fs::rename(&tmp, path)
-}
-
 fn read_state(dir: &Path) -> Map<String, Value> {
     fs::read_to_string(dir.join("state.json"))
         .ok()
@@ -176,7 +165,7 @@ fn persist_state(
         serde_json::to_value(order).map_err(|e| e.to_string())?,
     );
     let text = serde_json::to_string(&Value::Object(state)).map_err(|e| e.to_string())? + "\n";
-    atomic_write(&dir.join("state.json"), text.as_bytes()).map_err(|e| e.to_string())
+    atomic_replace(&dir.join("state.json"), text.as_bytes()).map_err(|e| e.to_string())
 }
 
 /// Append one Envelope as a JSONL line.
@@ -373,7 +362,7 @@ pub fn update_meta(
         .unwrap_or_default();
     let now = iso_now();
     meta.schema_version = Some(1);
-    meta.harness = Some(adapter.harness.to_string());
+    meta.harness = Some(adapter.harness.capture_label().to_string());
     meta.session_id.clone_from(&ids.session_id);
     if ids.thread_id.is_some() {
         meta.thread_id.clone_from(&ids.thread_id);
@@ -397,11 +386,12 @@ pub async fn prepare_capture(
     req: CapturedRequest,
     body: Value,
 ) -> Result<PendingCapture, String> {
-    let sid = req
-        .ids
-        .session_id
-        .clone()
-        .ok_or_else(|| format!("{} request has no session identity", adapter.harness))?;
+    let sid = req.ids.session_id.clone().ok_or_else(|| {
+        format!(
+            "{} request has no session identity",
+            adapter.harness.capture_label()
+        )
+    })?;
     let dir = session_dir(vault, &sid).map_err(|e| e.to_string())?;
     let root = canonical_root(vault);
 
@@ -423,7 +413,7 @@ pub async fn prepare_capture(
         "schema_version": 1,
         "request_id": uuid::Uuid::new_v4().to_string(),
         "observed_at": iso_now(),
-        "harness": adapter.harness,
+        "harness": adapter.harness.capture_label(),
         "session_id": sid,
         "thread_id": req.ids.thread_id,
         "turn_id": req.ids.turn_id,
@@ -440,7 +430,7 @@ pub async fn prepare_capture(
     let model = body.get("model").and_then(Value::as_str).map(String::from);
     let new_state = json!({
         "schema_version": 1,
-        "harness": adapter.harness,
+        "harness": adapter.harness.capture_label(),
         "session_id": sid,
         "thread_id": req.ids.thread_id,
         "request_body": body,
@@ -508,7 +498,7 @@ pub async fn finish_capture(
         "request_id": request_id,
         "envelope": pending.request_part,
     });
-    atomic_write(
+    atomic_replace(
         &stage_path,
         serde_json::to_string(&stage_doc)
             .map_err(|e| e.to_string())?
@@ -520,7 +510,10 @@ pub async fn finish_capture(
     // reclassify an accepted stage as lost.
     crate::herdr::maybe_snapshot(vault);
     if let Err(e) = update_meta(vault, adapter, &pending.req.ids, pending.model.as_deref()) {
-        eprintln!("[{}] meta update failed: {e}", adapter.harness);
+        eprintln!(
+            "[{}] meta update failed: {e}",
+            adapter.harness.capture_label()
+        );
     }
 
     drain(&pending.dir, &pending.root, &sid)
@@ -1157,7 +1150,7 @@ mod tests {
             "{seq}-{}.json",
             committed["request_id"].as_str().unwrap()
         ));
-        atomic_write(
+        atomic_replace(
             &stage,
             serde_json::to_string(&json!({
                 "root": root, "sequence": seq,
@@ -1199,7 +1192,7 @@ mod tests {
             "{seq}-{}.json",
             env["request_id"].as_str().unwrap()
         ));
-        atomic_write(
+        atomic_replace(
             &stage,
             serde_json::to_string(&json!({
                 "root": root, "sequence": seq, "request_id": env["request_id"], "envelope": env,
@@ -1246,7 +1239,7 @@ mod tests {
             json!({ "status": 200, "complete": true, "sse": "STAGED-DIFFERENT" }),
         );
         let stage = staging_dir(&root, &sid).join(format!("{seq}-{rid}.json"));
-        atomic_write(
+        atomic_replace(
             &stage,
             serde_json::to_string(&json!({
                 "root": root, "sequence": seq, "request_id": rid, "envelope": staged,
