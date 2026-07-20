@@ -39,7 +39,10 @@ that key before starting the Herdr lifecycle, and durably record each
 conclusive `Succeeded` or `Failed` outcome before returning. A repeated key
 MUST return its prior durable outcome without creating another Herdr workspace.
 Unreadable, corrupt, or unresolved in-progress idempotency state MUST fail
-closed without launching.
+closed without launching. The command MUST emit a machine-readable final result
+that distinguishes durable `Succeeded`/`Failed` outcomes from retryable and
+indeterminate operational state; it MUST NOT report claim or persistence
+failures as a conclusive `Failed` outcome.
 
 #### Scenario: A completed agent run is retried
 
@@ -50,11 +53,18 @@ closed without launching.
 #### Scenario: Duplicate launch state is uncertain
 
 - WHEN a key is already claimed without a conclusive durable outcome
-- THEN `plant agent run` fails closed
+- THEN `plant agent run` reports an indeterminate non-durable result and fails closed
 - AND it does not create another Herdr workspace
 
 #### Scenario: Herdr is unavailable before launch
 
 - WHEN the initial Herdr availability probe returns `Unavailable`
 - THEN Plant removes the key's pre-launch claim durably
+- AND reports a retryable non-durable result
 - AND a later call with the same key may retry
+
+#### Scenario: Conclusive outcome cannot be persisted
+
+- WHEN the Herdr lifecycle finishes but Plant cannot durably persist its conclusive outcome
+- THEN Plant reports an indeterminate non-durable result
+- AND it does not misreport a durable `Failed` outcome

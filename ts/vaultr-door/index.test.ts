@@ -1,5 +1,15 @@
 import { test, expect, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, readFileSync, utimesSync, rmSync } from "node:fs";
+import {
+  chmodSync,
+  mkdtempSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  unlinkSync,
+  utimesSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -11,7 +21,14 @@ let stub: string;
 let stubLog: string;
 
 function writeStub(exitCode: number) {
-  writeFileSync(stub, `#!/bin/sh\nprintf '%s ' "$@" >> "${stubLog}"\ncat >> "${stubLog}"\nprintf '\\n---\\n' >> "${stubLog}"\necho "stub done"\nexit ${exitCode}\n`);
+  const result = exitCode === 0
+    ? '{"type":"plant.agent.run","version":1,"state":"succeeded","durable":true,"detail":"stub done"}'
+    : exitCode === 1
+      ? '{"type":"plant.agent.run","version":1,"state":"failed","durable":true,"detail":"stub done"}'
+      : exitCode === 75
+        ? '{"type":"plant.agent.run","version":1,"state":"retryable","durable":false,"detail":"stub unavailable"}'
+        : '{"type":"plant.agent.run","version":1,"state":"failed","durable":true,"detail":"bad exit"}';
+  writeFileSync(stub, `#!/bin/sh\nprintf '%s ' "$@" >> "${stubLog}"\ncat >> "${stubLog}"\nprintf '\\n---\\n' >> "${stubLog}"\nprintf '%s\\n' '${result}'\nexit ${exitCode}\n`);
   chmodSync(stub, 0o755);
 }
 
@@ -27,8 +44,13 @@ done
 mkdir -p "${outcomes}"
 if [ -n "$key" ] && [ -f "${outcomes}/$key" ]; then
   cat >/dev/null
-  echo "stub cached"
-  exit "$(cat "${outcomes}/$key")"
+  code="$(cat "${outcomes}/$key")"
+  if [ "$code" = 0 ]; then
+    echo '{"type":"plant.agent.run","version":1,"state":"succeeded","durable":true,"detail":"stub cached"}'
+  else
+    echo '{"type":"plant.agent.run","version":1,"state":"failed","durable":true,"detail":"stub cached"}'
+  fi
+  exit "$code"
 fi
 printf '%s ' "$@" >> "${stubLog}"
 cat >> "${stubLog}"
@@ -39,7 +61,11 @@ if [ -n "$key" ]; then
   mv "${outcomes}/$key.tmp" "${outcomes}/$key"
 fi
 ${opts.killParent ? 'kill -KILL "$PPID"' : ""}
-echo "stub done"
+if [ "${exitCode}" = 0 ]; then
+  echo '{"type":"plant.agent.run","version":1,"state":"succeeded","durable":true,"detail":"stub done"}'
+else
+  echo '{"type":"plant.agent.run","version":1,"state":"failed","durable":true,"detail":"stub done"}'
+fi
 exit ${exitCode}
 `);
   chmodSync(stub, 0o755);
@@ -123,7 +149,7 @@ test("batch fires once and the fence prevents a double fire", async () => {
   expect(stubCalls()).toBe(1);
 });
 
-test("Unavailable does not advance the fence; files fire on the next run", async () => {
+test("a retryable result does not advance the frontier; files fire on the next run", async () => {
   landFile("mail/a.md", 1000);
   const spec = { name: "t", watch: "mail/*.md", prompt: () => "go" };
   writeStub(75);
@@ -135,7 +161,7 @@ test("Unavailable does not advance the fence; files fire on the next run", async
   expect(retried.detail).toContain("fired on 1 file");
 });
 
-test("a conclusive failed outcome advances the cursor without a second launch", async () => {
+test("a durable failed outcome advances the frontier without a second launch", async () => {
   landFile("mail/a.md", 1000);
   const spec = { name: "t", watch: "mail/*.md", prompt: () => "go" };
   writeStub(1);
@@ -157,16 +183,16 @@ test("corrupt state fails closed without replacement or launch", async () => {
   expect(stubCalls()).toBe(0);
 });
 
-test("tied mtimes advance in deterministic path order without misses", async () => {
+test("a later lower-sorting path at the frontier timestamp is not missed", async () => {
   const spec = { name: "t", watch: "mail/*.md", prompt: (files: any[]) => files.map((file) => file.path).join(" ") };
+  landFile("mail/z.md", 1000);
+  expect((await door(spec)).code).toBe(0);
   landFile("mail/a.md", 1000);
   expect((await door(spec)).code).toBe(0);
-  landFile("mail/b.md", 1000);
-  expect((await door(spec)).code).toBe(0);
   expect(stubCalls()).toBe(2);
-  expect(readFileSync(stubLog, "utf8")).toContain("mail/b.md");
+  expect(readFileSync(stubLog, "utf8")).toContain("mail/a.md");
   const state = JSON.parse(readFileSync(join(tmp, "state", "t.json"), "utf8"));
-  expect(state.cursor.path).toBe("mail/b.md");
+  expect(state.frontier).toEqual({ mtimeMs: 1000000, seen: ["mail/a.md", "mail/z.md"] });
 });
 
 test("concurrent door processes launch one batch once", async () => {
@@ -207,6 +233,38 @@ test("a post-launch crash reuses Plant's durable outcome without relaunch", asyn
   expect(JSON.parse(readFileSync(join(tmp, "state", "t.json"), "utf8")).claim).toBeUndefined();
 });
 
+test("an indeterminate Plant result retains the durable claim", async () => {
+  landFile("mail/a.md", 1000);
+  writeFileSync(stub, `#!/bin/sh
+printf '%s ' "$@" >> "${stubLog}"
+cat >> "${stubLog}"
+printf '\\n---\\n' >> "${stubLog}"
+echo "old untyped failure"
+exit 1
+`);
+  chmodSync(stub, 0o755);
+  const spec = { name: "t", watch: "mail/*.md", prompt: () => "go" };
+  const result = await door(spec);
+  expect(result.code).toBe(1);
+  expect(result.detail).toContain("indeterminate");
+  expect(JSON.parse(readFileSync(join(tmp, "state", "t.json"), "utf8")).claim).toBeDefined();
+
+  writeFileSync(stub, `#!/bin/sh
+printf '%s ' "$@" >> "${stubLog}"
+cat >> "${stubLog}"
+printf '\\n---\\n' >> "${stubLog}"
+echo '{"type":"plant.agent.run","version":1,"state":"succeeded","durable":false,"detail":"not recorded"}'
+exit 0
+`);
+  chmodSync(stub, 0o755);
+  expect((await door(spec)).detail).toContain("indeterminate");
+  expect(JSON.parse(readFileSync(join(tmp, "state", "t.json"), "utf8")).claim).toBeDefined();
+
+  writeStub(0);
+  expect((await door(spec)).code).toBe(0);
+  expect(stubCalls()).toBe(3);
+});
+
 test("non-ingestion watch roots are rejected before any launch", async () => {
   mkdirSync(join(vault, "learnings"), { recursive: true });
   landFile("learnings/x.md", 1000);
@@ -214,6 +272,39 @@ test("non-ingestion watch roots are rejected before any launch", async () => {
   expect(res.code).toBe(1);
   expect(res.detail).toContain("rejected");
   expect(stubCalls()).toBe(0);
+});
+
+test("watch traversal is rejected before any scan or launch", async () => {
+  landFile("mail/a.md", 1000);
+  const result = await door({ name: "t", watch: "mail/../mail/*.md", prompt: () => "go" });
+  expect(result.code).toBe(1);
+  expect(result.detail).toContain("traversal-free");
+  expect(stubCalls()).toBe(0);
+});
+
+test("a scanned symlink escaping the ingestion root fails closed", async () => {
+  const outside = join(tmp, "outside.md");
+  writeFileSync(outside, "hostile");
+  symlinkSync(outside, join(vault, "mail", "escape.md"));
+  const result = await door({ name: "t", watch: "mail/*.md", prompt: () => "go" });
+  expect(result.code).toBe(1);
+  expect(result.detail).toContain("symlink escapes ingestion root");
+  expect(stubCalls()).toBe(0);
+});
+
+test("a claimed file replaced by an escaping symlink is rejected before retry launch", async () => {
+  landFile("mail/a.md", 1000);
+  const crashed = spawnWorker({ CRASH_IN_PROMPT: "1" });
+  expect(await crashed.exited).toBe(86);
+  const outside = join(tmp, "outside.md");
+  writeFileSync(outside, "hostile");
+  unlinkSync(join(vault, "mail", "a.md"));
+  symlinkSync(outside, join(vault, "mail", "a.md"));
+
+  const retried = spawnWorker();
+  expect(await retried.exited).toBe(1);
+  expect(stubCalls()).toBe(0);
+  expect(JSON.parse(readFileSync(join(tmp, "state", "t.json"), "utf8")).claim).toBeDefined();
 });
 
 test("filter narrows the batch, including by content", async () => {
@@ -252,13 +343,15 @@ test("breaker pauses a runaway door and stays paused until re-armed", async () =
   expect(stubCalls()).toBe(3);
 });
 
-test("agentRun maps plant exit codes to typed outcomes", async () => {
+test("agentRun accepts only a valid machine-readable Plant result", async () => {
   writeStub(0);
-  expect((await agentRun("p")).outcome).toBe("Succeeded");
+  expect(await agentRun("p")).toMatchObject({ state: "Succeeded", durable: true });
   writeStub(75);
-  expect((await agentRun("p")).outcome).toBe("Unavailable");
+  expect(await agentRun("p")).toMatchObject({ state: "Retryable", durable: false });
+  writeStub(1);
+  expect(await agentRun("p")).toMatchObject({ state: "Failed", durable: true });
   writeStub(3);
-  expect((await agentRun("p")).outcome).toBe("Failed");
+  expect(await agentRun("p")).toMatchObject({ state: "Indeterminate", durable: false });
   rmSync(stubLog);
   writeStub(0);
   await agentRun("the prompt", { cli: "codex", model: "gpt-5.6-sol", timeout: "10m" });

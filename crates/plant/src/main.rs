@@ -40,8 +40,9 @@ fn vault_root() -> PathBuf {
 /// [--args '…'] [--label L] [--cleanup always|on-success|never] [--timeout 45m] [--cwd D]`
 /// [--idempotency-key K]
 /// with the prompt on stdin — the ONLY sanctioned way for job scripts to drive an agent
-/// (Herdr pane orchestration; never `claude -p`). Exit: 0 succeeded, 75 herdr
-/// unavailable (retry later), 1 failed. Requested --cleanup is honored only when
+/// (Herdr pane orchestration; never `claude -p`). The final stdout line is a
+/// machine-readable `plant.agent.run` result. Exit: 0 succeeded, 75 retryable,
+/// 1 failed or indeterminate. Requested --cleanup is honored only when
 /// PLANT_KEEP_PANES=0 opts in — see jobs::cleanup_policy.
 async fn subcommand(argv: &[String]) -> Option<i32> {
     let flag = |name: &str| {
@@ -218,24 +219,41 @@ async fn subcommand(argv: &[String]) -> Option<i32> {
                 discover_session_id: cli == "codex",
             };
             let label = run.label.clone();
-            let outcome = match flag("--idempotency-key") {
-                Some(key) => herdr::run_agent_idempotent(run, &key).await,
-                None => herdr::run_agent(run).await,
+            let (state, durable, detail, code) = match flag("--idempotency-key") {
+                Some(key) => match herdr::run_agent_idempotent(run, &key).await {
+                    herdr::IdempotentAgentRun::Durable(herdr::DurableAgentOutcome::Succeeded(
+                        detail,
+                    )) => ("succeeded", true, detail, 0),
+                    herdr::IdempotentAgentRun::Durable(herdr::DurableAgentOutcome::Failed(
+                        detail,
+                    )) => ("failed", true, detail, 1),
+                    herdr::IdempotentAgentRun::Retryable(detail) => {
+                        ("retryable", false, detail, 75)
+                    }
+                    herdr::IdempotentAgentRun::Indeterminate(detail) => {
+                        ("indeterminate", false, detail, 1)
+                    }
+                },
+                None => match herdr::run_agent(run).await {
+                    herdr::AgentRunOutcome::Succeeded(detail) => ("succeeded", false, detail, 0),
+                    herdr::AgentRunOutcome::Unavailable => {
+                        ("retryable", false, "herdr unavailable".to_string(), 75)
+                    }
+                    herdr::AgentRunOutcome::Failed(detail) => ("failed", false, detail, 1),
+                },
             };
-            match outcome {
-                herdr::AgentRunOutcome::Succeeded(detail) => {
-                    println!("[agent:{label}] succeeded: {detail}");
-                    Some(0)
-                }
-                herdr::AgentRunOutcome::Unavailable => {
-                    println!("[agent:{label}] herdr unavailable");
-                    Some(75)
-                }
-                herdr::AgentRunOutcome::Failed(detail) => {
-                    println!("[agent:{label}] failed: {detail}");
-                    Some(1)
-                }
-            }
+            println!(
+                "{}",
+                serde_json::json!({
+                    "type": "plant.agent.run",
+                    "version": 1,
+                    "state": state,
+                    "durable": durable,
+                    "detail": detail,
+                    "label": label,
+                })
+            );
+            Some(code)
         }
         _ => None,
     }

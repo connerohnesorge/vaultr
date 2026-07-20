@@ -162,6 +162,19 @@ pub enum AgentRunOutcome {
     Failed(String),
 }
 
+#[derive(Debug, PartialEq)]
+pub enum DurableAgentOutcome {
+    Succeeded(String),
+    Failed(String),
+}
+
+#[derive(Debug, PartialEq)]
+pub enum IdempotentAgentRun {
+    Durable(DurableAgentOutcome),
+    Retryable(String),
+    Indeterminate(String),
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 enum DurableAgentRun {
@@ -172,7 +185,7 @@ enum DurableAgentRun {
 
 enum IdempotencyClaim {
     Execute(PathBuf),
-    Prior(AgentRunOutcome),
+    Prior(DurableAgentOutcome),
     Pending,
 }
 
@@ -214,11 +227,11 @@ fn claim_agent_run(dir: &Path, key: &str) -> io::Result<IdempotencyClaim> {
                 DurableAgentRun::InProgress { key } => (key, IdempotencyClaim::Pending),
                 DurableAgentRun::Succeeded { key, detail } => (
                     key,
-                    IdempotencyClaim::Prior(AgentRunOutcome::Succeeded(detail)),
+                    IdempotencyClaim::Prior(DurableAgentOutcome::Succeeded(detail)),
                 ),
                 DurableAgentRun::Failed { key, detail } => (
                     key,
-                    IdempotencyClaim::Prior(AgentRunOutcome::Failed(detail)),
+                    IdempotencyClaim::Prior(DurableAgentOutcome::Failed(detail)),
                 ),
             };
             if recorded_key != key {
@@ -233,22 +246,16 @@ fn claim_agent_run(dir: &Path, key: &str) -> io::Result<IdempotencyClaim> {
     }
 }
 
-fn persist_agent_outcome(path: &Path, key: &str, outcome: &AgentRunOutcome) -> io::Result<()> {
+fn persist_agent_outcome(path: &Path, key: &str, outcome: &DurableAgentOutcome) -> io::Result<()> {
     let record = match outcome {
-        AgentRunOutcome::Succeeded(detail) => DurableAgentRun::Succeeded {
+        DurableAgentOutcome::Succeeded(detail) => DurableAgentRun::Succeeded {
             key: key.to_string(),
             detail: detail.clone(),
         },
-        AgentRunOutcome::Failed(detail) => DurableAgentRun::Failed {
+        DurableAgentOutcome::Failed(detail) => DurableAgentRun::Failed {
             key: key.to_string(),
             detail: detail.clone(),
         },
-        AgentRunOutcome::Unavailable => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "Unavailable is not a conclusive outcome",
-            ))
-        }
     };
     let mut bytes =
         serde_json::to_vec(&record).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -258,34 +265,41 @@ fn persist_agent_outcome(path: &Path, key: &str, outcome: &AgentRunOutcome) -> i
 
 /// Run an agent at most once for a caller-supplied stable key. Conclusive
 /// outcomes are replayed without touching Herdr; uncertain state fails closed.
-pub(crate) async fn run_agent_idempotent(agent_run: AgentRun, key: &str) -> AgentRunOutcome {
+pub(crate) async fn run_agent_idempotent(agent_run: AgentRun, key: &str) -> IdempotentAgentRun {
     let dir = crate::jobs::state_dir().join("agent-runs");
     let path = match claim_agent_run(&dir, key) {
         Ok(IdempotencyClaim::Execute(path)) => path,
-        Ok(IdempotencyClaim::Prior(outcome)) => return outcome,
+        Ok(IdempotencyClaim::Prior(outcome)) => return IdempotentAgentRun::Durable(outcome),
         Ok(IdempotencyClaim::Pending) => {
-            return AgentRunOutcome::Failed(
+            return IdempotentAgentRun::Indeterminate(
                 "idempotent agent run has no conclusive outcome; refusing duplicate launch"
                     .to_string(),
             )
         }
         Err(error) => {
-            return AgentRunOutcome::Failed(format!("idempotency state unavailable: {error}"))
+            return IdempotentAgentRun::Indeterminate(format!(
+                "idempotency state unavailable: {error}"
+            ))
         }
     };
 
-    let outcome = run_agent(agent_run).await;
-    if outcome == AgentRunOutcome::Unavailable {
-        return match std::fs::remove_file(&path).and_then(|_| crate::jobs::sync_dir(&dir)) {
-            Ok(()) => AgentRunOutcome::Unavailable,
-            Err(error) => AgentRunOutcome::Failed(format!(
-                "could not release unavailable idempotency claim: {error}"
-            )),
-        };
-    }
+    let outcome = match run_agent(agent_run).await {
+        AgentRunOutcome::Unavailable => {
+            return match std::fs::remove_file(&path).and_then(|_| crate::jobs::sync_dir(&dir)) {
+                Ok(()) => {
+                    IdempotentAgentRun::Retryable("herdr unavailable before launch".to_string())
+                }
+                Err(error) => IdempotentAgentRun::Indeterminate(format!(
+                    "could not release unavailable idempotency claim: {error}"
+                )),
+            };
+        }
+        AgentRunOutcome::Succeeded(detail) => DurableAgentOutcome::Succeeded(detail),
+        AgentRunOutcome::Failed(detail) => DurableAgentOutcome::Failed(detail),
+    };
     match persist_agent_outcome(&path, key, &outcome) {
-        Ok(()) => outcome,
-        Err(error) => AgentRunOutcome::Failed(format!(
+        Ok(()) => IdempotentAgentRun::Durable(outcome),
+        Err(error) => IdempotentAgentRun::Indeterminate(format!(
             "could not persist conclusive agent outcome: {error}"
         )),
     }
@@ -821,12 +835,12 @@ mod tests {
         persist_agent_outcome(
             &path,
             "door-batch",
-            &AgentRunOutcome::Succeeded("done once".to_string()),
+            &DurableAgentOutcome::Succeeded("done once".to_string()),
         )
         .unwrap();
         assert!(matches!(
             claim_agent_run(&dir, "door-batch").unwrap(),
-            IdempotencyClaim::Prior(AgentRunOutcome::Succeeded(ref detail))
+            IdempotencyClaim::Prior(DurableAgentOutcome::Succeeded(ref detail))
                 if detail == "done once"
         ));
 

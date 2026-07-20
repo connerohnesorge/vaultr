@@ -16,9 +16,10 @@ typed code rather than bash or a bespoke declarative format.
   agent launch — are written once in a shared TypeScript library, not
   re-authored per door.
 - Door state fails closed, is replaced atomically under a per-door
-  cross-process lock, and carries an ordered `(mtime,path)` cursor plus the
-  exact in-progress batch. The claim deterministically supplies Plant's
-  idempotency key, so process crashes cannot create a second agent run.
+  cross-process lock, and carries a timestamp frontier with the paths already
+  seen at that timestamp plus the exact ordered in-progress batch. The claim
+  deterministically supplies Plant's idempotency key, so process crashes
+  cannot create a second agent run.
 - Loop prevention is structural first (doors may only watch ingestion roots
   that agents never write) with a rate breaker as defense-in-depth, because a
   self-sustaining door fires slowly (agent runtime spaces the fires) and would
@@ -55,12 +56,14 @@ The jobs contract already requires agent jobs to drive panes only via
 `plant agent run`, and `plant-agent-jobs` made Plant's Herdr lifecycle the
 single owner of workspace creation, readiness, delivery, wait, and cleanup.
 The library is a thin typed client over that interface: it supplies the
-persisted batch's stable idempotency key and receives structured
-`Unavailable`/`Failed`/`Succeeded` results, never a second lifecycle
+persisted batch's stable idempotency key and requires a machine-readable Plant
+result that distinguishes durable `Succeeded`/`Failed` outcomes from
+retryable or indeterminate execution state, never a second lifecycle
 implementation. Plant durably claims each key before Herdr side effects,
 records conclusive outcomes before returning, and returns an already-recorded
-outcome without creating another workspace. An unavailable pre-launch Herdr
-probe remains retryable and does not become a conclusive outcome.
+outcome without creating another workspace. A pre-launch unavailable probe is
+retryable; pending or inaccessible idempotency state and outcome-persistence
+failure are indeterminate. Neither advances Door state.
 
 ### ADR-0004: Loop prevention is allowlist-by-construction plus a rate breaker
 
@@ -76,12 +79,18 @@ breakers (real loops fire slowly and never trip them) and provenance tagging
 
 ### ADR-0005: Door batches are ordered durable claims
 
-A scalar mtime cannot distinguish files with tied timestamps, and saving it
-after launch leaves a crash window that can launch the same batch twice. Each
-door therefore serializes evaluation with a per-door cross-process lock, fails
-closed on unreadable or invalid state, and atomically persists the exact batch
-ordered by `(mtime,path)` before launch. The persisted claim determines the
-Plant idempotency key and survives both pre-launch and post-launch Door
-crashes. A retry resumes that claim; after a conclusive Plant outcome it
-advances the cursor and clears the claim atomically. `Unavailable` retains the
-claim and its key for a later attempt.
+A scalar mtime misses ties, while a single `(mtime,path)` cursor misses a file
+that lands later at the same timestamp with a lower-sorting path. Each door
+therefore serializes evaluation with a per-door cross-process lock, fails
+closed on unreadable or invalid state, and persists a timestamp frontier plus
+the sorted set of paths already seen at that timestamp. It atomically persists
+the exact batch ordered by `(mtime,path)` before launch. The persisted claim
+determines the Plant idempotency key and survives both pre-launch and
+post-launch Door crashes. A retry resumes that claim; only a confirmed durable
+Plant `Succeeded` or `Failed` outcome advances the frontier and clears the
+claim atomically. Retryable and indeterminate results retain the claim and key.
+
+The watch resolver selects one configured ingestion root, canonicalizes it,
+and resolves both scanned and claimed files through that root. Traversal and
+real paths outside the selected root, including symlink escapes, fail closed
+before content is read or an agent is launched.

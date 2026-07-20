@@ -11,12 +11,14 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readdirSync,
+  realpathSync,
   renameSync,
   statSync,
   unlinkSync,
   writeSync,
 } from "node:fs";
-import { basename, relative, resolve } from "node:path";
+import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 
 const HOME = process.env.HOME ?? "";
 const vaultRoot = () => process.env.DOOR_VAULT_ROOT ?? `${HOME}/.dotfiles/vault`;
@@ -28,7 +30,11 @@ const allowedRoots = () => (process.env.DOOR_ROOTS ?? "mail,teams,tickets").spli
 
 const WINDOW_MS = 3_600_000;
 
-export type AgentOutcome = "Succeeded" | "Unavailable" | "Failed";
+export type AgentState = "Succeeded" | "Failed" | "Retryable" | "Indeterminate";
+
+export type AgentResult =
+  | { state: "Succeeded" | "Failed"; durable: boolean; detail: string }
+  | { state: "Retryable" | "Indeterminate"; durable: false; detail: string };
 
 export interface AgentOpts {
   cli?: "claude" | "codex";
@@ -42,8 +48,9 @@ export interface AgentOpts {
 }
 
 /** Typed client over `plant agent run` — the only sanctioned way to drive an
- *  agent pane. Exit contract mirrors plant: 0 Succeeded, 75 Unavailable, else Failed. */
-export async function agentRun(prompt: string, opts: AgentOpts = {}): Promise<{ outcome: AgentOutcome; detail: string }> {
+ * agent pane. A conclusive result is durable only when Plant says its stable
+ * idempotency record was committed. */
+export async function agentRun(prompt: string, opts: AgentOpts = {}): Promise<AgentResult> {
   const argv = [plantBin(), "agent", "run", "--cli", opts.cli ?? "claude", "--label", opts.label ?? "agent"];
   for (const [flag, v] of [["--model", opts.model], ["--args", opts.args], ["--cwd", opts.cwd], ["--timeout", opts.timeout], ["--cleanup", opts.cleanup], ["--idempotency-key", opts.idempotencyKey]] as const) {
     if (v) argv.push(flag, v);
@@ -51,9 +58,37 @@ export async function agentRun(prompt: string, opts: AgentOpts = {}): Promise<{ 
   const proc = Bun.spawn(argv, { stdin: new TextEncoder().encode(prompt), stdout: "pipe", stderr: "pipe" });
   const [out, err, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
   const lastLine = (s: string) => s.split("\n").map((l) => l.trim()).filter(Boolean).pop();
-  const detail = lastLine(out) ?? lastLine(err) ?? "no output";
-  const outcome: AgentOutcome = code === 0 ? "Succeeded" : code === 75 ? "Unavailable" : "Failed";
-  return { outcome, detail };
+  const fallback = lastLine(err) ?? lastLine(out) ?? "no output";
+  let receipt: Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(lastLine(out) ?? "");
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error();
+    receipt = parsed;
+  } catch {
+    return { state: "Indeterminate", durable: false, detail: `missing Plant result (exit ${code}): ${fallback}` };
+  }
+  const states: Record<string, AgentState> = {
+    succeeded: "Succeeded",
+    failed: "Failed",
+    retryable: "Retryable",
+    indeterminate: "Indeterminate",
+  };
+  const state = typeof receipt.state === "string" ? states[receipt.state] : undefined;
+  const valid = receipt.type === "plant.agent.run"
+    && receipt.version === 1
+    && state !== undefined
+    && typeof receipt.detail === "string"
+    && typeof receipt.durable === "boolean"
+    && ((state === "Succeeded" && code === 0)
+      || (state === "Failed" && code === 1)
+      || (state === "Retryable" && code === 75 && receipt.durable === false)
+      || (state === "Indeterminate" && code === 1 && receipt.durable === false));
+  if (!valid) {
+    return { state: "Indeterminate", durable: false, detail: `invalid Plant result (exit ${code}): ${fallback}` };
+  }
+  return state === "Retryable" || state === "Indeterminate"
+    ? { state, durable: false, detail: receipt.detail }
+    : { state, durable: receipt.durable, detail: receipt.detail };
 }
 
 export interface DoorFile {
@@ -66,7 +101,7 @@ export interface DoorFile {
 export interface DoorSpec {
   /** Defaults to the job filename: door-oncall.30m.ts -> "oncall". */
   name?: string;
-  /** Glob relative to the vault content root; first segment must be an allowlisted ingestion root. */
+  /** Traversal-free glob beneath one canonical allowlisted ingestion root. */
   watch: string;
   filter?: (f: DoorFile) => boolean;
   prompt: (files: DoorFile[]) => string;
@@ -80,22 +115,25 @@ export interface DoorResult {
   detail: string;
 }
 
-interface Cursor {
+interface ClaimFile {
   mtimeMs: number;
   path: string;
 }
 
-type ClaimFile = Cursor;
+interface Frontier {
+  mtimeMs: number;
+  seen: string[];
+}
 
 interface DoorClaim {
-  from: Cursor;
+  from: Frontier;
   files: ClaimFile[];
   key: string;
 }
 
 interface DoorState {
-  version: 1;
-  cursor: Cursor;
+  version: 2;
+  frontier: Frontier;
   fires: number[]; // epoch-ms of launches in/near the rolling window
   paused?: string; // reason; presence = paused until manually removed
   claim?: DoorClaim;
@@ -109,24 +147,43 @@ function lockPath(name: string): string {
   return `${stateDir()}/${name}.lock`;
 }
 
-function compareCursor(a: Cursor, b: Cursor): number {
+function compareFile(a: ClaimFile, b: ClaimFile): number {
   if (a.mtimeMs !== b.mtimeMs) return a.mtimeMs < b.mtimeMs ? -1 : 1;
   return a.path < b.path ? -1 : a.path > b.path ? 1 : 0;
 }
 
-function sameCursor(a: Cursor, b: Cursor): boolean {
-  return a.mtimeMs === b.mtimeMs && a.path === b.path;
+function sameFrontier(a: Frontier, b: Frontier): boolean {
+  return a.mtimeMs === b.mtimeMs
+    && a.seen.length === b.seen.length
+    && a.seen.every((path, index) => path === b.seen[index]);
 }
 
-function validCursor(value: unknown): value is Cursor {
-  const cursor = value as Cursor;
-  return !!cursor
-    && Number.isFinite(cursor.mtimeMs)
-    && cursor.mtimeMs >= 0
-    && typeof cursor.path === "string";
+function validFile(value: unknown): value is ClaimFile {
+  const file = value as ClaimFile;
+  return !!file
+    && Number.isFinite(file.mtimeMs)
+    && file.mtimeMs >= 0
+    && typeof file.path === "string"
+    && file.path.length > 0;
 }
 
-function claimKey(name: string, from: Cursor, files: ClaimFile[]): string {
+function validFrontier(value: unknown): value is Frontier {
+  const frontier = value as Frontier;
+  return !!frontier
+    && Number.isFinite(frontier.mtimeMs)
+    && frontier.mtimeMs >= 0
+    && Array.isArray(frontier.seen)
+    && frontier.seen.every((path) => typeof path === "string" && path.length > 0)
+    && frontier.seen.every((path) => validRelativePath(path, true))
+    && frontier.seen.every((path, index) => index === 0 || frontier.seen[index - 1]! < path);
+}
+
+function isNew(file: ClaimFile, frontier: Frontier): boolean {
+  return file.mtimeMs > frontier.mtimeMs
+    || (file.mtimeMs === frontier.mtimeMs && !frontier.seen.includes(file.path));
+}
+
+function claimKey(name: string, from: Frontier, files: ClaimFile[]): string {
   return createHash("sha256")
     .update(JSON.stringify({ door: name, from, files }))
     .digest("hex");
@@ -136,37 +193,28 @@ function parseState(name: string, value: unknown): DoorState {
   const raw = value as Record<string, unknown>;
   if (!raw || typeof raw !== "object" || !Array.isArray(raw.fires)
     || !raw.fires.every((fire) => Number.isFinite(fire) && (fire as number) >= 0)
-    || (raw.paused !== undefined && typeof raw.paused !== "string")) {
+    || (raw.paused !== undefined && typeof raw.paused !== "string")
+    || raw.version !== 2
+    || !validFrontier(raw.frontier)) {
     throw new Error("invalid door state");
   }
 
-  // Shipped scalar states are migrated conservatively: every path tied at the
-  // old high-water timestamp is treated as already fired, never duplicated.
-  if (raw.cursor !== undefined && raw.version !== 1) {
-    throw new Error("unsupported door state version");
-  }
-  const cursor = validCursor(raw.cursor)
-    ? raw.cursor
-    : Number.isFinite(raw.hwm) && (raw.hwm as number) >= 0
-      ? { mtimeMs: raw.hwm as number, path: "\uffff" }
-      : undefined;
-  if (!cursor) throw new Error("invalid door cursor");
-
   const state: DoorState = {
-    version: 1,
-    cursor,
+    version: 2,
+    frontier: raw.frontier,
     fires: raw.fires as number[],
     ...(raw.paused === undefined ? {} : { paused: raw.paused as string }),
   };
   if (raw.claim !== undefined) {
     const claim = raw.claim as DoorClaim;
-    if (!claim || !validCursor(claim.from) || !sameCursor(claim.from, cursor)
+    if (!claim || !validFrontier(claim.from) || !sameFrontier(claim.from, state.frontier)
       || !Array.isArray(claim.files) || claim.files.length === 0
-      || !claim.files.every(validCursor)
-      || claim.files.some((file) => file.path.length === 0)
+      || !claim.files.every(validFile)
+      || claim.files.some((file) => !validRelativePath(file.path, true))
+      || new Set(claim.files.map((file) => file.path)).size !== claim.files.length
       || claim.files.some((file, i) =>
-        compareCursor(file, claim.from) <= 0
-        || (i > 0 && compareCursor(claim.files[i - 1]!, file) >= 0))
+        !isNew(file, claim.from)
+        || (i > 0 && compareFile(claim.files[i - 1]!, file) >= 0))
       || typeof claim.key !== "string"
       || claim.key !== claimKey(name, claim.from, claim.files)) {
       throw new Error("invalid door claim");
@@ -181,9 +229,9 @@ function loadState(name: string): DoorState {
     return parseState(name, JSON.parse(readFileSync(statePath(name), "utf8")));
   } catch (error: any) {
     if (error?.code === "ENOENT") {
-      return { version: 1, cursor: { mtimeMs: 0, path: "" }, fires: [] };
+      return { version: 2, frontier: { mtimeMs: 0, seen: [] }, fires: [] };
     }
-    throw new Error(`cannot read ${statePath(name)}: ${error instanceof Error ? error.message : String(error)}`);
+    throw new Error(`cannot read supported ${statePath(name)}: ${error instanceof Error ? error.message : String(error)}`);
   }
 }
 
@@ -281,21 +329,105 @@ function acquireLock(name: string): (() => void) | undefined {
   throw new Error(`could not recover stale door lock ${path}`);
 }
 
-function absoluteClaimPath(path: string): string {
-  const root = resolve(vaultRoot());
-  const absolute = resolve(root, path);
-  const rel = relative(root, absolute);
-  if (rel === ".." || rel.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`)) {
-    throw new Error(`claimed path escapes vault root: ${path}`);
-  }
-  return absolute;
+interface IngestionRoot {
+  prefix: string;
+  path: string;
+  pattern: string;
 }
 
-function hydrateClaim(claim: DoorClaim): DoorFile[] {
+function isBeneath(parent: string, child: string): boolean {
+  const rel = relative(parent, child);
+  return rel === "" || (!isAbsolute(rel) && rel !== ".." && !rel.startsWith(`..${sep}`));
+}
+
+function validRelativePath(path: string, allowGlob: boolean): boolean {
+  if (!path || isAbsolute(path) || path.includes("\\") || path.includes("\0")) return false;
+  const segments = path.split("/");
+  return segments.every((segment) =>
+    segment.length > 0
+    && segment !== "."
+    && segment !== ".."
+    && (allowGlob || !/[*?[\]{}]/.test(segment)));
+}
+
+/** Resolve one trusted ingestion root and the watch pattern beneath it. Every
+ * later path is resolved through this same canonical root. */
+function resolveIngestionRoot(watch: string): IngestionRoot {
+  if (!validRelativePath(watch, true)) {
+    throw new Error(`watch "${watch}" rejected: must be a traversal-free relative glob`);
+  }
+  const configuredRoots = allowedRoots();
+  const roots = configuredRoots
+    .filter((root) => validRelativePath(root, false))
+    .sort((a, b) => b.length - a.length);
+  if (roots.length !== configuredRoots.length) {
+    throw new Error("DOOR_ROOTS contains an invalid ingestion root");
+  }
+  const prefix = roots.find((root) => watch === root || watch.startsWith(`${root}/`));
+  if (!prefix) {
+    throw new Error(`watch "${watch}" rejected: must be beneath an ingestion root (${roots.join(", ")})`);
+  }
+  const vault = realpathSync(vaultRoot());
+  const path = realpathSync(resolve(vault, prefix));
+  if (!isBeneath(vault, path) || !statSync(path).isDirectory()) {
+    throw new Error(`ingestion root "${prefix}" escapes the vault or is not a directory`);
+  }
+  return { prefix, path, pattern: watch === prefix ? "*" : watch.slice(prefix.length + 1) };
+}
+
+function resolveIngestionFile(root: IngestionRoot, path: string): string {
+  if (!validRelativePath(path, true)) {
+    throw new Error(`invalid path beneath ingestion root: ${path}`);
+  }
+  const lexical = resolve(root.path, path);
+  if (!isBeneath(root.path, lexical)) {
+    throw new Error(`path escapes ingestion root: ${path}`);
+  }
+  const canonical = realpathSync(lexical);
+  if (!isBeneath(root.path, canonical)) {
+    throw new Error(`symlink escapes ingestion root: ${path}`);
+  }
+  return canonical;
+}
+
+/** Walk without following directory symlinks, validating every symlink before
+ * deciding whether its file target matches the watch glob. */
+function scanIngestionPaths(root: IngestionRoot): string[] {
+  const glob = new Bun.Glob(root.pattern);
+  const pending = [""];
+  const matches: string[] = [];
+  while (pending.length > 0) {
+    const dir = pending.pop()!;
+    for (const entry of readdirSync(resolve(root.path, dir), { withFileTypes: true })) {
+      const path = dir ? `${dir}/${entry.name}` : entry.name;
+      if (entry.isSymbolicLink()) {
+        const target = realpathSync(resolve(root.path, path));
+        if (!isBeneath(root.path, target)) {
+          throw new Error(`symlink escapes ingestion root: ${path}`);
+        }
+        if (statSync(target).isFile() && glob.match(path)) matches.push(path);
+      } else if (entry.isDirectory()) {
+        pending.push(path);
+      } else if (entry.isFile() && glob.match(path)) {
+        matches.push(path);
+      }
+    }
+  }
+  return matches;
+}
+
+function claimRelativePath(root: IngestionRoot, path: string): string {
+  if (!path.startsWith(`${root.prefix}/`)) {
+    throw new Error(`claimed path is outside ingestion root "${root.prefix}": ${path}`);
+  }
+  return path.slice(root.prefix.length + 1);
+}
+
+function hydrateClaim(root: IngestionRoot, claim: DoorClaim): DoorFile[] {
   return claim.files.map((file) => {
-    const abs = absoluteClaimPath(file.path);
+    const abs = resolveIngestionFile(root, claimRelativePath(root, file.path));
     const stat = statSync(abs);
-    if (stat.mtimeMs !== file.mtimeMs) {
+    if (!stat.isFile() || stat.mtimeMs !== file.mtimeMs) {
       throw new Error(`claimed file changed before launch: ${file.path}`);
     }
     return {
@@ -304,6 +436,15 @@ function hydrateClaim(claim: DoorClaim): DoorFile[] {
       text: readFileSync(abs, "utf8").slice(0, 65536),
     };
   });
+}
+
+function advanceFrontier(from: Frontier, files: ClaimFile[]): Frontier {
+  const mtimeMs = files[files.length - 1]!.mtimeMs;
+  const atFrontier = files
+    .filter((file) => file.mtimeMs === mtimeMs)
+    .map((file) => file.path);
+  const seen = mtimeMs === from.mtimeMs ? [...from.seen, ...atFrontier] : atFrontier;
+  return { mtimeMs, seen: [...new Set(seen)].sort() };
 }
 
 function doorNameFromScript(): string {
@@ -322,32 +463,31 @@ export async function door(spec: DoorSpec): Promise<DoorResult> {
     release = acquireLock(name);
     if (!release) return { code: 75, detail: `door "${name}" is already running` };
     const state = loadState(name);
+    const root = resolveIngestionRoot(spec.watch);
 
     if (state.paused) {
       return { code: 0, detail: `paused: ${state.paused} — re-arm by deleting "paused" in ${statePath(name)}` };
     }
 
-    const root = spec.watch.split("/")[0] ?? "";
-    if (/[*?[\]]/.test(root) || !allowedRoots().includes(root)) {
-      return { code: 1, detail: `watch "${spec.watch}" rejected: first segment must be an ingestion root (${allowedRoots().join(", ")})` };
-    }
-
     if (!state.claim) {
       const files: DoorFile[] = [];
-      for (const path of new Bun.Glob(spec.watch).scanSync({ cwd: vaultRoot() })) {
-        const abs = absoluteClaimPath(path);
-        let mtimeMs: number;
+      for (const path of scanIngestionPaths(root)) {
         try {
-          mtimeMs = statSync(abs).mtimeMs;
-        } catch {
-          continue; // raced away mid-scan
-        }
-        if (compareCursor({ mtimeMs, path }, state.cursor) > 0) {
-          const text = readFileSync(abs, "utf8").slice(0, 65536);
-          files.push({ path, abs, mtimeMs, text });
+          const abs = resolveIngestionFile(root, path);
+          const stat = statSync(abs);
+          if (!stat.isFile()) continue;
+          const mtimeMs = stat.mtimeMs;
+          const vaultPath = `${root.prefix}/${path}`;
+          if (isNew({ mtimeMs, path: vaultPath }, state.frontier)) {
+            const text = readFileSync(abs, "utf8").slice(0, 65536);
+            files.push({ path: vaultPath, abs, mtimeMs, text });
+          }
+        } catch (error: any) {
+          if (error?.code === "ENOENT") continue; // raced away mid-scan
+          throw error;
         }
       }
-      files.sort(compareCursor);
+      files.sort(compareFile);
       const matched = spec.filter ? files.filter(spec.filter) : files;
       if (matched.length === 0) return { code: 0, detail: "no new files" };
 
@@ -362,31 +502,33 @@ export async function door(spec: DoorSpec): Promise<DoorResult> {
 
       const claimFiles = matched.map(({ mtimeMs, path }) => ({ mtimeMs, path }));
       state.claim = {
-        from: state.cursor,
+        from: state.frontier,
         files: claimFiles,
-        key: claimKey(name, state.cursor, claimFiles),
+        key: claimKey(name, state.frontier, claimFiles),
       };
       saveState(name, state);
     }
 
     const claim = state.claim;
-    const matched = hydrateClaim(claim);
-    const { outcome, detail } = await agentRun(spec.prompt(matched), {
+    const matched = hydrateClaim(root, claim);
+    const result = await agentRun(spec.prompt(matched), {
       label: `door-${name}`,
       ...spec.agent,
       idempotencyKey: claim.key,
     });
-    if (outcome === "Unavailable") {
-      return { code: 75, detail: `herdr unavailable, ${matched.length} file(s) held` };
+    if (!result.durable) {
+      return result.state === "Retryable"
+        ? { code: 75, detail: `agent retryable, ${matched.length} file(s) held: ${result.detail}` }
+        : { code: 1, detail: `agent outcome indeterminate, ${matched.length} file(s) held: ${result.detail}` };
     }
 
     state.fires.push(Date.now());
-    state.cursor = claim.files[claim.files.length - 1]!;
+    state.frontier = advanceFrontier(claim.from, claim.files);
     delete state.claim;
     saveState(name, state);
-    return outcome === "Succeeded"
-      ? { code: 0, detail: `fired on ${matched.length} file(s): ${detail}` }
-      : { code: 1, detail: `agent failed after claiming ${matched.length} file(s): ${detail}` };
+    return result.state === "Succeeded"
+      ? { code: 0, detail: `fired on ${matched.length} file(s): ${result.detail}` }
+      : { code: 1, detail: `agent failed after claiming ${matched.length} file(s): ${result.detail}` };
   } catch (error) {
     return {
       code: 1,

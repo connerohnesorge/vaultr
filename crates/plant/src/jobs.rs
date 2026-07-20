@@ -387,7 +387,8 @@ fn record(
         .append(true)
         .open(ledger_path(name))?;
     file.write_all(&line)?;
-    file.sync_data()?;
+    file.sync_all()?;
+    sync_dir(&dir)?;
     println!("[job:{name}] {outcome} ({detail})");
     Ok(())
 }
@@ -441,21 +442,20 @@ fn tail_line(text: &str) -> Option<String> {
 /// Runaway backstop only — scripts own their real timeouts (passed to `plant agent run`).
 const SCRIPT_BACKSTOP: Duration = Duration::from_secs(3 * 3600);
 
-pub async fn run_job(job: &Job) -> i32 {
-    let started = SystemTime::now();
-    let mut attempt = match begin_attempt(&job.name) {
-        Ok(AttemptStart::Ready(attempt)) => attempt,
-        Ok(AttemptStart::Blocked(detail)) => {
-            eprintln!("[job:{}] dispatch blocked: {detail}", job.name);
-            return 1;
-        }
-        Err(e) => {
-            eprintln!("[job:{}] attempt fence failed: {e}", job.name);
-            return 1;
-        }
-    };
+enum JobExecution {
+    Final {
+        code: i32,
+        outcome: &'static str,
+        detail: String,
+    },
+    Retryable {
+        detail: String,
+    },
+}
+
+async fn execute_job(job: &Job) -> JobExecution {
     // Exec the script directly: the shebang picks the interpreter. A missing
-    // shebang or exec bit fails at spawn (ENOEXEC/EACCES) and is recorded below.
+    // shebang or exec bit fails at spawn (ENOEXEC/EACCES).
     let mut cmd = tokio::process::Command::new(&job.path);
     cmd.current_dir(expand_home("~/.dotfiles"))
         .env("PATH", script_path_env())
@@ -473,33 +473,30 @@ pub async fn run_job(job: &Job) -> i32 {
         .stderr(std::process::Stdio::piped());
     let child = match cmd.spawn() {
         Ok(c) => c,
-        Err(e) => {
-            if let Err(record_error) =
-                finish_attempt(&attempt, "failed", started, &format!("spawn: {e}"))
-            {
-                eprintln!("[job:{}] final record failed: {record_error}", job.name);
-            }
-            return 1;
+        Err(error) => {
+            return JobExecution::Final {
+                code: 1,
+                outcome: "failed",
+                detail: format!("spawn: {error}"),
+            };
         }
     };
     let out = match tokio::time::timeout(SCRIPT_BACKSTOP, child.wait_with_output()).await {
         Ok(Ok(out)) => out,
-        Ok(Err(e)) => {
-            if let Err(record_error) =
-                finish_attempt(&attempt, "failed", started, &format!("wait: {e}"))
-            {
-                eprintln!("[job:{}] final record failed: {record_error}", job.name);
-            }
-            return 1;
+        Ok(Err(error)) => {
+            return JobExecution::Final {
+                code: 1,
+                outcome: "failed",
+                detail: format!("wait: {error}"),
+            };
         }
         Err(_) => {
             // kill_on_drop reaped the child when the future was dropped by timeout
-            if let Err(record_error) =
-                finish_attempt(&attempt, "failed", started, "killed: 3h backstop")
-            {
-                eprintln!("[job:{}] final record failed: {record_error}", job.name);
-            }
-            return 1;
+            return JobExecution::Final {
+                code: 1,
+                outcome: "failed",
+                detail: "killed: 3h backstop".to_string(),
+            };
         }
     };
     let detail = tail_line(&String::from_utf8_lossy(&out.stdout))
@@ -507,24 +504,49 @@ pub async fn run_job(job: &Job) -> i32 {
         .unwrap_or_else(|| "no output".to_string());
     let code = out.status.code();
     match outcome_for(code) {
-        Some(outcome) => {
-            if let Err(e) = finish_attempt(&attempt, outcome, started, &detail) {
-                eprintln!("[job:{}] final record failed: {e}", job.name);
+        Some(outcome) => JobExecution::Final {
+            code: if code == Some(0) { 0 } else { 1 },
+            outcome,
+            detail,
+        },
+        None => JobExecution::Retryable { detail },
+    }
+}
+
+pub async fn run_job(job: &Job) -> i32 {
+    let started = SystemTime::now();
+    let mut attempt = match begin_attempt(&job.name) {
+        Ok(AttemptStart::Ready(attempt)) => attempt,
+        Ok(AttemptStart::Blocked(detail)) => {
+            eprintln!("[job:{}] dispatch blocked: {detail}", job.name);
+            return 1;
+        }
+        Err(e) => {
+            eprintln!("[job:{}] attempt fence failed: {e}", job.name);
+            return 1;
+        }
+    };
+
+    match execute_job(job).await {
+        JobExecution::Final {
+            code,
+            outcome,
+            detail,
+        } => {
+            if let Err(error) = finish_attempt(&attempt, outcome, started, &detail) {
+                eprintln!("[job:{}] final record failed: {error}", job.name);
                 return 1;
             }
+            code
         }
-        None => {
+        JobExecution::Retryable { detail } => {
             if let Err(e) = attempt.mark_retryable() {
                 eprintln!("[job:{}] retry fence failed: {e}", job.name);
                 return 1;
             }
             println!("[job:{}] retry next tick ({detail})", job.name);
+            75
         }
-    }
-    match code {
-        Some(0) => 0,
-        Some(75) => 75,
-        _ => 1,
     }
 }
 

@@ -9,10 +9,11 @@
 ## 2. Door library (Bun/TypeScript)
 
 - [ ] 2.1 Scaffold the `ts/` Bun package in the workspace with flake + Home Manager packaging so door jobs can import it
-- [x] 2.2 Deepen `plant agent run` with a stable idempotency key, durable fail-closed claim/outcome lookup, and typed `Unavailable`/`Failed`/`Succeeded` replay, with focused Rust tests
-- [x] 2.3 Implement `door()`: fail-closed atomic state, per-door cross-process lock, ordered `(mtime,path)` cursor, exact persisted batch claim, stable claim-derived idempotency key, and conclusive-outcome cursor advance
-- [x] 2.4 Implement the ingestion-root allowlist (loud rejection before launch) and the rolling-window breaker with manual re-arm, with tests for both
+- [x] 2.2 Deepen `plant agent run` with a stable idempotency key, durable fail-closed claim/outcome lookup, and machine-readable separation of durable, retryable, and indeterminate results, with focused Rust tests
+- [x] 2.3 Implement `door()`: fail-closed atomic state, per-door cross-process lock, timestamp frontier with durable tied paths, exact persisted batch claim, stable claim-derived idempotency key, and durable-outcome-only frontier advance
+- [x] 2.4 Implement one canonical ingestion-root resolver (loud traversal and symlink-escape rejection before launch) and the rolling-window breaker with manual re-arm, with tests for both
 - [x] 2.5 Add corrupt-state, tied-mtime, concurrent-process, before-launch crash, and after-launch crash tests against a fake idempotent `plant agent run`
+- [x] 2.6 Replace the cursor with a timestamp frontier and durable seen paths, require machine-readable durable Plant outcomes before claim advance, canonicalize every path beneath one selected ingestion root, and cover traversal, symlink, indeterminate-result, and lower-sorting tied-mtime cases
 
 ## 3. First doors and ingestion
 

@@ -19,23 +19,26 @@ watch, filter, and prompt.
 ### Requirement: Crash-idempotent ordered batch claims
 
 A door MUST fail closed on unreadable or invalid state and MUST serialize each
-door's evaluation with a per-door cross-process lock. It MUST select files in
-total `(mtime,path)` order after its persisted cursor, atomically persist the
-exact ordered in-progress batch before launch, and derive a stable Plant Agent
-Run idempotency key from that claim. A retry MUST resume the persisted claim.
-After a conclusive `Succeeded` or `Failed` outcome, the door MUST atomically
-advance the cursor through the claim and clear it; `Unavailable` MUST retain
-the claim and key. A given file MUST never launch a second agent run.
+door's evaluation with a per-door cross-process lock. It MUST persist a
+timestamp frontier and the durable sorted set of paths already processed at
+that timestamp, select all unseen files in total `(mtime,path)` batch order,
+atomically persist the exact ordered in-progress batch before launch, and
+derive a stable Plant Agent Run idempotency key from that claim. A retry MUST
+resume the persisted claim. Only a machine-readable Plant result confirming a
+durably recorded `Succeeded` or `Failed` outcome MAY atomically advance the
+frontier through the claim and clear it. Retryable, operationally failed,
+missing, malformed, or otherwise indeterminate results MUST retain the claim
+and key. A given file MUST never launch a second agent run.
 
 #### Scenario: A sync batch produces one session
 
 - WHEN a sync lands 20 matching files before the door's next run
 - THEN the door launches exactly one agent session whose prompt references all 20
-- AND the ordered cursor advances past them after the outcome is durably recorded
+- AND the timestamp frontier records them after the outcome is durably recorded
 
 #### Scenario: Nothing new means no launch
 
-- WHEN no matching file sorts after the persisted `(mtime,path)` cursor
+- WHEN no matching file is newer than the timestamp frontier or unseen at its timestamp
 - THEN the door exits without contacting Herdr
 
 #### Scenario: Corrupt state fails closed
@@ -52,9 +55,9 @@ the claim and key. A given file MUST never launch a second agent run.
 
 #### Scenario: Files share a timestamp
 
-- WHEN multiple matching files have the same mtime
-- THEN their paths provide a deterministic total order
-- AND each file after the persisted cursor is included without re-firing an earlier file
+- WHEN `z.md` is durably processed and `a.md` lands later with the same mtime
+- THEN the durable seen-path set includes `z.md` without treating the timestamp as closed
+- AND `a.md` is included on the next evaluation without re-firing `z.md`
 
 #### Scenario: Door crashes before launch
 
@@ -64,15 +67,18 @@ the claim and key. A given file MUST never launch a second agent run.
 
 #### Scenario: Door crashes after launch
 
-- WHEN a door crashes after Plant durably records the launch outcome but before the cursor save
+- WHEN a door crashes after Plant durably records the launch outcome but before the frontier save
 - THEN the next invocation reuses the persisted key and Plant's durable prior outcome
 - AND no second Herdr workspace is created
 
 ### Requirement: Ingestion-only watch roots
 
-The library MUST enforce an allowlist of watchable ingestion roots — paths
-written only by sync jobs — and MUST reject a door whose watch glob falls
-outside it with a loud error before any launch, so a door cannot subscribe to
+The library MUST select exactly one allowlisted ingestion root — a path written
+only by sync jobs — for each watch glob. It MUST reject traversal and MUST
+canonicalize the selected root and every scanned or hydrated file, rejecting
+any real path outside that selected root, including symlink escapes, before
+reading content or launching an agent. A door whose watch glob falls outside
+the allowlist MUST fail loudly before launch, so a door cannot subscribe to
 agent-written Vault Content.
 
 #### Scenario: Watching agent-written content is rejected
@@ -80,6 +86,12 @@ agent-written Vault Content.
 - WHEN a door's watch glob targets a cultivation path such as learnings
 - THEN the library refuses to evaluate the door and records the rejection
 - AND no agent session is launched
+
+#### Scenario: Traversal and symlink escapes fail closed
+
+- WHEN a watch contains traversal or a matching or claimed file resolves through a symlink outside the selected ingestion root
+- THEN the library returns a failure before reading that file or launching an agent
+- AND any durable in-progress claim remains intact
 
 ### Requirement: Rolling-window fire breaker
 
@@ -96,13 +108,14 @@ manual re-arm before the door fires again.
 ### Requirement: Typed launch over plant agent run
 
 The library MUST launch agent sessions only through `plant agent run`, MUST
-pass the persisted claim's stable idempotency key, and MUST surface the lifecycle outcome as a typed
-`Unavailable`/`Failed`/`Succeeded` result. It MUST NOT reimplement any part of
-the Herdr lifecycle owned by Plant.
+pass the persisted claim's stable idempotency key, and MUST require Plant's
+machine-readable result separating durable `Succeeded`/`Failed` outcomes from
+retryable and indeterminate state. It MUST NOT reimplement any part of the
+Herdr lifecycle owned by Plant.
 
-#### Scenario: Unavailable does not advance the fence
+#### Scenario: Non-durable result does not advance the claim
 
-- WHEN `plant agent run` reports Herdr unavailable
-- THEN the door's ordered cursor does not advance
+- WHEN `plant agent run` reports a retryable or indeterminate result or does not emit a valid result
+- THEN the door's timestamp frontier does not advance
 - AND the in-progress claim and idempotency key remain durable
 - AND the same files are eligible on the next run
