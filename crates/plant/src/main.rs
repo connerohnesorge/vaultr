@@ -3,12 +3,14 @@
 //! and the original ~/.dotfiles/.config/wireproxy/wireproxy.ts.
 
 mod adapter;
+mod agent_run;
 mod capture;
 mod herdr;
 mod jobs;
 mod otel;
 mod proxy;
 mod selftest;
+mod state;
 mod sweep;
 
 use proxy::ProxyCtx;
@@ -17,8 +19,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 fn crash_log() -> PathBuf {
-    let dir = jobs::state_dir();
-    let _ = jobs::ensure_dir_durable(&dir);
+    let dir = state::dir();
+    let _ = state::ensure_dir_durable(&dir);
     dir.join("crash.log")
 }
 
@@ -219,18 +221,8 @@ async fn subcommand(argv: &[String]) -> Option<i32> {
                 discover_session_id: cli == "codex",
             };
             let receipt = match flag("--idempotency-key") {
-                Some(key) => herdr::run_agent_idempotent(run, &key).await,
-                None => match herdr::run_agent(run).await {
-                    herdr::AgentRunOutcome::Succeeded(detail) => {
-                        herdr::AgentRunReceipt::UntrackedSucceeded { detail }
-                    }
-                    herdr::AgentRunOutcome::Unavailable => herdr::AgentRunReceipt::Retryable {
-                        detail: "herdr unavailable".to_string(),
-                    },
-                    herdr::AgentRunOutcome::Failed(detail) => {
-                        herdr::AgentRunReceipt::UntrackedFailed { detail }
-                    }
-                },
+                Some(key) => agent_run::run_idempotent(run, &key).await,
+                None => agent_run::AgentRunReceipt::untracked(herdr::run_agent(run).await),
             };
             println!(
                 "{}",

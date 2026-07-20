@@ -123,6 +123,7 @@ interface ClaimFile {
 interface Frontier {
   mtimeMs: number;
   seen: string[];
+  closedThroughPath?: string;
 }
 
 interface LegacyCursor {
@@ -160,6 +161,7 @@ function compareFile(a: ClaimFile, b: ClaimFile): number {
 
 function sameFrontier(a: Frontier, b: Frontier): boolean {
   return a.mtimeMs === b.mtimeMs
+    && a.closedThroughPath === b.closedThroughPath
     && a.seen.length === b.seen.length
     && a.seen.every((path, index) => path === b.seen[index]);
 }
@@ -189,12 +191,18 @@ function validFrontier(value: unknown): value is Frontier {
     && Array.isArray(frontier.seen)
     && frontier.seen.every((path) => typeof path === "string" && path.length > 0)
     && frontier.seen.every((path) => validRelativePath(path, true))
-    && frontier.seen.every((path, index) => index === 0 || frontier.seen[index - 1]! < path);
+    && frontier.seen.every((path, index) => index === 0 || frontier.seen[index - 1]! < path)
+    && (frontier.closedThroughPath === undefined
+      || (typeof frontier.closedThroughPath === "string"
+        && (frontier.closedThroughPath === "" || validRelativePath(frontier.closedThroughPath, true))
+        && frontier.seen.every((path) => path > frontier.closedThroughPath!)));
 }
 
 function isNew(file: ClaimFile, frontier: Frontier): boolean {
   return file.mtimeMs > frontier.mtimeMs
-    || (file.mtimeMs === frontier.mtimeMs && !frontier.seen.includes(file.path));
+    || (file.mtimeMs === frontier.mtimeMs
+      && (frontier.closedThroughPath === undefined || file.path > frontier.closedThroughPath)
+      && !frontier.seen.includes(file.path));
 }
 
 function claimKey(name: string, from: Frontier, files: ClaimFile[]): string {
@@ -247,7 +255,9 @@ function parseState(name: string, value: unknown): DoorState {
       || typeof claim.key !== "string"
       || (legacy
         ? !validLegacyCursor(legacy)
-          || claim.from.mtimeMs !== conservativeFrontier(legacy.mtimeMs).mtimeMs
+          || claim.from.mtimeMs !== legacy.mtimeMs
+          || claim.from.closedThroughPath !== legacy.path
+          || claim.from.seen.length !== 0
           || claim.key !== legacyClaimKey(name, legacy, claim.files)
         : claim.key !== claimKey(name, claim.from, claim.files))) {
       throw new Error("invalid door claim");
@@ -283,7 +293,11 @@ function migrateLegacyState(name: string, value: unknown): DoorState {
   const cursor = raw.cursor;
   const state: DoorState = {
     version: 2,
-    frontier: conservativeFrontier(cursor.mtimeMs),
+    frontier: {
+      mtimeMs: cursor.mtimeMs,
+      seen: [],
+      closedThroughPath: cursor.path,
+    },
     ...metadata,
   };
   if (raw.claim !== undefined) {
@@ -385,10 +399,26 @@ function saveState(name: string, state: DoorState): void {
 
 function lockOwner(path: string): { pid: number; token: string } {
   const owner = JSON.parse(readFileSync(path, "utf8"));
-  if (!Number.isInteger(owner?.pid) || owner.pid <= 0 || typeof owner?.token !== "string") {
+  if (!Number.isInteger(owner?.pid) || owner.pid <= 0
+    || typeof owner?.token !== "string" || owner.token.length === 0) {
     throw new Error(`invalid door lock ${path}`);
   }
   return owner;
+}
+
+async function readPublishedLockOwner(path: string): Promise<{ pid: number; token: string }> {
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      return lockOwner(path);
+    } catch (error: any) {
+      if (error?.code === "ENOENT") throw error;
+      if (attempt < 3) await Bun.sleep(10);
+    }
+  }
+  throw new Error(
+    `incomplete legacy door lock ${path}; refusing automatic removal `
+    + "until an offline migration verifies no legacy Door process exists",
+  );
 }
 
 function pidAlive(pid: number): boolean {
@@ -436,7 +466,7 @@ function publishLock(path: string, owner: { pid: number; token: string }): boole
   }
 }
 
-function acquireLock(name: string): (() => void) | undefined {
+async function acquireLock(name: string): Promise<(() => void) | undefined> {
   ensureDirectoryDurable(stateDir());
   const path = lockPath(name);
   for (let attempt = 0; attempt < 3; attempt++) {
@@ -444,11 +474,10 @@ function acquireLock(name: string): (() => void) | undefined {
     if (!publishLock(path, { pid: process.pid, token })) {
       let owner: { pid: number; token: string };
       try {
-        owner = lockOwner(path);
-      } catch {
-        unlinkSync(path);
-        syncDirectory(stateDir());
-        continue;
+        owner = await readPublishedLockOwner(path);
+      } catch (error: any) {
+        if (error?.code === "ENOENT") continue;
+        throw error;
       }
       if (pidAlive(owner.pid)) return undefined;
       unlinkSync(path);
@@ -556,7 +585,13 @@ function advanceFrontier(from: Frontier, files: ClaimFile[]): Frontier {
     .filter((file) => file.mtimeMs === mtimeMs)
     .map((file) => file.path);
   const seen = mtimeMs === from.mtimeMs ? [...from.seen, ...atFrontier] : atFrontier;
-  return { mtimeMs, seen: [...new Set(seen)].sort() };
+  return {
+    mtimeMs,
+    seen: [...new Set(seen)].sort(),
+    ...(mtimeMs === from.mtimeMs && from.closedThroughPath !== undefined
+      ? { closedThroughPath: from.closedThroughPath }
+      : {}),
+  };
 }
 
 function doorNameFromScript(): string {
@@ -572,7 +607,7 @@ export async function door(spec: DoorSpec): Promise<DoorResult> {
   }
   let release: (() => void) | undefined;
   try {
-    release = acquireLock(name);
+    release = await acquireLock(name);
     if (!release) return { code: 75, detail: `door "${name}" is already running` };
     const state = loadState(name);
     const root = resolveIngestionRoot(spec.watch);

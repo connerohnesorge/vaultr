@@ -332,7 +332,7 @@ pub fn stuck_captures(vault: &Path, age: Duration) -> Vec<StuckCapture> {
 /// for the pane once the run finishes and registers it, so both harnesses are excluded
 /// before dispatch — no content-heuristic skip in the learn skill.
 pub fn job_sids_path() -> PathBuf {
-    crate::jobs::state_dir().join("job-sids.txt")
+    crate::state::dir().join("job-sids.txt")
 }
 
 pub fn job_sids() -> HashSet<String> {
@@ -354,7 +354,7 @@ fn job_sids_at(path: &Path) -> HashSet<String> {
 pub fn register_job_sid(sid: &str) {
     let path = job_sids_path();
     let parent = path.parent().unwrap();
-    if crate::jobs::ensure_dir_durable(parent).is_err() {
+    if crate::state::ensure_dir_durable(parent).is_err() {
         return;
     }
     use std::io::Write;
@@ -365,7 +365,7 @@ pub fn register_job_sid(sid: &str) {
     {
         let _ = writeln!(f, "{sid}")
             .and_then(|_| f.sync_all())
-            .and_then(|_| crate::jobs::sync_dir(parent));
+            .and_then(|_| crate::state::sync_dir(parent));
     }
 }
 

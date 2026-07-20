@@ -30,8 +30,11 @@ frontier through the claim and clear it. Retryable, operationally failed,
 missing, malformed, or otherwise indeterminate results MUST retain the claim
 and key. New Door state-directory levels MUST be durably linked before a lock,
 claim, migration, or outcome is published. Lock owner metadata MUST be complete
-and fsynced before the canonical lock path becomes visible. A given file MUST
-never launch a second agent run.
+and fsynced before the canonical lock path becomes visible. An incomplete
+canonical lock from the legacy publisher MUST be boundedly reread and then left
+intact while the Door fails closed; it MUST NOT be reclaimed by a running Door.
+Its removal requires an explicit offline migration after verifying no legacy
+Door process exists. A given file MUST never launch a second agent run.
 
 #### Scenario: A sync batch produces one session
 
@@ -60,7 +63,14 @@ never launch a second agent run.
 
 - WHEN a Door process crashes while preparing lock owner metadata
 - THEN it cannot leave an incomplete canonical lock
-- AND an empty lock left by the shipped implementation is safely reclaimed
+- AND any temporary lock inode it leaves is ignored
+
+#### Scenario: Legacy lock publisher is incomplete
+
+- WHEN a Door sees an incomplete canonical lock that a shipped legacy publisher may still be populating
+- THEN it boundedly rereads the lock and fails closed if complete owner metadata does not appear
+- AND it leaves the canonical lock intact for explicit offline migration
+- AND no agent session is launched
 
 #### Scenario: Files share a timestamp
 
@@ -82,9 +92,16 @@ never launch a second agent run.
 
 #### Scenario: Shipped state is migrated
 
-- WHEN a Door reads a shipped scalar `hwm` state or v1 `(mtime,path)` cursor state
+- WHEN a Door reads a shipped scalar `hwm` state
 - THEN it atomically persists a valid v2 timestamp frontier under the Door lock before evaluation
-- AND it closes the legacy high-water timestamp conservatively so no file can fire twice
+- AND it closes the entire legacy high-water timestamp at the next representable timestamp so no file can fire twice
+
+#### Scenario: Shipped v1 cursor is migrated
+
+- WHEN a Door reads a shipped v1 `(mtime,path)` cursor state
+- THEN it atomically persists a v2 frontier at that timestamp with the cursor path as its durable closed-through boundary
+- AND paths sorting after the boundary remain eligible while paths through the boundary cannot fire twice
+- AND the boundary and same-timestamp seen set remain until a claim advances the frontier to a newer timestamp
 - AND a v1 in-progress claim retains its original Plant idempotency key
 
 ### Requirement: Ingestion-only watch roots

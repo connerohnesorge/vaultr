@@ -65,6 +65,12 @@ pre-launch unavailable probe is retryable; pending or inaccessible idempotency
 state and outcome-persistence failure are indeterminate. Neither advances Door
 state.
 
+Within Plant, `herdr.rs` owns only the Herdr lifecycle, `agent_run.rs` owns the
+receipt and durable idempotency transition around that lifecycle, and
+`state.rs` owns the durable filesystem operations shared by Agent Runs, jobs,
+capture staging, and sweep state. Herdr therefore does not depend back on the
+job scheduler for persistence.
+
 ### ADR-0004: Loop prevention is allowlist-by-construction plus a rate breaker
 
 Door-launched agents write Vault Content; a door watching agent-written paths
@@ -97,15 +103,22 @@ before content is read or an agent is launched.
 
 New Plant and Door state directories are created one level at a time and both
 the new directory and its parent are fsynced before any fence, claim, lock, or
-outcome is published. Door lock owner metadata is fsynced in a temporary inode
-before an atomic hard link publishes the canonical lock name, so a crash can
-leave an ignorable temp file or a complete reclaimable lock, never an empty
-canonical lock.
+outcome is published. New Door publishers fsync lock owner metadata in a
+temporary inode before an atomic hard link publishes the canonical lock name,
+so their crashes leave an ignorable temp file or a complete lock. An
+incomplete canonical lock may still belong to the shipped legacy publisher:
+the Door boundedly rereads it, then fails closed without unlinking it. Such a
+lock is removed only as an explicit offline migration after verifying no
+legacy Door process exists.
 
 Shipped scalar `hwm` and v1 `(mtime,path)` states migrate under the Door lock
-and the v2 replacement is durable before evaluation. Because neither legacy
-schema can prove which paths at its high-water timestamp already fired, the
-migration advances to the immediately following representable timestamp. This
-preserves never-fire-twice but can conservatively skip an unprocessed file tied
-exactly at the legacy timestamp. An existing v1 in-progress claim retains its
-original Plant idempotency key until its durable outcome is recovered.
+and the v2 replacement is durable before evaluation. A scalar `hwm` cannot
+identify any processed paths at its high-water timestamp, so only that schema
+advances to the immediately following representable timestamp; this preserves
+never-fire-twice but can conservatively skip an unprocessed exact tie. A v1
+cursor is authoritative through its known path, so migration keeps the same
+timestamp with a durable `closedThroughPath` boundary and a separate seen set.
+The boundary and seen paths survive claims at that timestamp and disappear
+only after the frontier advances to a newer timestamp. An existing v1
+in-progress claim retains its original Plant idempotency key until its durable
+outcome is recovered.

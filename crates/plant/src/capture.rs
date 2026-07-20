@@ -117,7 +117,7 @@ pub(crate) fn canonical_root(vault: &Path) -> String {
 }
 
 fn staging_base() -> PathBuf {
-    crate::jobs::state_dir().join("capture-staging")
+    crate::state::dir().join("capture-staging")
 }
 
 fn staging_dir(root: &str, sid: &str) -> PathBuf {

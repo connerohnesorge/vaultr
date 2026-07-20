@@ -209,10 +209,10 @@ test("scalar hwm state migrates durably and conservatively closes its tied times
 
 test("v1 cursor and in-progress claim migrate without changing the Plant key", async () => {
   const name = "v1";
-  const cursor = { mtimeMs: 999000, path: "mail/old.md" };
-  const files = [{ mtimeMs: 1000000, path: "mail/claim.md" }];
+  const cursor = { mtimeMs: 1000000, path: "mail/a.md" };
+  const files = [{ mtimeMs: 1000000, path: "mail/z.md" }];
   const key = legacyKey(name, cursor, files);
-  landFile("mail/claim.md", 1000);
+  landFile("mail/z.md", 1000);
   mkdirSync(join(tmp, "state"), { recursive: true });
   writeFileSync(join(tmp, "state", `${name}.json`), JSON.stringify({
     version: 1,
@@ -223,37 +223,72 @@ test("v1 cursor and in-progress claim migrate without changing the Plant key", a
 
   const beforeLaunch = await door({
     name,
-    watch: "mail/claim.md",
+    watch: "mail/z.md",
     prompt: () => {
       throw new Error("crash before launch");
     },
   });
   expect(beforeLaunch.code).toBe(1);
   const persisted = JSON.parse(readFileSync(join(tmp, "state", `${name}.json`), "utf8"));
-  expect(persisted).toMatchObject({ version: 2, claim: { key } });
+  expect(persisted).toMatchObject({
+    version: 2,
+    frontier: { mtimeMs: cursor.mtimeMs, seen: [], closedThroughPath: cursor.path },
+    claim: { key },
+  });
   expect(stubCalls()).toBe(0);
 
-  expect((await door({ name, watch: "mail/claim.md", prompt: () => "go" })).code).toBe(0);
+  expect((await door({ name, watch: "mail/z.md", prompt: () => "go" })).code).toBe(0);
   expect(readFileSync(stubLog, "utf8")).toContain(`--idempotency-key ${key}`);
   const migrated = JSON.parse(readFileSync(join(tmp, "state", `${name}.json`), "utf8"));
   expect(migrated.version).toBe(2);
   expect(migrated.claim).toBeUndefined();
+  expect(migrated.frontier).toEqual({
+    mtimeMs: 1000000,
+    seen: ["mail/z.md"],
+    closedThroughPath: "mail/a.md",
+  });
 });
 
-test("v1 cursor without a claim closes the entire legacy tie", async () => {
+test("v1 cursor keeps its path boundary and seen set until a newer timestamp", async () => {
   landFile("mail/a.md", 1000);
+  landFile("mail/z.md", 1000);
   const path = join(tmp, "state", "v1-tie.json");
   mkdirSync(join(tmp, "state"), { recursive: true });
   writeFileSync(path, JSON.stringify({
     version: 1,
-    cursor: { mtimeMs: 1000000, path: "mail/z.md" },
+    cursor: { mtimeMs: 1000000, path: "mail/m.md" },
     fires: [],
   }));
-  const spec = { name: "v1-tie", watch: "mail/*.md", prompt: () => "go" };
+  const spec = {
+    name: "v1-tie",
+    watch: "mail/*.md",
+    prompt: (files: any[]) => files.map((file) => file.path).join(" "),
+  };
 
-  expect((await door(spec)).detail).toBe("no new files");
-  expect(JSON.parse(readFileSync(path, "utf8")).frontier.mtimeMs).toBeGreaterThan(1000000);
-  expect(stubCalls()).toBe(0);
+  expect((await door(spec)).code).toBe(0);
+  expect(stubCalls()).toBe(1);
+  expect(readFileSync(stubLog, "utf8")).toContain("mail/z.md");
+  expect(readFileSync(stubLog, "utf8")).not.toContain("mail/a.md");
+  expect(JSON.parse(readFileSync(path, "utf8")).frontier).toEqual({
+    mtimeMs: 1000000,
+    seen: ["mail/z.md"],
+    closedThroughPath: "mail/m.md",
+  });
+
+  landFile("mail/y.md", 1000);
+  expect((await door(spec)).code).toBe(0);
+  expect(JSON.parse(readFileSync(path, "utf8")).frontier).toEqual({
+    mtimeMs: 1000000,
+    seen: ["mail/y.md", "mail/z.md"],
+    closedThroughPath: "mail/m.md",
+  });
+
+  landFile("mail/new.md", 1001);
+  expect((await door(spec)).code).toBe(0);
+  expect(JSON.parse(readFileSync(path, "utf8")).frontier).toEqual({
+    mtimeMs: 1001000,
+    seen: ["mail/new.md"],
+  });
 });
 
 test("a later lower-sorting path at the frontier timestamp is not missed", async () => {
@@ -287,13 +322,33 @@ test("concurrent door processes launch one batch once", async () => {
   expect(stubCalls()).toBe(1);
 });
 
-test("an empty lock left by a crashed old publisher is reclaimed", async () => {
+test("an incomplete legacy lock is retained and fails closed", async () => {
   landFile("mail/a.md", 1000);
   mkdirSync(join(tmp, "state"), { recursive: true });
-  writeFileSync(join(tmp, "state", "t.lock"), "");
+  const path = join(tmp, "state", "t.lock");
+  writeFileSync(path, "");
   const result = await door({ name: "t", watch: "mail/*.md", prompt: () => "go" });
-  expect(result.code).toBe(0);
-  expect(stubCalls()).toBe(1);
+  expect(result.code).toBe(1);
+  expect(result.detail).toContain("offline migration");
+  expect(readFileSync(path, "utf8")).toBe("");
+  expect(stubCalls()).toBe(0);
+});
+
+test("an incomplete legacy lock is reread while its publisher finishes", async () => {
+  landFile("mail/a.md", 1000);
+  mkdirSync(join(tmp, "state"), { recursive: true });
+  const path = join(tmp, "state", "t.lock");
+  writeFileSync(path, "");
+  setTimeout(() => {
+    writeFileSync(path, `${JSON.stringify({ pid: process.pid, token: "legacy-owner" })}\n`);
+  }, 5);
+  const result = await door({ name: "t", watch: "mail/*.md", prompt: () => "go" });
+  expect(result).toEqual({ code: 75, detail: 'door "t" is already running' });
+  expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({
+    pid: process.pid,
+    token: "legacy-owner",
+  });
+  expect(stubCalls()).toBe(0);
 });
 
 test("a crash while preparing owner metadata leaves only an ignorable temp lock", async () => {
