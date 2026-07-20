@@ -3,7 +3,7 @@
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 /// Per-session index entry from `<root>/.meta/<session-uuid>.json`.
@@ -307,6 +307,14 @@ pub fn sha256_reader(mut reader: impl Read) -> Result<String> {
         hash.update(&buffer[..read]);
     }
     Ok(format!("{:x}", hash.finalize()))
+}
+
+/// Decode the concatenated-zstd suffix at `offset` and hash its exact
+/// uncompressed bytes. Reconstruction and Sealing use this same evidence proof.
+pub fn decoded_zstd_suffix_digest(mut reader: impl Read + Seek, offset: u64) -> Result<String> {
+    reader.seek(SeekFrom::Start(offset))?;
+    let decoder = zstd::Decoder::new(reader)?;
+    sha256_reader(decoder)
 }
 
 /// The capture file inside a session directory.

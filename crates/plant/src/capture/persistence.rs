@@ -2,7 +2,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{Read, Write};
+use std::ops::Range;
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -234,7 +237,7 @@ pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 static SESSION_LOCKS: Mutex<Option<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     Mutex::new(None);
 
-pub(super) fn session_lock(root: &str, sid: &str) -> Arc<tokio::sync::Mutex<()>> {
+pub(crate) fn session_lock(root: &str, sid: &str) -> Arc<tokio::sync::Mutex<()>> {
     let key = format!("{root}\0{sid}");
     SESSION_LOCKS
         .lock()
@@ -295,7 +298,30 @@ impl Stage {
     }
 }
 
-fn read_stages(root: &str, sid: &str, journal: &Journal) -> Result<BTreeMap<u64, Stage>, String> {
+fn is_atomic_stage_temp(name: &str) -> bool {
+    let Some((stage, temporary_id)) = name.rsplit_once(".tmp-") else {
+        return false;
+    };
+    let Some((sequence, request_id)) = stage.split_once('-') else {
+        return false;
+    };
+    let valid_uuid = |value: &str| {
+        uuid::Uuid::parse_str(value).is_ok_and(|parsed| parsed.hyphenated().to_string() == value)
+    };
+    sequence
+        .parse::<u64>()
+        .is_ok_and(|parsed| parsed.to_string() == sequence)
+        && valid_uuid(request_id)
+        && valid_uuid(temporary_id)
+        && uuid::Uuid::parse_str(temporary_id).is_ok_and(|parsed| parsed.get_version_num() == 4)
+}
+
+fn read_stages(
+    root: &str,
+    sid: &str,
+    journal: &Journal,
+    recover_atomic_temps: bool,
+) -> Result<BTreeMap<u64, Stage>, String> {
     let directory = staging_dir(root, sid);
     let entries = match fs::read_dir(&directory) {
         Ok(entries) => entries,
@@ -339,6 +365,15 @@ fn read_stages(root: &str, sid: &str, journal: &Journal) -> Result<BTreeMap<u64,
         let name = name
             .to_str()
             .ok_or_else(|| format!("capture stage: invalid name at {}", path.display()))?;
+        if recover_atomic_temps && is_atomic_stage_temp(name) {
+            fs::remove_file(&path).map_err(|error| {
+                format!(
+                    "capture recovery: remove atomic stage temp {}: {error}",
+                    path.display()
+                )
+            })?;
+            continue;
+        }
         let stem = name
             .strip_suffix(".json")
             .ok_or_else(|| format!("capture stage: invalid name at {}", path.display()))?;
@@ -426,135 +461,277 @@ fn read_stages(root: &str, sid: &str, journal: &Journal) -> Result<BTreeMap<u64,
     Ok(stages)
 }
 
-fn append_record(path: &Path, serialized: &[u8]) -> Result<(), String> {
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .map_err(|error| format!("capture commit: open {}: {error}", path.display()))?;
-    file.write_all(serialized)
-        .and_then(|_| file.write_all(b"\n"))
-        .map_err(|error| format!("capture commit: append {}: {error}", path.display()))
+const IO_CHUNK: usize = 64 * 1024;
+
+struct RawGeneration {
+    _directory: fs::File,
+    file: fs::File,
+    path: PathBuf,
+}
+
+impl RawGeneration {
+    fn open(directory: &Path, create: bool) -> Result<Option<Self>, String> {
+        let directory_handle = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(directory)
+            .map_err(|error| {
+                format!(
+                    "capture commit: open session directory {}: {error}",
+                    directory.display()
+                )
+            })?;
+        let name = b"turns.jsonl\0";
+        let mut flags = libc::O_RDWR | libc::O_APPEND | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        if create {
+            flags |= libc::O_CREAT;
+        }
+        // SAFETY: `name` is a static NUL-terminated path, the directory fd stays
+        // alive in this handle, and a successful fd is transferred into `File`.
+        let descriptor = unsafe {
+            libc::openat(
+                directory_handle.as_raw_fd(),
+                name.as_ptr().cast(),
+                flags,
+                0o666,
+            )
+        };
+        if descriptor < 0 {
+            let error = std::io::Error::last_os_error();
+            if !create && error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            return Err(format!(
+                "capture commit: open {}: {error}",
+                directory.join("turns.jsonl").display()
+            ));
+        }
+        // SAFETY: `openat` returned a new owned descriptor.
+        let file = unsafe { fs::File::from_raw_fd(descriptor) };
+        if !file
+            .metadata()
+            .map_err(|error| {
+                format!(
+                    "capture commit: stat {}: {error}",
+                    directory.join("turns.jsonl").display()
+                )
+            })?
+            .is_file()
+        {
+            return Err(format!(
+                "capture commit: raw generation is not a regular file at {}",
+                directory.join("turns.jsonl").display()
+            ));
+        }
+        Ok(Some(Self {
+            _directory: directory_handle,
+            file,
+            path: directory.join("turns.jsonl"),
+        }))
+    }
+
+    fn read_exact_at(&self, mut bytes: &mut [u8], mut offset: u64) -> Result<(), String> {
+        while !bytes.is_empty() {
+            let read = self.file.read_at(bytes, offset).map_err(|error| {
+                format!("capture commit: read {}: {error}", self.path.display())
+            })?;
+            if read == 0 {
+                return Err(format!(
+                    "capture commit: unexpected end of {}",
+                    self.path.display()
+                ));
+            }
+            offset += read as u64;
+            bytes = &mut bytes[read..];
+        }
+        Ok(())
+    }
+
+    fn find_forward(
+        &self,
+        range: Range<u64>,
+        predicate: impl Fn(u8) -> bool,
+    ) -> Result<Option<u64>, String> {
+        let mut offset = range.start;
+        let mut chunk = vec![0; IO_CHUNK];
+        while offset < range.end {
+            let len = (range.end - offset).min(IO_CHUNK as u64) as usize;
+            self.read_exact_at(&mut chunk[..len], offset)?;
+            if let Some(position) = chunk[..len].iter().position(|byte| predicate(*byte)) {
+                return Ok(Some(offset + position as u64));
+            }
+            offset += len as u64;
+        }
+        Ok(None)
+    }
+
+    fn find_backward(
+        &self,
+        range: Range<u64>,
+        predicate: impl Fn(u8) -> bool,
+    ) -> Result<Option<u64>, String> {
+        let mut end = range.end;
+        let mut chunk = vec![0; IO_CHUNK];
+        while end > range.start {
+            let start = end.saturating_sub(IO_CHUNK as u64).max(range.start);
+            let len = (end - start) as usize;
+            self.read_exact_at(&mut chunk[..len], start)?;
+            if let Some(position) = chunk[..len].iter().rposition(|byte| predicate(*byte)) {
+                return Ok(Some(start + position as u64));
+            }
+            end = start;
+        }
+        Ok(None)
+    }
+
+    fn range_matches_prefix(&self, range: &Range<u64>, expected: &[u8]) -> Result<bool, String> {
+        let length = range.end - range.start;
+        if length > expected.len() as u64 {
+            return Ok(false);
+        }
+        let mut offset = 0usize;
+        let mut chunk = vec![0; IO_CHUNK];
+        while offset < length as usize {
+            let len = (length as usize - offset).min(IO_CHUNK);
+            self.read_exact_at(&mut chunk[..len], range.start + offset as u64)?;
+            if chunk[..len] != expected[offset..offset + len] {
+                return Ok(false);
+            }
+            offset += len;
+        }
+        Ok(true)
+    }
+
+    fn append_record(&mut self, serialized: &[u8]) -> Result<(), String> {
+        self.file
+            .write_all(serialized)
+            .and_then(|_| self.file.write_all(b"\n"))
+            .map_err(|error| format!("capture commit: append {}: {error}", self.path.display()))
+    }
+
+    fn truncate(&self, offset: u64) -> Result<(), String> {
+        self.file
+            .set_len(offset)
+            .map_err(|error| format!("capture commit: truncate {}: {error}", self.path.display()))
+    }
+}
+
+struct FileRange<'a> {
+    raw: &'a RawGeneration,
+    offset: u64,
+    end: u64,
+}
+
+impl Read for FileRange<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let len = (self.end - self.offset).min(bytes.len() as u64) as usize;
+        if len == 0 {
+            return Ok(0);
+        }
+        let read = self.raw.file.read_at(&mut bytes[..len], self.offset)?;
+        self.offset += read as u64;
+        Ok(read)
+    }
+}
+
+#[derive(Deserialize)]
+struct EnvelopeIdentity {
+    request_id: String,
 }
 
 enum CaptureTail {
     Blank,
     ValidTerminated {
-        bytes: Vec<u8>,
-        request_id: Option<String>,
+        range: Range<u64>,
+        request_id: String,
     },
     MalformedTerminated,
     Unterminated {
-        bytes: Vec<u8>,
-        offset: u64,
+        range: Range<u64>,
     },
 }
 
-fn capture_tail(path: &Path) -> Result<CaptureTail, String> {
-    let mut file = match fs::File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(CaptureTail::Blank);
-        }
-        Err(error) => {
-            return Err(format!("capture commit: open {}: {error}", path.display()));
-        }
-    };
-    let length = file
+fn capture_tail(raw: &RawGeneration) -> Result<CaptureTail, String> {
+    let length = raw
+        .file
         .metadata()
-        .map_err(|error| format!("capture commit: stat {}: {error}", path.display()))?
+        .map_err(|error| format!("capture commit: stat {}: {error}", raw.path.display()))?
         .len();
-    if length == 0 {
+    let Some(last_content) = raw.find_backward(0..length, |byte| !byte.is_ascii_whitespace())?
+    else {
         return Ok(CaptureTail::Blank);
-    }
-
-    file.seek(SeekFrom::End(-1))
-        .map_err(|error| format!("capture commit: seek {}: {error}", path.display()))?;
-    let mut last_byte = [0];
-    file.read_exact(&mut last_byte)
-        .map_err(|error| format!("capture commit: read {}: {error}", path.display()))?;
-    let terminated = last_byte[0] == b'\n';
-    let end = length - u64::from(terminated);
-    if end == 0 {
-        return Ok(CaptureTail::Blank);
-    }
-
-    const CHUNK_SIZE: usize = 64 * 1024;
-    let mut cursor = end;
-    let mut start = 0;
-    let mut chunk = vec![0; CHUNK_SIZE];
-    while cursor > 0 {
-        let chunk_start = cursor.saturating_sub(CHUNK_SIZE as u64);
-        let chunk_len = (cursor - chunk_start) as usize;
-        file.seek(SeekFrom::Start(chunk_start))
-            .map_err(|error| format!("capture commit: seek {}: {error}", path.display()))?;
-        file.read_exact(&mut chunk[..chunk_len])
-            .map_err(|error| format!("capture commit: read {}: {error}", path.display()))?;
-        if let Some(position) = chunk[..chunk_len].iter().rposition(|byte| *byte == b'\n') {
-            start = chunk_start + position as u64 + 1;
-            break;
-        }
-        cursor = chunk_start;
-    }
-
-    let mut bytes = vec![0; (end - start) as usize];
-    file.seek(SeekFrom::Start(start))
-        .map_err(|error| format!("capture commit: seek {}: {error}", path.display()))?;
-    file.read_exact(&mut bytes)
-        .map_err(|error| format!("capture commit: read {}: {error}", path.display()))?;
-
-    if !terminated {
+    };
+    let start = raw
+        .find_backward(0..last_content, |byte| byte == b'\n')?
+        .map_or(0, |newline| newline + 1);
+    let Some(record_end) = raw.find_forward(last_content + 1..length, |byte| byte == b'\n')? else {
         return Ok(CaptureTail::Unterminated {
-            bytes,
-            offset: start,
+            range: start..length,
         });
-    }
-    if bytes.iter().all(u8::is_ascii_whitespace) {
-        return Ok(CaptureTail::Blank);
-    }
+    };
 
-    match serde_json::from_slice::<Value>(&bytes) {
-        Ok(record) => Ok(CaptureTail::ValidTerminated {
-            request_id: record
-                .get("request_id")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            bytes,
-        }),
-        Err(_) => Ok(CaptureTail::MalformedTerminated),
+    let mut invalid_identity = false;
+    let mut final_value = None;
+    let decoded = vaultr::recon::decode_concatenated(
+        FileRange {
+            raw,
+            offset: start,
+            end: record_end,
+        },
+        |identity: EnvelopeIdentity, range| {
+            if uuid::Uuid::parse_str(&identity.request_id).is_err() {
+                invalid_identity = true;
+            }
+            final_value = Some((range, identity.request_id));
+        },
+    );
+    let Some((range, request_id)) = final_value else {
+        return Ok(CaptureTail::MalformedTerminated);
+    };
+    if decoded.is_err() || invalid_identity {
+        return Ok(CaptureTail::MalformedTerminated);
     }
+    let range_start = start + range.start as u64;
+    let range_end = start + range.end as u64;
+    let Some(value_start) =
+        raw.find_forward(range_start..range_end, |byte| !byte.is_ascii_whitespace())?
+    else {
+        return Ok(CaptureTail::MalformedTerminated);
+    };
+    let value_end = raw
+        .find_backward(value_start..range_end, |byte| !byte.is_ascii_whitespace())?
+        .expect("value range has non-whitespace")
+        + 1;
+    Ok(CaptureTail::ValidTerminated {
+        range: value_start..value_end,
+        request_id,
+    })
 }
 
-fn truncate(path: &Path, offset: u64) -> Result<(), String> {
-    fs::OpenOptions::new()
-        .write(true)
-        .open(path)
-        .and_then(|file| file.set_len(offset))
-        .map_err(|error| format!("capture commit: truncate {}: {error}", path.display()))
-}
-
-fn reconcile_append(path: &Path, envelope: &Value) -> Result<(), String> {
+fn reconcile_append(raw: &mut RawGeneration, envelope: &Value) -> Result<(), String> {
     let serialized = serde_json::to_vec(envelope).map_err(|error| error.to_string())?;
     let request_id = envelope.get("request_id").and_then(Value::as_str);
-    match capture_tail(path)? {
-        CaptureTail::Blank => append_record(path, &serialized),
+    match capture_tail(raw)? {
+        CaptureTail::Blank => raw.append_record(&serialized),
         CaptureTail::ValidTerminated {
-            bytes,
+            range,
             request_id: tail_request_id,
-        } if tail_request_id.as_deref() == request_id => {
-            if bytes == serialized {
+        } if Some(tail_request_id.as_str()) == request_id => {
+            if range.end - range.start == serialized.len() as u64
+                && raw.range_matches_prefix(&range, &serialized)?
+            {
                 Ok(())
             } else {
                 Err("capture commit: committed envelope conflicts with stage".into())
             }
         }
-        CaptureTail::ValidTerminated { .. } => append_record(path, &serialized),
+        CaptureTail::ValidTerminated { .. } => raw.append_record(&serialized),
         CaptureTail::MalformedTerminated => {
             Err("capture commit: malformed terminated capture tail".into())
         }
-        CaptureTail::Unterminated { bytes, offset } if serialized.starts_with(&bytes) => {
-            truncate(path, offset)?;
-            append_record(path, &serialized)
+        CaptureTail::Unterminated { range } if raw.range_matches_prefix(&range, &serialized)? => {
+            raw.truncate(range.start)?;
+            raw.append_record(&serialized)
         }
         CaptureTail::Unterminated { .. } => {
             Err("capture commit: persisted tail conflicts with stage".into())
@@ -562,19 +739,23 @@ fn reconcile_append(path: &Path, envelope: &Value) -> Result<(), String> {
     }
 }
 
-fn committed_exactly(path: &Path, envelope: &Value) -> Result<bool, String> {
+fn committed_exactly(raw: &RawGeneration, envelope: &Value) -> Result<bool, String> {
     let serialized = serde_json::to_vec(envelope).map_err(|error| error.to_string())?;
-    Ok(matches!(
-        capture_tail(path)?,
-        CaptureTail::ValidTerminated { bytes, .. } if bytes == serialized
-    ))
+    let CaptureTail::ValidTerminated { range, .. } = capture_tail(raw)? else {
+        return Ok(false);
+    };
+    Ok(range.end - range.start == serialized.len() as u64
+        && raw.range_matches_prefix(&range, &serialized)?)
 }
 
 fn commit_stage(journal: &mut Journal, stage: &Stage) -> Result<(), String> {
-    let turns = journal.dir.join("turns.jsonl");
     let next = journal.require_order()?.next_to_drain;
     if stage.sequence < next {
-        if stage.sequence + 1 != next || !committed_exactly(&turns, &stage.envelope)? {
+        let committed = match RawGeneration::open(&journal.dir, false)? {
+            Some(raw) => committed_exactly(&raw, &stage.envelope)?,
+            None => false,
+        };
+        if stage.sequence + 1 != next || !committed {
             return Err(format!(
                 "capture commit: retired stage conflicts at {}",
                 stage.path.display()
@@ -593,7 +774,9 @@ fn commit_stage(journal: &mut Journal, stage: &Stage) -> Result<(), String> {
             stage.path.display()
         ));
     }
-    reconcile_append(&turns, &stage.envelope)?;
+    let mut raw = RawGeneration::open(&journal.dir, true)?
+        .expect("create=true returns a raw generation handle");
+    reconcile_append(&mut raw, &stage.envelope)?;
     {
         let order = journal.require_order_mut()?;
         order.next_to_drain += 1;
@@ -609,7 +792,7 @@ fn commit_stage(journal: &mut Journal, stage: &Stage) -> Result<(), String> {
 }
 
 fn drain(root: &str, sid: &str, journal: &mut Journal) -> Result<(), String> {
-    let mut stages = read_stages(root, sid, journal)?;
+    let mut stages = read_stages(root, sid, journal, false)?;
     loop {
         let sequence = journal.require_order()?.next_to_drain;
         if sequence >= journal.require_order()?.next_sequence {
@@ -673,7 +856,7 @@ pub(crate) async fn detach_generation(
 
     let stage_dir = staging_dir(&root, sid);
     let staged = if journal.order.is_some() {
-        !read_stages(&root, sid, &journal)?.is_empty()
+        !read_stages(&root, sid, &journal, false)?.is_empty()
     } else {
         match fs::read_dir(&stage_dir) {
             Ok(mut entries) => entries
@@ -713,28 +896,10 @@ pub(crate) async fn detach_generation(
         }
     }
 
-    let Some(raw) = generations.raw else {
+    if generations.raw.is_none() {
         return Ok(None);
-    };
-    if !crate::sweep::scrub(&raw).await {
-        return Err(format!("scrub generation failed at {}", raw.display()));
     }
-    let digest = vaultr::vault::sha256_file(&raw).map_err(|error| error.to_string())?;
-    let base_len = generations
-        .sealed
-        .as_ref()
-        .map(fs::metadata)
-        .transpose()
-        .map_err(|error| format!("stat sealed generation under {}: {error}", dir.display()))?
-        .map_or(0, |metadata| metadata.len());
-    let path = dir.join(format!("turns.jsonl.sealing-{base_len}-{digest}"));
-    fs::rename(&raw, &path)
-        .map_err(|error| format!("detach generation {}: {error}", raw.display()))?;
-    Ok(Some(vaultr::vault::DetachedGeneration {
-        path,
-        base_len,
-        digest,
-    }))
+    crate::sweep::detach_capture_generation(dir).map(Some)
 }
 
 struct RecoverySession {
@@ -909,7 +1074,7 @@ pub(crate) fn recover_all(vault: &Path) -> Result<(), String> {
                 directory.join("state.json").display()
             ));
         }
-        let stages = read_stages(&root, &sid, &journal)?;
+        let stages = read_stages(&root, &sid, &journal, true)?;
         inventory.push(RecoverySession {
             sid,
             root: root.clone(),

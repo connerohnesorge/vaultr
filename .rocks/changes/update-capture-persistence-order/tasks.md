@@ -50,3 +50,26 @@
 - [x] 7.2 Carry validated generation inventories and explicit kinds through learning, coverage, and pending Sealing
 - [x] 7.3 Assign compression a typed in-process action during job discovery and keep the wrapper manual-only
 - [x] 7.4 Correct graceful-drain ownership documentation and rerun the full two-repository verification matrix
+
+## 8. Crash-edge exact-tip review
+
+- [x] 8.1 Remove only exact atomic stage-write temp debris during exclusive recovery and materialize pending reservations once
+- [x] 8.2 Make tail reconciliation whitespace-aware, concatenated-value compatible, UUID-strict, chunkwise, and bounded-memory
+- [x] 8.3 Use one directory-anchored no-follow raw descriptor through classification, comparison, truncation, and append
+- [x] 8.4 Generalize detached exact-once Sealing to Herdr and coordinate snapshot appends with detachment
+- [x] 8.5 Run focused crash and security fixtures, formatting, strict Clippy, workspace tests, self-test, and Rocks validation
+
+## 9. Detach and Sealing boundary hardening
+
+- [x] 9.1 Anchor Capture and Herdr scrub, detach, compression, comparison, rename, and cleanup to retained no-follow descriptors under a cooperative session-directory flock
+- [x] 9.2 Reject static or pre-operation source, destination, temporary, and cleanup entry substitutions without following symlinks or mutating their targets
+- [x] 9.3 Sync source or merged data and directory renames before detached cleanup, then sync the cleanup removal
+- [x] 9.4 Cover pre-operation substitutions, symlinked generation paths, and durable post-rename retry while preserving legacy frame compatibility
+- [x] 9.5 Rerun formatting, strict Clippy, workspace tests, self-test, Rocks validation, and final clean-tip review
+
+## 10. Final immutable-Sealing audit
+
+- [x] 10.1 Recover current exact UUID temps and only the five enumerated previous-version deterministic temp names under the session lock
+- [x] 10.2 Prove fresh and retried committed suffixes through the canonical decoded digest, accepting alternate valid frame representations and retaining corrupt output evidence
+- [x] 10.3 Kill and reap a timed-out compressor before descriptor-owned temp cleanup
+- [x] 10.4 Cover exact and near-miss temp migration, corrupt-success output, alternate valid frames, and timeout reaping

@@ -131,25 +131,143 @@ fn commit_stage_repairs_a_prefix_split_inside_utf8() {
 }
 
 #[test]
-fn commit_stage_finds_a_small_next_record_after_a_large_previous_record() {
+fn commit_stage_streams_a_small_next_record_after_a_large_previous_record() {
     let dir = test_dir("large-previous");
     let sid = "00000000-0000-4000-8000-000000000048";
     let staged = envelope(sid);
     write_ordered_journal(&dir, sid, "/vault", &staged);
-    let mut previous = envelope(sid);
-    previous["request_id"] = json!("00000000-0000-4000-8000-000000000049");
-    previous["response"]["sse"] = json!("x".repeat(128 * 1024));
-    let mut expected = serde_json::to_vec(&previous).unwrap();
-    expected.push(b'\n');
-    fs::write(dir.join("turns.jsonl"), &expected).unwrap();
+    let turns = dir.join("turns.jsonl");
+    let mut file = fs::File::create(&turns).unwrap();
+    file.write_all(br#"{"request_id":"00000000-0000-4000-8000-000000000049","padding":""#)
+        .unwrap();
+    for _ in 0..256 {
+        file.write_all(&[b'x'; 64 * 1024]).unwrap();
+    }
+    file.write_all(b"\"}\n").unwrap();
+    let previous_len = file.metadata().unwrap().len();
+    drop(file);
     let stage = stage(&dir, staged.clone());
     let mut journal = Journal::load(&dir, sid).unwrap();
 
     commit_stage(&mut journal, &stage).unwrap();
 
-    expected.extend(serde_json::to_vec(&staged).unwrap());
-    expected.push(b'\n');
-    assert_eq!(fs::read(dir.join("turns.jsonl")).unwrap(), expected);
+    assert_eq!(
+        fs::metadata(&turns).unwrap().len(),
+        previous_len + serde_json::to_vec(&staged).unwrap().len() as u64 + 1
+    );
+    let raw = RawGeneration::open(&dir, false).unwrap().unwrap();
+    assert!(matches!(
+        capture_tail(&raw).unwrap(),
+        CaptureTail::ValidTerminated { request_id, .. }
+            if request_id == staged["request_id"].as_str().unwrap()
+    ));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn commit_stage_skips_trailing_whitespace_records_and_fragments() {
+    for (label, trailing) in [
+        ("blank-line", b"\n".as_slice()),
+        ("space-tab-record", b" \t\n".as_slice()),
+        ("unterminated-space-tab", b" \t".as_slice()),
+    ] {
+        let dir = test_dir(label);
+        let sid = "00000000-0000-4000-8000-000000000051";
+        let envelope = envelope(sid);
+        write_ordered_journal(&dir, sid, "/vault", &envelope);
+        let mut before = serde_json::to_vec(&envelope).unwrap();
+        before.push(b'\n');
+        before.extend_from_slice(trailing);
+        fs::write(dir.join("turns.jsonl"), &before).unwrap();
+        let stage = stage(&dir, envelope);
+        let mut journal = Journal::load(&dir, sid).unwrap();
+
+        commit_stage(&mut journal, &stage).unwrap();
+
+        assert_eq!(fs::read(dir.join("turns.jsonl")).unwrap(), before);
+        assert!(!stage.path.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn commit_stage_recovers_the_final_envelope_from_a_concatenated_record() {
+    let dir = test_dir("concatenated-tail");
+    let sid = "00000000-0000-4000-8000-000000000052";
+    let staged = envelope(sid);
+    write_ordered_journal(&dir, sid, "/vault", &staged);
+    let mut previous = staged.clone();
+    previous["request_id"] = json!("00000000-0000-4000-8000-000000000053");
+    let before = [
+        serde_json::to_vec(&previous).unwrap(),
+        serde_json::to_vec(&staged).unwrap(),
+        b"\n\n".to_vec(),
+    ]
+    .concat();
+    fs::write(dir.join("turns.jsonl"), &before).unwrap();
+    let stage = stage(&dir, staged);
+    let mut journal = Journal::load(&dir, sid).unwrap();
+
+    commit_stage(&mut journal, &stage).unwrap();
+
+    assert_eq!(fs::read(dir.join("turns.jsonl")).unwrap(), before);
+    assert!(!stage.path.exists());
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn commit_stage_rejects_non_envelope_values_and_residue_without_mutation() {
+    for (label, before) in [
+        ("empty-object", b"{}\n".as_slice()),
+        ("null", b"null\n".as_slice()),
+        (
+            "invalid-request-id",
+            b"{\"request_id\":\"not-a-uuid\"}\n".as_slice(),
+        ),
+        (
+            "residue",
+            b"{\"request_id\":\"00000000-0000-4000-8000-000000000053\"}junk\n".as_slice(),
+        ),
+    ] {
+        let dir = test_dir(label);
+        let sid = "00000000-0000-4000-8000-000000000054";
+        let envelope = envelope(sid);
+        write_ordered_journal(&dir, sid, "/vault", &envelope);
+        fs::write(dir.join("turns.jsonl"), before).unwrap();
+        let stage = stage(&dir, envelope);
+        let mut journal = Journal::load(&dir, sid).unwrap();
+
+        assert!(commit_stage(&mut journal, &stage).is_err(), "{label}");
+
+        assert_eq!(fs::read(dir.join("turns.jsonl")).unwrap(), before);
+        assert!(stage.path.exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn commit_stage_appends_once_after_an_all_blank_file() {
+    let dir = test_dir("all-blank");
+    let sid = "00000000-0000-4000-8000-000000000055";
+    let envelope = envelope(sid);
+    write_ordered_journal(&dir, sid, "/vault", &envelope);
+    fs::write(dir.join("turns.jsonl"), b"\n \t\n \t").unwrap();
+    let first = stage(&dir, envelope.clone());
+    let mut journal = Journal::load(&dir, sid).unwrap();
+
+    commit_stage(&mut journal, &first).unwrap();
+    let once = fs::read(dir.join("turns.jsonl")).unwrap();
+    let retry = stage(&dir, envelope);
+    let mut journal = Journal::load(&dir, sid).unwrap();
+    commit_stage(&mut journal, &retry).unwrap();
+
+    assert_eq!(fs::read(dir.join("turns.jsonl")).unwrap(), once);
+    assert_eq!(
+        vaultr::recon::reconstruct(&dir.join("turns.jsonl"))
+            .unwrap()
+            .envelopes,
+        1
+    );
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -159,7 +277,7 @@ fn commit_stage_rejects_terminated_junk_without_mutation() {
     let sid = "00000000-0000-4000-8000-000000000050";
     let envelope = envelope(sid);
     write_ordered_journal(&dir, sid, "/vault", &envelope);
-    let before = b"{not-json}\n".to_vec();
+    let before = b"{not-json}\n \t\n".to_vec();
     fs::write(dir.join("turns.jsonl"), &before).unwrap();
     let stage = stage(&dir, envelope);
     let mut journal = Journal::load(&dir, sid).unwrap();
@@ -204,8 +322,9 @@ fn commit_stage_requires_byte_exact_retired_evidence() {
     let sid = "00000000-0000-4000-8000-000000000046";
     let envelope = envelope(sid);
     write_ordered_journal(&dir, sid, "/vault", &envelope);
-    let mut semantically_equal = vec![b' '];
-    semantically_equal.extend(serde_json::to_vec(&envelope).unwrap());
+    let serialized = serde_json::to_vec(&envelope).unwrap();
+    let mut semantically_equal = vec![b'{', b' '];
+    semantically_equal.extend_from_slice(&serialized[1..]);
     semantically_equal.push(b'\n');
     fs::write(dir.join("turns.jsonl"), &semantically_equal).unwrap();
     let stage = stage(&dir, envelope);
@@ -291,6 +410,68 @@ fn commit_stage_propagates_cleanup_failure_and_retries_exactly_once() {
         1
     );
     fs::remove_dir_all(dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn commit_stage_rejects_a_symlinked_raw_without_mutating_any_evidence() {
+    use std::os::unix::fs::symlink;
+
+    let root = test_dir("raw-symlink");
+    let dir = root.join("session");
+    fs::create_dir_all(&dir).unwrap();
+    let sid = "00000000-0000-4000-8000-000000000056";
+    let envelope = envelope(sid);
+    write_ordered_journal(&dir, sid, "/vault", &envelope);
+    let stage = stage(&dir, envelope);
+    let target = root.join("outside.jsonl");
+    fs::write(&target, b"outside evidence\n").unwrap();
+    symlink(&target, dir.join("turns.jsonl")).unwrap();
+    let target_before = fs::read(&target).unwrap();
+    let journal_before = fs::read(dir.join("state.json")).unwrap();
+    let stage_before = fs::read(&stage.path).unwrap();
+    let mut journal = Journal::load(&dir, sid).unwrap();
+
+    assert!(commit_stage(&mut journal, &stage).is_err());
+
+    assert_eq!(fs::read(&target).unwrap(), target_before);
+    assert_eq!(fs::read(dir.join("state.json")).unwrap(), journal_before);
+    assert_eq!(fs::read(&stage.path).unwrap(), stage_before);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn raw_handle_keeps_check_and_append_on_one_descriptor() {
+    use std::os::unix::fs::symlink;
+
+    let root = test_dir("raw-swap");
+    let dir = root.join("session");
+    fs::create_dir_all(&dir).unwrap();
+    let sid = "00000000-0000-4000-8000-000000000057";
+    let first = envelope(sid);
+    let mut initial = serde_json::to_vec(&first).unwrap();
+    initial.push(b'\n');
+    fs::write(dir.join("turns.jsonl"), &initial).unwrap();
+    let mut raw = RawGeneration::open(&dir, false).unwrap().unwrap();
+    assert!(matches!(
+        capture_tail(&raw).unwrap(),
+        CaptureTail::ValidTerminated { .. }
+    ));
+    let retained = dir.join("retained.jsonl");
+    fs::rename(dir.join("turns.jsonl"), &retained).unwrap();
+    let target = root.join("outside.jsonl");
+    fs::write(&target, b"outside evidence\n").unwrap();
+    symlink(&target, dir.join("turns.jsonl")).unwrap();
+
+    raw.append_record(b"{\"request_id\":\"00000000-0000-4000-8000-000000000058\"}")
+        .unwrap();
+
+    assert_eq!(fs::read(&target).unwrap(), b"outside evidence\n");
+    assert!(fs::read(&retained)
+        .unwrap()
+        .ends_with(b"00000000-0000-4000-8000-000000000058\"}\n"));
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[tokio::test]

@@ -543,12 +543,16 @@ pub fn maybe_snapshot(vault: &Path) {
             let Ok(sans_ts) = serde_json::to_string(&snapshot) else {
                 continue;
             };
-            let mut guard = SNAPSHOTS.lock().unwrap();
-            let state = guard.get_or_insert_with(HashMap::new);
-            let Some(entry) = state.get_mut(&sid) else {
-                continue;
-            };
-            if entry.1 == sans_ts {
+            let root = crate::capture::canonical_root(&vault);
+            let lock = crate::capture::session_lock(&root, &sid);
+            let _capture_guard = lock.lock().await;
+            if SNAPSHOTS
+                .lock()
+                .unwrap()
+                .as_ref()
+                .and_then(|state| state.get(&sid))
+                .is_none_or(|entry| entry.1 == sans_ts)
+            {
                 continue;
             }
             let Ok(dir) = session_dir(&vault, &sid) else {
@@ -569,7 +573,14 @@ pub fn maybe_snapshot(vault: &Path) {
                 continue;
             };
             if writeln!(file, "{}", line).is_ok() {
-                entry.1 = sans_ts;
+                if let Some(entry) = SNAPSHOTS
+                    .lock()
+                    .unwrap()
+                    .get_or_insert_with(HashMap::new)
+                    .get_mut(&sid)
+                {
+                    entry.1 = sans_ts;
+                }
             }
         }
     });

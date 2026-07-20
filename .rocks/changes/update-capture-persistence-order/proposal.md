@@ -20,6 +20,14 @@ must reconcile that durable backlog before new capture or Sealing begins.
   the Session Capture strictly in preparation order.
 - Recover staged and abandoned preparations before Plant accepts proxy traffic
   or permits Sealing, failing startup rather than guessing on conflicting state.
+- Seal Capture and Herdr generations through validated, immutable detached
+  evidence with base-length and digest proof, including directory-anchored
+  no-follow mutation, cooperative cross-process session locking, narrowly
+  enumerated temp recovery, and exact-once process- or power-loss retry.
+- Require complete ownership of both Plant listeners before recovery or manual
+  compression, and run scheduled compression in-process in the owning daemon.
+- Propagate shared maintenance traversal failures through every caller instead
+  of treating an incomplete inventory as successful work.
 - Keep Session Index and Herdr snapshot timing at durable stage acceptance.
 - Make Reconstruction recover complete concatenated legacy Envelopes while
   rejecting unrecoverable terminated records and malformed sealed tails.
@@ -33,6 +41,13 @@ must reconcile that durable backlog before new capture or Sealing begins.
   `crates/plant/src/main.rs`, `crates/plant/src/jobs.rs`,
   `crates/plant/src/sweep.rs`, `crates/vaultr/src/vault.rs`,
   `crates/vaultr/src/recon.rs`, and focused tests
-- Related issue: https://github.com/connerohnesorge/vaultr/issues/16
+- Issue traceability:
+  - #19: immutable Capture and Herdr generation Sealing with exact-once retry
+  - #20: complete two-listener ownership and daemon-only scheduled compression
+  - #21: path-exact, strict, fail-closed recovery
+  - #22: byte-exact idempotent recovery append reconciliation
+  - #32: explicit maintenance traversal failure propagation
+- Related historical issue: #16 documents the legacy concatenated-record and
+  mixed-generation Reconstruction evidence
 - Existing proposals: distinct from draft PR #12, whose Plant generation
   lifecycle was superseded by merged PR #14

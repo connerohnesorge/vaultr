@@ -18,12 +18,14 @@ first new reservation.
 A `capture.rs`-private per-session async mutex, keyed by canonical Session
 Capture root plus session id, serializes journal mutation, stage publication,
 eligible draining, and raw-generation detachment. It is never held across
-upstream response streaming. Cross-process locking is not added; complete
-ownership of both existing listeners is the process-ownership boundary.
-Scheduled compression therefore runs directly inside the listener-owning
-daemon. A manual `compress once` must first acquire and retain both listeners,
-recover persistence state, and only then sweep, so it refuses while that daemon
-is active.
+upstream response streaming. Live capture persistence adds no separate
+cross-process lock; complete ownership of both existing listeners is that
+process-ownership boundary. Scheduled compression therefore runs directly
+inside the listener-owning daemon. A manual `compress once` must first acquire
+and retain both listeners, recover persistence state, and only then sweep, so
+it refuses while that daemon is active. Maintenance also retains an exclusive
+advisory flock on each session directory from temp recovery through commit and
+cleanup, serializing cooperating Plant processes at the filesystem boundary.
 
 ### Completed stage files
 
@@ -40,6 +42,12 @@ Local stage metadata also records the canonical Session Capture root so a hash
 collision or path mismatch fails recovery. Completed stages never live in the
 Git-backed Session Capture tree before security scrub.
 
+An interrupted atomic stage publication can leave only
+`<sequence>-<request-uuid>.tmp-<temp-v4-uuid>`. During exclusive startup
+recovery, Plant removes files matching exactly that writer-owned grammar before
+materializing the still-pending reservation as incomplete. Every near-miss
+entry remains fail-closed.
+
 `finish_capture` returns success once its completed Envelope is durably staged,
 even if an earlier live sequence prevents draining. A stage-write failure or an
 eligible drain failure returns an error and retains the stage for recovery.
@@ -54,15 +62,26 @@ transaction. For each eligible sequence, while holding the session mutex:
 3. delete the private stage file.
 
 An exact crash prefix can end at any byte, including inside a multibyte UTF-8
-code point; no lossy text conversion participates in reconciliation. A typed
-backward tail classifier scans independently of the staged record size and
-distinguishes blank, valid terminated, malformed terminated, and unterminated
-evidence. A valid different request permits append, an identical request
-requires byte-exact equality, and only an exact staged prefix permits repair.
-Malformed terminated or conflicting evidence fails without mutation. If the
-append succeeds but the journal write fails, or the journal write succeeds but
-stage cleanup fails, retained evidence makes the next attempt converge to one
-record while propagating the failed operation.
+code point; no lossy text conversion participates in reconciliation. Plant
+opens the session directory without following its final component and opens
+`turns.jsonl` relative to that descriptor with `O_NOFOLLOW`. Classification,
+range comparison, truncation, and append all use that same raw-generation
+descriptor.
+
+A typed backward tail classifier scans fixed-size chunks independently of the
+staged record size and skips all trailing whitespace-only records or fragments;
+`Blank` means the entire file contains only whitespace. Terminated records use
+the same concatenated-value stream decoder as Reconstruction, deserialize only
+request identity, retain the final Envelope's byte range, and reject malformed
+residue or any value without a UUID `request_id`. Exact identity and crash
+prefixes compare descriptor ranges chunkwise, so even a large record is never
+duplicated into a full buffer or second `Value` DOM. A valid different request
+permits append, an identical request requires byte-exact Envelope bytes, and
+only an exact staged prefix permits repair. Malformed terminated or conflicting
+evidence fails without mutation. If the append succeeds but the journal write
+fails, or the journal write succeeds but stage cleanup fails, retained evidence
+makes the next attempt converge to one record while propagating the failed
+operation.
 
 Persisted line order remains the Envelope contract. Preparation sequence is not
 added to the public Envelope schema; `request_id` is the idempotency identity.
@@ -91,6 +110,8 @@ application consume that same value rather than reopening mutable evidence.
   request delta with `response.complete=false` and no invented output.
 - Completed stages are interleaved at their reserved positions and the entire
   journal drains before any new reservation is accepted.
+- Exact atomic-write temp debris is removed before its pending reservation is
+  materialized once as incomplete; every other staging entry remains an error.
 - A leftover stage is already committed only when the final complete persisted
   Envelope has the same `request_id` and exactly equals the stage.
 - If the final live bytes are an exact prefix of the retained staged Envelope,
@@ -127,17 +148,51 @@ or detached kind. Learning eligibility, pending-Sealing selection, and capture
 decoding use that kind and never re-derive evidence type from a filename or
 extension. Sealing regenerates the detached generation's zstd frame. The prior
 destination length identifies the commit boundary: a destination at that
-length is uncommitted; a destination whose exact suffix is the regenerated
-frame is the post-rename/pre-detached-removal state and only needs cleanup; any
-other state fails without deleting evidence. Reconstruction reads sealed,
-detached, and new live raw generations in order. It omits detached bytes only
-after decoding the sealed suffix at the recorded base and proving its raw
-digest; sealed length alone is never proof.
+length is uncommitted; a longer destination is the
+post-rename/pre-detached-removal state only when the canonical decoded-suffix
+proof matches the detached raw digest. This content proof deliberately accepts
+different valid zstd frame representations for the same generation. Any other
+state fails without deleting evidence. Reconstruction reads sealed, detached,
+and new live raw generations in order and reuses that same proof. Sealed length
+alone is never proof.
 
 Detached conflicts and scrubbing, compression, rename, or cleanup failures
 preserve the evidence and propagate as operational failures. Manual compression
 exits 2 and the daemon scheduler records `failed`; neither reports “nothing to
 seal” or success.
+
+Herdr snapshot appends take the same short session lock used by capture
+persistence. Sealing detaches `herdr.jsonl` into the same
+base-length/digest-identified transaction shape before compression. The shared
+exact-once commit primitive decodes and hashes an already-renamed destination
+suffix before removing detached evidence, so a crash between destination rename
+and cleanup cannot append the Herdr content twice.
+
+Capture and Herdr scrubbing, detachment, and Sealing retain one no-follow
+session-directory descriptor and open every source, destination, and
+unpredictably named temporary relative to it. The retained directory also owns
+an exclusive advisory flock through temp recovery, hashing, compression,
+rename, digest proof, and cleanup. Under that cooperative single-owner
+precondition, no second Plant process can create or retire another compressor's
+temporary entry. Same-account writers that ignore the advisory lock are outside
+this contract; device/inode checks reject static or pre-operation substitutions
+but do not claim atomic rejection of a hostile swap in the syscall gap.
+
+Hashing, compression input/output, suffix comparison, rename, and cleanup use
+retained regular-file descriptors. Directory-relative rename and unlink do not
+follow symlinks. Each source or merged file is synced before rename, the
+directory is synced after every rename, and the committed destination is synced
+before detached evidence is unlinked and the directory is synced again. Thus a
+power-loss boundary can retain both names or only the committed destination,
+but cannot durably lose both source evidence and the destination name.
+
+Restart cleanup recognizes only the current hidden UUIDv4 temp grammar plus the
+five exact deterministic names emitted by the immediately preceding version:
+`turns.scrub-tmp`, `turns.jsonl.frame-tmp`, `turns.jsonl.zst-tmp`,
+`herdr.jsonl.frame-tmp`, and `herdr.jsonl.zst-tmp`. It opens each entry
+no-follow and removes it only when regular; symlinks, non-regular entries, and
+near misses fail closed. A timed-out zstd child is explicitly killed and reaped
+before its retained output is cleaned.
 
 The detached filename and location diagnostics contain no captured content.
 Legacy Envelope files and concatenated zstd frames remain unchanged.
@@ -183,10 +238,14 @@ preparation order differ in practice.
   concatenated records.
 - Non-Goals: a new trait, public Interface, Adapter, generic queue,
   Envelope sequence field, live gap timeout, public watchdog state,
-  cross-process locking, vault-move migration, or clone/cache optimization.
-- Non-Goals: per-request `fsync`/`sync_data` and host power-loss durability.
+  cross-process locking for live capture append beyond complete listener
+  ownership, vault-move migration, or clone/cache optimization.
+- Non-Goals: per-request `fsync`/`sync_data` and host power-loss durability
+  outside the immutable Sealing commit boundary.
 - Non-Goals: changing permissive embedded SSE parsing, retained legacy decode
-  branches, Vault Learn generation selection, or issue #16 sibling discovery.
+  branches, learner eligibility policy, or issue #16 sibling discovery.
+- Non-Goals: defending against hostile same-account filesystem writers that
+  ignore the cooperative session-directory flock.
 
 ## Decisions
 
@@ -207,7 +266,8 @@ preparation order differ in practice.
 - Do not abandon live gaps by timeout. Normal EOF, stream error, or disconnect
   already completes the existing path, while long model pauses are valid.
 - Cover Plant process crashes using completed writes and atomic replacement.
-  Host power-loss durability is a separate, unmeasured requirement.
+  Immutable Sealing additionally syncs its destination-name and source-cleanup
+  ordering; per-request journal power-loss durability remains unmeasured.
 
 ## Risks / Trade-offs
 

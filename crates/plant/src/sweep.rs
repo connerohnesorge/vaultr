@@ -4,7 +4,13 @@
 //! Every failure path non-fatal: capture uptime is sacred. All heavy work shells out.
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::CString;
+use std::fs::File;
+use std::io::{Seek, SeekFrom, Write};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::time::{Duration, SystemTime};
 
 /// How a subprocess run ended. Distinguishes the cases `ok: false` collapses:
@@ -520,15 +526,332 @@ fn redact_line(
     (line, hits)
 }
 
-/// Redact known-secret patterns + a literal denylist in place. false => do not compress/push.
-/// Rust-native (regex): no subprocess, no timeout, constant memory. Streaming line-by-line —
-/// turns.jsonl files reach GBs, and whole-file reads were the historic multi-GB RSS spike
-/// (and the Bun-era jetsam death loop).
-pub async fn scrub(path: &Path) -> bool {
-    let path_s = path.display().to_string();
+struct AnchoredDirectory {
+    path: PathBuf,
+    file: File,
+}
 
-    // optional literal denylist: known plaintext secrets no regex can pattern-match
-    // (e.g. the CLAUDE.md athens password). Absent file => regex-only.
+impl AnchoredDirectory {
+    fn open(path: &Path) -> Result<Self, String> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(path)
+            .map_err(|error| format!("open session directory {}: {error}", path.display()))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+        })
+    }
+
+    fn name(&self, name: &str) -> Result<CString, String> {
+        if name.is_empty()
+            || Path::new(name).file_name().and_then(|part| part.to_str()) != Some(name)
+        {
+            return Err(format!(
+                "invalid session entry name under {}",
+                self.path.display()
+            ));
+        }
+        CString::new(name)
+            .map_err(|_| format!("invalid session entry name under {}", self.path.display()))
+    }
+
+    fn open_optional(&self, name: &str, write: bool) -> Result<Option<File>, String> {
+        let name_c = self.name(name)?;
+        let flags = if write { libc::O_RDWR } else { libc::O_RDONLY }
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | libc::O_NONBLOCK;
+        // SAFETY: `name_c` is NUL-terminated, the retained directory fd is
+        // valid, and a successful descriptor is transferred into `File`.
+        let descriptor = unsafe { libc::openat(self.file.as_raw_fd(), name_c.as_ptr(), flags, 0) };
+        if descriptor < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            return Err(format!(
+                "open session entry {}: {error}",
+                self.path.join(name).display()
+            ));
+        }
+        // SAFETY: `openat` returned a new owned descriptor.
+        let file = unsafe { File::from_raw_fd(descriptor) };
+        if !file
+            .metadata()
+            .map_err(|error| {
+                format!(
+                    "inspect session entry {}: {error}",
+                    self.path.join(name).display()
+                )
+            })?
+            .is_file()
+        {
+            return Err(format!(
+                "session entry is not a regular file at {}",
+                self.path.join(name).display()
+            ));
+        }
+        Ok(Some(file))
+    }
+
+    fn open_required(&self, name: &str, write: bool) -> Result<File, String> {
+        self.open_optional(name, write)?.ok_or_else(|| {
+            format!(
+                "missing session entry at {}",
+                self.path.join(name).display()
+            )
+        })
+    }
+
+    fn create_temp(&self, base: &str, purpose: &str) -> Result<(String, File), String> {
+        let name = format!(".{base}.{purpose}-{}", uuid::Uuid::new_v4());
+        let name_c = self.name(&name)?;
+        let flags =
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+        // SAFETY: `name_c` is NUL-terminated, the retained directory fd is
+        // valid, and a successful descriptor is transferred into `File`.
+        let descriptor =
+            unsafe { libc::openat(self.file.as_raw_fd(), name_c.as_ptr(), flags, 0o600) };
+        if descriptor < 0 {
+            return Err(format!(
+                "create session temp {}: {}",
+                self.path.join(&name).display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        // SAFETY: `openat` returned a new owned descriptor.
+        Ok((name, unsafe { File::from_raw_fd(descriptor) }))
+    }
+
+    fn entry_names(&self) -> Result<Vec<String>, String> {
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(&self.path)
+            .map_err(|error| format!("read session directory {}: {error}", self.path.display()))?
+        {
+            let entry = entry.map_err(|error| {
+                format!("read session entry under {}: {error}", self.path.display())
+            })?;
+            if let Some(name) = entry.file_name().to_str() {
+                names.push(name.to_string());
+            }
+        }
+        let current = Self::open(&self.path)?;
+        if !Self::same_file(&self.file, &current.file)? {
+            return Err(format!(
+                "session directory changed during inventory at {}",
+                self.path.display()
+            ));
+        }
+        Ok(names)
+    }
+
+    fn cleanup_temps(
+        &self,
+        base: &str,
+        purposes: &[&str],
+        legacy_names: &[&str],
+    ) -> Result<(), String> {
+        let mut owned_names = Vec::new();
+        for name in self.entry_names()? {
+            let mut prefixed = false;
+            let exact_uuid = purposes.iter().any(|purpose| {
+                let prefix = format!(".{base}.{purpose}-");
+                name.strip_prefix(&prefix).is_some_and(|suffix| {
+                    prefixed = true;
+                    uuid::Uuid::parse_str(suffix).is_ok_and(|id| {
+                        id.get_version_num() == 4 && id.hyphenated().to_string() == suffix
+                    })
+                })
+            });
+            let exact_legacy = legacy_names.iter().any(|legacy| name == *legacy);
+            let legacy_near_miss = legacy_names.iter().any(|legacy| {
+                legacy
+                    .strip_suffix("tmp")
+                    .is_some_and(|prefix| name != *legacy && name.starts_with(prefix))
+            });
+            if (prefixed && !exact_uuid) || legacy_near_miss {
+                return Err(format!(
+                    "unrecognized session temp evidence at {}",
+                    self.path.join(name).display()
+                ));
+            }
+            if !exact_uuid && !exact_legacy {
+                continue;
+            }
+            owned_names.push(name);
+        }
+        // Validate and retain every exact entry before removing any. A symlink
+        // or non-regular legacy entry therefore leaves all evidence untouched.
+        let mut owned = Vec::with_capacity(owned_names.len());
+        for name in owned_names {
+            let file = self.open_required(&name, false)?;
+            owned.push((name, file));
+        }
+        for (name, file) in owned {
+            self.unlink_if_same(&name, &file)?;
+        }
+        Ok(())
+    }
+
+    fn same_file(left: &File, right: &File) -> Result<bool, String> {
+        let left = left
+            .metadata()
+            .map_err(|error| format!("inspect retained session entry: {error}"))?;
+        let right = right
+            .metadata()
+            .map_err(|error| format!("inspect current session entry: {error}"))?;
+        Ok(left.dev() == right.dev() && left.ino() == right.ino())
+    }
+
+    fn entry_matches(&self, name: &str, expected: &File) -> Result<bool, String> {
+        let Some(current) = self.open_optional(name, false)? else {
+            return Ok(false);
+        };
+        Self::same_file(&current, expected)
+    }
+
+    fn sync(&self) -> Result<(), String> {
+        self.file
+            .sync_all()
+            .map_err(|error| format!("sync session directory {}: {error}", self.path.display()))
+    }
+
+    /// Cooperative cross-process ownership for one session's maintenance
+    /// transaction. The retained directory fd keeps the flock until drop.
+    fn lock_exclusive(&self) -> Result<(), String> {
+        // SAFETY: the retained directory descriptor is valid for this object's
+        // lifetime; `flock` does not take ownership of it.
+        if unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(format!(
+                "lock session directory {}: {}",
+                self.path.display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Under the caller-held cooperative lock, rename only the retained inode,
+    /// then make that directory entry durable before returning.
+    fn replace_entry(
+        &self,
+        from: &str,
+        to: &str,
+        source: &File,
+        expected_destination: Option<&File>,
+    ) -> Result<File, String> {
+        source.sync_all().map_err(|error| {
+            format!(
+                "sync session entry before rename {}: {error}",
+                self.path.join(from).display()
+            )
+        })?;
+        if !self.entry_matches(from, source)? {
+            return Err(format!(
+                "session entry changed before rename at {}",
+                self.path.join(from).display()
+            ));
+        }
+        match (self.open_optional(to, false)?, expected_destination) {
+            (Some(current), Some(expected)) if Self::same_file(&current, expected)? => {}
+            (None, None) => {}
+            _ => {
+                return Err(format!(
+                    "session destination changed before rename at {}",
+                    self.path.join(to).display()
+                ));
+            }
+        }
+        let from_c = self.name(from)?;
+        let to_c = self.name(to)?;
+        // SAFETY: both names are NUL-terminated and resolved only relative to
+        // the retained directory descriptor.
+        let status = unsafe {
+            libc::renameat(
+                self.file.as_raw_fd(),
+                from_c.as_ptr(),
+                self.file.as_raw_fd(),
+                to_c.as_ptr(),
+            )
+        };
+        if status != 0 {
+            return Err(format!(
+                "rename session entry {}: {}",
+                self.path.join(from).display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        let renamed = self.open_required(to, false)?;
+        if !Self::same_file(&renamed, source)? {
+            return Err(format!(
+                "session entry changed during rename at {}",
+                self.path.join(to).display()
+            ));
+        }
+        self.sync()?;
+        source
+            .try_clone()
+            .map_err(|error| format!("retain renamed session entry: {error}"))
+    }
+
+    /// Under the caller-held cooperative lock, remove only the retained inode
+    /// and make the removal durable before success.
+    fn unlink_if_same(&self, name: &str, expected: &File) -> Result<(), String> {
+        if !self.entry_matches(name, expected)? {
+            return Err(format!(
+                "session entry changed before removal at {}",
+                self.path.join(name).display()
+            ));
+        }
+        let name_c = self.name(name)?;
+        // SAFETY: `name_c` is NUL-terminated and resolved only relative to the
+        // retained directory descriptor.
+        if unsafe { libc::unlinkat(self.file.as_raw_fd(), name_c.as_ptr(), 0) } != 0 {
+            return Err(format!(
+                "remove session entry {}: {}",
+                self.path.join(name).display(),
+                std::io::Error::last_os_error()
+            ));
+        }
+        self.sync()
+    }
+}
+
+fn clone_at_start(file: &File) -> Result<File, String> {
+    let mut clone = file
+        .try_clone()
+        .map_err(|error| format!("clone retained session entry: {error}"))?;
+    clone
+        .seek(SeekFrom::Start(0))
+        .map_err(|error| format!("seek retained session entry: {error}"))?;
+    Ok(clone)
+}
+
+fn hash_file(file: &File) -> Result<String, String> {
+    vaultr::vault::sha256_reader(clone_at_start(file)?).map_err(|error| error.to_string())
+}
+
+fn print_scrub(path: &Path, hits: usize) {
+    if hits == 0 {
+        return;
+    }
+    let path_s = path.display().to_string();
+    let rel = path_s.split("/sessions/").nth(1).unwrap_or(&path_s);
+    println!("[scrub] {rel}: {hits} redaction(s)");
+}
+
+fn scrub_entry(directory: &AnchoredDirectory, name: &str) -> Result<(File, usize), String> {
+    use std::io::{BufRead, BufReader, BufWriter};
+
+    let legacy_temps: &[&str] = if name == "turns.jsonl" {
+        &["turns.scrub-tmp"]
+    } else {
+        &[]
+    };
+    directory.cleanup_temps(name, &["scrub"], legacy_temps)?;
+    let source = directory.open_required(name, true)?;
     let mut needles: HashSet<String> = HashSet::new();
     let denylist = format!(
         "{}/.config/wireproxy/scrub-denylist.txt",
@@ -536,203 +859,474 @@ pub async fn scrub(path: &Path) -> bool {
     );
     if let Ok(contents) = std::fs::read_to_string(&denylist) {
         for line in contents.lines() {
-            let s = line.trim();
-            if s.len() >= 6 {
-                // match both raw and JSON-escaped forms
-                let j = serde_json::to_string(s).unwrap_or_default();
-                needles.insert(s.to_string());
-                if j.len() >= 2 {
-                    needles.insert(j[1..j.len() - 1].to_string());
+            let value = line.trim();
+            if value.len() >= 6 {
+                let escaped = serde_json::to_string(value).unwrap_or_default();
+                needles.insert(value.to_string());
+                if escaped.len() >= 2 {
+                    needles.insert(escaped[1..escaped.len() - 1].to_string());
                 }
             }
         }
     }
-
     let patterns = secret_regexes();
-
-    // rewrite line-by-line via temp file + rename: memory = one line, not one file
-    let tmp = path.with_extension("scrub-tmp");
-    let hits = (|| -> std::io::Result<usize> {
-        use std::io::{BufRead, Write};
-        let reader = std::io::BufReader::new(std::fs::File::open(path)?);
-        let mut writer = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+    let (temporary_name, temporary) = directory.create_temp(name, "scrub")?;
+    let scrubbed = (|| -> Result<usize, String> {
+        let reader = BufReader::new(clone_at_start(&source)?);
+        let mut writer = BufWriter::new(
+            temporary
+                .try_clone()
+                .map_err(|error| format!("clone scrub temp: {error}"))?,
+        );
         let mut hits = 0;
         for line in reader.lines() {
-            let (line, n) = redact_line(line?, &needles, &patterns);
-            hits += n;
-            writeln!(writer, "{line}")?;
+            let (line, count) = redact_line(
+                line.map_err(|error| format!("read session capture: {error}"))?,
+                &needles,
+                &patterns,
+            );
+            hits += count;
+            writeln!(writer, "{line}")
+                .map_err(|error| format!("write scrubbed session capture: {error}"))?;
         }
-        writer.flush()?;
+        writer
+            .flush()
+            .map_err(|error| format!("flush scrubbed session capture: {error}"))?;
+        temporary
+            .sync_all()
+            .map_err(|error| format!("sync scrubbed session capture: {error}"))?;
         Ok(hits)
     })();
-    let hits = match hits {
-        Ok(h) => h,
-        Err(_) => {
-            let _ = std::fs::remove_file(&tmp);
-            return false;
+    let hits = match scrubbed {
+        Ok(hits) => hits,
+        Err(error) => {
+            let _ = directory.unlink_if_same(&temporary_name, &temporary);
+            return Err(error);
         }
     };
-    if hits > 0 {
-        if std::fs::rename(&tmp, path).is_err() {
-            let _ = std::fs::remove_file(&tmp);
-            return false;
-        }
-        let rel = path_s.split("/sessions/").nth(1).unwrap_or(&path_s);
-        println!("[scrub] {rel}: {hits} redaction(s)");
-    } else {
-        let _ = std::fs::remove_file(&tmp);
+    if hits == 0 {
+        directory.unlink_if_same(&temporary_name, &temporary)?;
+        return Ok((source, 0));
     }
+    match directory.replace_entry(&temporary_name, name, &temporary, Some(&source)) {
+        Ok(scrubbed) => Ok((scrubbed, hits)),
+        Err(error) => {
+            let _ = directory.unlink_if_same(&temporary_name, &temporary);
+            Err(error)
+        }
+    }
+}
+
+/// Redact known-secret patterns + a literal denylist in place. false => do not compress/push.
+/// Rust-native (regex): no subprocess, no timeout, constant memory. Streaming line-by-line —
+/// turns.jsonl files reach GBs, and whole-file reads were the historic multi-GB RSS spike
+/// (and the Bun-era jetsam death loop).
+pub async fn scrub(path: &Path) -> bool {
+    let Some(directory_path) = path.parent() else {
+        return false;
+    };
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Ok(directory) = AnchoredDirectory::open(directory_path) else {
+        return false;
+    };
+    if directory.lock_exclusive().is_err() {
+        return false;
+    }
+    let Ok((_, hits)) = scrub_entry(&directory, name) else {
+        return false;
+    };
+    print_scrub(path, hits);
     true
 }
 
-/// Seal `raw` into its `.zst` sibling and remove `raw`. When the sibling already exists
-/// (a session resumed after sealing), the new frame is APPENDED — concatenated zstd
-/// frames are a valid stream that zstdcat reads transparently, so both generations
-/// survive losslessly in chronological order. Atomic: the merged file is assembled in a
-/// temp sibling and renamed over the destination; the raw file is only removed after.
-/// The destination mtime is set to the raw's mtime (as `zstd` itself would), because
-/// learned_current uses it as the generation boundary.
-async fn seal_file(raw: &Path) -> Result<(), String> {
-    let dest = raw.with_extension("jsonl.zst");
-    let raw_mtime = std::fs::metadata(raw)
-        .and_then(|m| m.modified())
-        .map_err(|e| format!("stat: {e}"))?;
-    let frame = raw.with_extension("frame-tmp");
-    let raw_s = raw.display().to_string();
-    let frame_s = frame.display().to_string();
-    let zstd = run(
-        &["zstd", "-19", "-T0", "-q", "-f", "-o", &frame_s, &raw_s],
-        Duration::from_secs(600),
-    )
-    .await;
-    if !zstd.ok {
-        let _ = std::fs::remove_file(&frame);
-        return Err(zstd.failure_detail());
+/// Detach one mutable sidecar generation under the caller-held session lock.
+/// A retained detached file always wins over a newer raw sibling.
+fn detach_sidecar(
+    raw: &Path,
+    dest: &Path,
+) -> Result<Option<vaultr::vault::DetachedGeneration>, String> {
+    let directory_path = raw
+        .parent()
+        .ok_or_else(|| format!("sidecar has no directory at {}", raw.display()))?;
+    if dest.parent() != Some(directory_path) {
+        return Err(format!(
+            "sidecar destination leaves session directory at {}",
+            dest.display()
+        ));
     }
-    let merged = raw.with_extension("zst-tmp");
-    let assemble = (|| -> std::io::Result<()> {
-        let mut out = std::fs::File::create(&merged)?;
-        if dest.is_file() {
-            std::io::copy(&mut std::fs::File::open(&dest)?, &mut out)?;
+    let directory = AnchoredDirectory::open(directory_path)?;
+    directory.lock_exclusive()?;
+    let raw_name = raw
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("invalid sidecar name at {}", raw.display()))?;
+    let dest_name = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("invalid sealed sidecar name at {}", dest.display()))?;
+    let prefix = format!("{raw_name}.sealing-");
+    let mut detached = None;
+    for name in directory.entry_names()? {
+        let Some(suffix) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        let path = directory_path.join(&name);
+        let (base_len, digest) = suffix
+            .split_once('-')
+            .ok_or_else(|| format!("invalid detached sidecar at {}", path.display()))?;
+        let base_len = base_len
+            .parse::<u64>()
+            .map_err(|_| format!("invalid detached sidecar at {}", path.display()))?;
+        if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(format!("invalid detached sidecar at {}", path.display()));
         }
-        std::io::copy(&mut std::fs::File::open(&frame)?, &mut out)?;
-        out.sync_all()?;
-        std::fs::rename(&merged, &dest)?;
-        std::fs::OpenOptions::new()
-            .append(true)
-            .open(&dest)?
-            .set_modified(raw_mtime)?;
-        Ok(())
-    })();
-    let _ = std::fs::remove_file(&frame);
-    match assemble {
-        Ok(()) => {
-            std::fs::remove_file(raw).map_err(|e| format!("rm raw: {e}"))?;
-            Ok(())
+        let digest = digest.to_ascii_lowercase();
+        let file = directory.open_required(&name, false)?;
+        if hash_file(&file)? != digest {
+            return Err(format!(
+                "detached sidecar digest mismatch at {}",
+                path.display()
+            ));
         }
-        Err(e) => {
-            let _ = std::fs::remove_file(&merged);
-            Err(e.to_string())
+        if detached
+            .replace(vaultr::vault::DetachedGeneration {
+                path,
+                base_len,
+                digest,
+            })
+            .is_some()
+        {
+            return Err(format!(
+                "multiple detached sidecar generations under {}",
+                directory_path.display()
+            ));
+        }
+    }
+    if detached.is_some() {
+        return Ok(detached);
+    }
+
+    let Some(source) = directory.open_optional(raw_name, true)? else {
+        return Ok(None);
+    };
+    let base_len = directory
+        .open_optional(dest_name, false)?
+        .map(|file| file.metadata())
+        .transpose()
+        .map_err(|error| format!("inspect sealed sidecar {}: {error}", dest.display()))?
+        .map_or(0, |metadata| metadata.len());
+    let digest = hash_file(&source)?;
+    let detached_name = format!("{raw_name}.sealing-{base_len}-{digest}");
+    directory.replace_entry(raw_name, &detached_name, &source, None)?;
+    let path = directory_path.join(detached_name);
+    Ok(Some(vaultr::vault::DetachedGeneration {
+        path,
+        base_len,
+        digest,
+    }))
+}
+
+pub(crate) fn detach_capture_generation(
+    directory_path: &Path,
+) -> Result<vaultr::vault::DetachedGeneration, String> {
+    let directory = AnchoredDirectory::open(directory_path)?;
+    directory.lock_exclusive()?;
+    let (source, hits) = scrub_entry(&directory, "turns.jsonl")?;
+    print_scrub(&directory_path.join("turns.jsonl"), hits);
+    let base_len = directory
+        .open_optional("turns.jsonl.zst", false)?
+        .map(|file| file.metadata())
+        .transpose()
+        .map_err(|error| {
+            format!(
+                "inspect sealed generation under {}: {error}",
+                directory_path.display()
+            )
+        })?
+        .map_or(0, |metadata| metadata.len());
+    let digest = hash_file(&source)?;
+    let detached_name = format!("turns.jsonl.sealing-{base_len}-{digest}");
+    directory.replace_entry("turns.jsonl", &detached_name, &source, None)?;
+    Ok(vaultr::vault::DetachedGeneration {
+        path: directory_path.join(detached_name),
+        base_len,
+        digest,
+    })
+}
+
+async fn wait_for_compressor(
+    child: &mut tokio::process::Child,
+    timeout: Duration,
+) -> Result<std::process::ExitStatus, String> {
+    match tokio::time::timeout(timeout, child.wait()).await {
+        Ok(Ok(status)) => Ok(status),
+        Ok(Err(error)) => {
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            Err(format!("wait for zstd: {error}"))
+        }
+        Err(_) => {
+            let kill_error = child.start_kill().err();
+            let reap = child.wait().await;
+            match (kill_error, reap) {
+                (_, Ok(_)) => Err("zstd timed out; killed and reaped".into()),
+                (Some(kill), Err(wait)) => Err(format!(
+                    "zstd timed out; kill failed: {kill}; reap failed: {wait}"
+                )),
+                (None, Err(wait)) => Err(format!("zstd timed out; reap failed: {wait}")),
+            }
         }
     }
 }
 
-fn suffix_matches(path: &Path, offset: u64, suffix: &Path) -> Result<bool, String> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file =
-        std::fs::File::open(path).map_err(|e| format!("open {}: {e}", path.display()))?;
-    file.seek(SeekFrom::Start(offset))
-        .map_err(|e| format!("seek {}: {e}", path.display()))?;
-    let mut expected =
-        std::fs::File::open(suffix).map_err(|e| format!("open {}: {e}", suffix.display()))?;
-    let mut left = [0u8; 64 * 1024];
-    let mut right = [0u8; 64 * 1024];
-    loop {
-        let a = file
-            .read(&mut left)
-            .map_err(|e| format!("read {}: {e}", path.display()))?;
-        let b = expected
-            .read(&mut right)
-            .map_err(|e| format!("read {}: {e}", suffix.display()))?;
-        if a != b || left[..a] != right[..b] {
-            return Ok(false);
-        }
-        if a == 0 {
-            return Ok(true);
+async fn compress_frame_with_timeout(
+    source: &File,
+    frame: &File,
+    timeout: Duration,
+) -> Result<(), String> {
+    use tokio::io::AsyncReadExt;
+
+    let source_len = source
+        .metadata()
+        .map_err(|error| format!("inspect detached generation: {error}"))?
+        .len();
+    frame
+        .set_len(0)
+        .map_err(|error| format!("truncate compression temp: {error}"))?;
+    let input = clone_at_start(source)?;
+    let output = clone_at_start(frame)?;
+    let stream_size = format!("--stream-size={source_len}");
+    let mut command = tokio::process::Command::new("zstd");
+    command
+        .args(["-19", "-T0", "-q", "-c", &stream_size])
+        .env("PATH", augmented_path())
+        .stdin(Stdio::from(input))
+        .stdout(Stdio::from(output))
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("spawn zstd: {error}"))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| "capture zstd stderr unavailable".to_string())?;
+    let (status, stderr) = tokio::join!(wait_for_compressor(&mut child, timeout), async move {
+        let mut bytes = Vec::new();
+        stderr
+            .read_to_end(&mut bytes)
+            .await
+            .map(|_| bytes)
+            .map_err(|error| format!("read zstd stderr: {error}"))
+    });
+    let status = status?;
+    let stderr = stderr?;
+    if !status.success() {
+        let stderr: String = String::from_utf8_lossy(&stderr)
+            .trim()
+            .chars()
+            .take(200)
+            .collect();
+        return Err(if stderr.is_empty() {
+            format!("zstd exit {status}")
+        } else {
+            format!("zstd exit {status}: {stderr}")
+        });
+    }
+    frame
+        .sync_all()
+        .map_err(|error| format!("sync compression temp: {error}"))
+}
+
+async fn compress_frame(source: &File, frame: &File) -> Result<(), String> {
+    compress_frame_with_timeout(source, frame, Duration::from_secs(600)).await
+}
+
+#[derive(Clone, Copy)]
+enum FrameCompressor {
+    Zstd,
+    #[cfg(test)]
+    CorruptSuccess,
+}
+
+async fn write_frame(
+    compressor: FrameCompressor,
+    source: &File,
+    frame: &File,
+) -> Result<(), String> {
+    match compressor {
+        FrameCompressor::Zstd => compress_frame(source, frame).await,
+        #[cfg(test)]
+        FrameCompressor::CorruptSuccess => {
+            let mut output = clone_at_start(frame)?;
+            output
+                .write_all(b"not a zstd frame")
+                .and_then(|_| output.flush())
+                .map_err(|error| format!("write corrupt-success fixture: {error}"))?;
+            frame
+                .sync_all()
+                .map_err(|error| format!("sync corrupt-success fixture: {error}"))
         }
     }
 }
 
 /// Commit one immutable detached generation exactly once. The filename records
-/// the sealed destination length at detach time; a retry after the destination
-/// rename verifies the regenerated frame at that exact offset before cleanup.
-async fn seal_detached(generation: &vaultr::vault::DetachedGeneration) -> Result<PathBuf, String> {
-    let raw_mtime = std::fs::metadata(&generation.path)
-        .and_then(|m| m.modified())
-        .map_err(|e| format!("stat {}: {e}", generation.path.display()))?;
-    let dest = generation.path.with_file_name("turns.jsonl.zst");
-    let frame = generation.path.with_file_name("turns.jsonl.frame-tmp");
-    let raw_s = generation.path.display().to_string();
-    let frame_s = frame.display().to_string();
-    let zstd = run(
-        &["zstd", "-19", "-T0", "-q", "-f", "-o", &frame_s, &raw_s],
-        Duration::from_secs(600),
-    )
-    .await;
-    if !zstd.ok {
-        let _ = std::fs::remove_file(&frame);
-        return Err(zstd.failure_detail());
-    }
-    let frame_len = std::fs::metadata(&frame)
-        .map(|meta| meta.len())
-        .map_err(|e| format!("stat {}: {e}", frame.display()))?;
-    let dest_len = match std::fs::metadata(&dest) {
-        Ok(meta) => meta.len(),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
-        Err(e) => return Err(format!("stat {}: {e}", dest.display())),
-    };
+/// the sealed destination length at detach time; cleanup requires the canonical
+/// decoded suffix digest proof, independent of compressed frame representation.
+async fn seal_generation(
+    generation: &vaultr::vault::DetachedGeneration,
+    dest: &Path,
+) -> Result<PathBuf, String> {
+    seal_generation_with(generation, dest, FrameCompressor::Zstd).await
+}
 
-    let result = if dest_len == generation.base_len {
-        let merged = generation.path.with_file_name("turns.jsonl.zst-tmp");
-        let assembled = (|| -> std::io::Result<()> {
-            let mut out = std::fs::File::create(&merged)?;
-            if generation.base_len > 0 {
-                std::io::copy(&mut std::fs::File::open(&dest)?, &mut out)?;
-            }
-            std::io::copy(&mut std::fs::File::open(&frame)?, &mut out)?;
-            out.sync_all()?;
-            std::fs::rename(&merged, &dest)
-        })();
-        if let Err(e) = assembled {
-            let _ = std::fs::remove_file(&merged);
-            Err(e.to_string())
-        } else {
-            Ok(())
-        }
-    } else if dest_len == generation.base_len + frame_len
-        && suffix_matches(&dest, generation.base_len, &frame)?
-    {
-        Ok(())
-    } else {
-        Err(format!(
-            "sealed destination conflicts with detached generation at {}",
-            dest.display()
-        ))
-    };
-    let _ = std::fs::remove_file(&frame);
-    result?;
-    std::fs::OpenOptions::new()
-        .append(true)
-        .open(&dest)
-        .and_then(|file| file.set_modified(raw_mtime))
-        .map_err(|e| format!("set mtime {}: {e}", dest.display()))?;
-    std::fs::remove_file(&generation.path).map_err(|e| {
+async fn seal_generation_with(
+    generation: &vaultr::vault::DetachedGeneration,
+    dest: &Path,
+    compressor: FrameCompressor,
+) -> Result<PathBuf, String> {
+    let directory_path = generation.path.parent().ok_or_else(|| {
         format!(
-            "remove detached generation {}: {e}",
+            "detached generation has no directory at {}",
             generation.path.display()
         )
     })?;
-    Ok(dest)
+    if dest.parent() != Some(directory_path) {
+        return Err(format!(
+            "sealed destination leaves session directory at {}",
+            dest.display()
+        ));
+    }
+    let source_name = generation
+        .path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            format!(
+                "invalid detached generation name at {}",
+                generation.path.display()
+            )
+        })?;
+    let dest_name = dest
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("invalid sealed generation name at {}", dest.display()))?;
+    let directory = AnchoredDirectory::open(directory_path)?;
+    directory.lock_exclusive()?;
+    let source = directory.open_required(source_name, true)?;
+    source.sync_all().map_err(|error| {
+        format!(
+            "sync detached generation {}: {error}",
+            generation.path.display()
+        )
+    })?;
+    if hash_file(&source)? != generation.digest {
+        return Err(format!(
+            "detached generation digest mismatch at {}",
+            generation.path.display()
+        ));
+    }
+    let raw_mtime = source
+        .metadata()
+        .and_then(|metadata| metadata.modified())
+        .map_err(|error| {
+            format!(
+                "inspect detached generation {}: {error}",
+                generation.path.display()
+            )
+        })?;
+    // These four deterministic sealing names, plus turns.scrub-tmp above, are
+    // the complete temp vocabulary of the immediately preceding release. They
+    // are migration evidence, not a new generation classifier.
+    let legacy_temps: &[&str] = match dest_name {
+        "turns.jsonl.zst" => &["turns.jsonl.frame-tmp", "turns.jsonl.zst-tmp"],
+        "herdr.jsonl.zst" => &["herdr.jsonl.frame-tmp", "herdr.jsonl.zst-tmp"],
+        _ => &[],
+    };
+    directory.cleanup_temps(dest_name, &["frame", "merged"], legacy_temps)?;
+    let destination = directory.open_optional(dest_name, false)?;
+    let dest_len = destination
+        .as_ref()
+        .map(|file| file.metadata())
+        .transpose()
+        .map_err(|error| format!("inspect sealed destination {}: {error}", dest.display()))?
+        .map_or(0, |metadata| metadata.len());
+    let committed = if dest_len > generation.base_len {
+        destination.expect("positive destination length")
+    } else if dest_len == generation.base_len {
+        let (frame_name, frame) = directory.create_temp(dest_name, "frame")?;
+        if let Err(error) = write_frame(compressor, &source, &frame).await {
+            let _ = directory.unlink_if_same(&frame_name, &frame);
+            return Err(error);
+        }
+        let (merged_name, merged) = match directory.create_temp(dest_name, "merged") {
+            Ok(merged) => merged,
+            Err(error) => {
+                let _ = directory.unlink_if_same(&frame_name, &frame);
+                return Err(error);
+            }
+        };
+        let assembled = (|| -> Result<(), String> {
+            let mut output = clone_at_start(&merged)?;
+            if let Some(destination) = &destination {
+                std::io::copy(&mut clone_at_start(destination)?, &mut output)
+                    .map_err(|error| format!("copy sealed generation: {error}"))?;
+            }
+            std::io::copy(&mut clone_at_start(&frame)?, &mut output)
+                .map_err(|error| format!("copy compressed generation: {error}"))?;
+            output
+                .flush()
+                .map_err(|error| format!("flush merged generation: {error}"))?;
+            merged
+                .sync_all()
+                .map_err(|error| format!("sync merged generation: {error}"))
+        })();
+        if let Err(error) = assembled {
+            let _ = directory.unlink_if_same(&merged_name, &merged);
+            let _ = directory.unlink_if_same(&frame_name, &frame);
+            return Err(error);
+        }
+        let renamed =
+            directory.replace_entry(&merged_name, dest_name, &merged, destination.as_ref());
+        if renamed.is_err() {
+            let _ = directory.unlink_if_same(&merged_name, &merged);
+        }
+        let frame_cleanup = directory.unlink_if_same(&frame_name, &frame);
+        let committed = renamed?;
+        frame_cleanup?;
+        committed
+    } else {
+        return Err(format!(
+            "sealed destination conflicts with detached generation at {}",
+            dest.display()
+        ));
+    };
+    let decoded_digest =
+        vaultr::vault::decoded_zstd_suffix_digest(clone_at_start(&committed)?, generation.base_len)
+            .map_err(|_| format!("sealed destination suffix is invalid at {}", dest.display()))?;
+    if decoded_digest != generation.digest {
+        return Err(format!(
+            "sealed destination conflicts with detached generation at {}",
+            dest.display()
+        ));
+    }
+    committed
+        .set_modified(raw_mtime)
+        .map_err(|error| format!("set mtime {}: {error}", dest.display()))?;
+    committed
+        .sync_all()
+        .map_err(|error| format!("sync sealed destination {}: {error}", dest.display()))?;
+    if !directory.entry_matches(dest_name, &committed)? {
+        return Err(format!(
+            "sealed destination changed before detached cleanup at {}",
+            dest.display()
+        ));
+    }
+    directory.sync()?;
+    directory.unlink_if_same(source_name, &source)?;
+    Ok(dest.to_path_buf())
 }
 
 /// Sealed captures above this stay on disk but out of git: a 2.7GB .zst blob turned
@@ -781,6 +1375,7 @@ pub async fn compress_sweep(vault: &Path, idle: Duration) -> Result<(), String> 
     let claude = ledger_latest(vault, "claude");
     let codex = ledger_latest(vault, "codex");
     let jobs = job_sids();
+    let root = crate::capture::canonical_root(vault);
     let mut sealed = 0u32;
     for selected in pending_generations(vault)? {
         if !selected.ready_to_seal(&claude, &codex, &jobs, idle) {
@@ -797,12 +1392,19 @@ pub async fn compress_sweep(vault: &Path, idle: Duration) -> Result<(), String> 
             .map(|m| m.len())
             .unwrap_or(0);
         let herdr = generation.path.with_file_name("herdr.jsonl");
-        if herdr.is_file() {
-            if let Err(e) = seal_file(&herdr).await {
+        let herdr_dest = generation.path.with_file_name("herdr.jsonl.zst");
+        let herdr_generation = {
+            let lock = crate::capture::session_lock(&root, sid);
+            let _guard = lock.lock().await;
+            detach_sidecar(&herdr, &herdr_dest)?
+        };
+        if let Some(herdr_generation) = herdr_generation {
+            if let Err(e) = seal_generation(&herdr_generation, &herdr_dest).await {
                 return Err(format!("seal {sid} herdr.jsonl: {e}"));
             }
         }
-        match seal_detached(&generation).await {
+        let capture_dest = generation.path.with_file_name("turns.jsonl.zst");
+        match seal_generation(&generation, &capture_dest).await {
             Ok(sealed_path) => {
                 sealed += 1;
                 let after = std::fs::metadata(&sealed_path)
@@ -1343,10 +1945,407 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
-    /// Sealing a resumed session appends a second zstd frame; zstd -d reads the
+    #[cfg(unix)]
+    #[test]
+    fn anchored_detach_and_cleanup_reject_preoperation_entry_swaps() {
+        use std::os::unix::fs::symlink;
+
+        let root =
+            std::env::temp_dir().join(format!("plant-anchored-swap-{}", uuid::Uuid::new_v4()));
+        let session = root.join("session");
+        std::fs::create_dir_all(&session).unwrap();
+        let outside = root.join("outside");
+        std::fs::write(&outside, b"outside evidence\n").unwrap();
+        let outside_before = std::fs::read(&outside).unwrap();
+        let directory = AnchoredDirectory::open(&session).unwrap();
+
+        let raw_name = "turns.jsonl";
+        std::fs::write(session.join(raw_name), b"capture evidence\n").unwrap();
+        let raw = directory.open_required(raw_name, true).unwrap();
+        std::fs::rename(session.join(raw_name), session.join("retained-turns")).unwrap();
+        symlink(&outside, session.join(raw_name)).unwrap();
+
+        assert!(directory
+            .replace_entry(raw_name, "turns.jsonl.sealing-0-deadbeef", &raw, None)
+            .is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), outside_before);
+        assert!(!session.join("turns.jsonl.sealing-0-deadbeef").exists());
+
+        let detached_name = "herdr.jsonl.sealing-0-deadbeef";
+        std::fs::write(session.join(detached_name), b"herdr evidence\n").unwrap();
+        let detached = directory.open_required(detached_name, false).unwrap();
+        std::fs::rename(session.join(detached_name), session.join("retained-herdr")).unwrap();
+        symlink(&outside, session.join(detached_name)).unwrap();
+
+        assert!(directory.unlink_if_same(detached_name, &detached).is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), outside_before);
+        assert!(std::fs::symlink_metadata(session.join(detached_name))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_flock_serializes_independent_directory_owners() {
+        let root =
+            std::env::temp_dir().join(format!("plant-session-lock-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let first = AnchoredDirectory::open(&root).unwrap();
+        let second = AnchoredDirectory::open(&root).unwrap();
+        first.lock_exclusive().unwrap();
+
+        // A separate open file description is the same boundary another
+        // cooperating process obtains. It cannot enter while `first` is held.
+        // SAFETY: `second` retains its valid directory fd for this call.
+        assert_ne!(
+            unsafe { libc::flock(second.file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB,) },
+            0
+        );
+        assert!(matches!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EAGAIN)
+        ));
+
+        drop(first);
+        // SAFETY: `second` still retains its valid directory fd.
+        assert_eq!(
+            unsafe { libc::flock(second.file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB,) },
+            0
+        );
+        drop(second);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn detachment_rejects_symlinked_capture_and_sidecar_sources() {
+        use std::os::unix::fs::symlink;
+
+        let root =
+            std::env::temp_dir().join(format!("plant-detach-symlink-{}", uuid::Uuid::new_v4()));
+        let session = root.join("session");
+        std::fs::create_dir_all(&session).unwrap();
+        let outside = root.join("outside");
+        std::fs::write(&outside, b"outside evidence\n").unwrap();
+        let outside_before = std::fs::read(&outside).unwrap();
+
+        symlink(&outside, session.join("turns.jsonl")).unwrap();
+        assert!(detach_capture_generation(&session).is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), outside_before);
+        assert!(!std::fs::read_dir(&session)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().to_str().map(String::from))
+            .any(|name| name.starts_with("turns.jsonl.sealing-")));
+
+        std::fs::remove_file(session.join("turns.jsonl")).unwrap();
+        let herdr = session.join("herdr.jsonl");
+        let herdr_dest = session.join("herdr.jsonl.zst");
+        symlink(&outside, &herdr).unwrap();
+        assert!(detach_sidecar(&herdr, &herdr_dest).is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), outside_before);
+        assert!(!std::fs::read_dir(&session)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter_map(|entry| entry.file_name().to_str().map(String::from))
+            .any(|name| name.starts_with("herdr.jsonl.sealing-")));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sealing_rejects_symlinked_source_and_destination_without_mutating_targets() {
+        use std::os::unix::fs::symlink;
+
+        if !which("zstd") {
+            eprintln!("zstd not on PATH; skipping");
+            return;
+        }
+        let root =
+            std::env::temp_dir().join(format!("plant-seal-symlink-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let source = root.join("turns.jsonl.sealing-0-source");
+        let destination = root.join("turns.jsonl.zst");
+        let outside_source = root.join("outside-source");
+        let outside_destination = root.join("outside-destination");
+        std::fs::write(&outside_source, b"outside source\n").unwrap();
+        std::fs::write(&outside_destination, b"outside destination\n").unwrap();
+        let source_before = std::fs::read(&outside_source).unwrap();
+        let destination_before = std::fs::read(&outside_destination).unwrap();
+        symlink(&outside_source, &source).unwrap();
+        let generation = vaultr::vault::DetachedGeneration {
+            path: source.clone(),
+            base_len: 0,
+            digest: vaultr::vault::sha256_file(&outside_source).unwrap(),
+        };
+
+        assert!(seal_generation(&generation, &destination).await.is_err());
+        assert_eq!(std::fs::read(&outside_source).unwrap(), source_before);
+        assert!(!destination.exists());
+
+        std::fs::remove_file(&source).unwrap();
+        std::fs::write(&source, b"detached evidence\n").unwrap();
+        symlink(&outside_destination, &destination).unwrap();
+        let generation = vaultr::vault::DetachedGeneration {
+            path: source.clone(),
+            base_len: 0,
+            digest: vaultr::vault::sha256_file(&source).unwrap(),
+        };
+
+        assert!(seal_generation(&generation, &destination).await.is_err());
+        assert_eq!(
+            std::fs::read(&outside_destination).unwrap(),
+            destination_before
+        );
+        assert_eq!(std::fs::read(&source).unwrap(), b"detached evidence\n");
+        assert!(
+            std::fs::read_dir(&root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter_map(|entry| entry.file_name().to_str().map(String::from))
+                .all(|name| !name.contains(".frame-") && !name.contains(".merged-")),
+            "failed sealing removes only its descriptor-owned temps"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sealing_restart_cleans_only_exact_temp_debris_and_rejects_near_misses() {
+        if !which("zstd") {
+            eprintln!("zstd not on PATH; skipping");
+            return;
+        }
+        let root =
+            std::env::temp_dir().join(format!("plant-seal-temp-recovery-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let capture_bytes = b"capture generation\n";
+        let capture_digest = vaultr::vault::sha256_hex(capture_bytes);
+        let capture_source = root.join(format!("turns.jsonl.sealing-0-{capture_digest}"));
+        let capture_destination = root.join("turns.jsonl.zst");
+        std::fs::write(&capture_source, capture_bytes).unwrap();
+        let exact_frame = root.join(format!(".turns.jsonl.zst.frame-{}", uuid::Uuid::new_v4()));
+        let exact_merged = root.join(format!(".turns.jsonl.zst.merged-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&exact_frame, b"partial compressed debris").unwrap();
+        std::fs::write(&exact_merged, b"partial merged debris").unwrap();
+        let capture = vaultr::vault::DetachedGeneration {
+            path: capture_source,
+            base_len: 0,
+            digest: capture_digest,
+        };
+
+        seal_generation(&capture, &capture_destination)
+            .await
+            .unwrap();
+
+        assert!(!exact_frame.exists());
+        assert!(!exact_merged.exists());
+        assert_eq!(
+            zstd::decode_all(std::fs::File::open(&capture_destination).unwrap()).unwrap(),
+            capture_bytes
+        );
+
+        let herdr_bytes = b"herdr generation\n";
+        let herdr_digest = vaultr::vault::sha256_hex(herdr_bytes);
+        let herdr_source = root.join(format!("herdr.jsonl.sealing-0-{herdr_digest}"));
+        let herdr_destination = root.join("herdr.jsonl.zst");
+        std::fs::write(&herdr_source, herdr_bytes).unwrap();
+        let near_miss = root.join(".herdr.jsonl.zst.frame-not-a-canonical-v4-uuid");
+        let near_miss_bytes = b"unrecognized evidence";
+        std::fs::write(&near_miss, near_miss_bytes).unwrap();
+        let herdr = vaultr::vault::DetachedGeneration {
+            path: herdr_source.clone(),
+            base_len: 0,
+            digest: herdr_digest,
+        };
+
+        assert!(seal_generation(&herdr, &herdr_destination).await.is_err());
+
+        assert_eq!(std::fs::read(&near_miss).unwrap(), near_miss_bytes);
+        assert_eq!(std::fs::read(&herdr_source).unwrap(), herdr_bytes);
+        assert!(!herdr_destination.exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn legacy_temp_upgrade_removes_only_enumerated_regular_debris() {
+        if !which("zstd") {
+            eprintln!("zstd not on PATH; skipping");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("plant-legacy-temp-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+
+        let turns = root.join("turns.jsonl");
+        std::fs::write(&turns, b"capture generation\n").unwrap();
+        std::fs::write(root.join("turns.scrub-tmp"), b"partial scrub debris").unwrap();
+        assert!(scrub(&turns).await);
+        assert!(!root.join("turns.scrub-tmp").exists());
+
+        let capture = detach_capture_generation(&root).unwrap();
+        for name in ["turns.jsonl.frame-tmp", "turns.jsonl.zst-tmp"] {
+            std::fs::write(root.join(name), b"partial capture seal debris").unwrap();
+        }
+        seal_generation(&capture, &root.join("turns.jsonl.zst"))
+            .await
+            .unwrap();
+        assert!(!root.join("turns.jsonl.frame-tmp").exists());
+        assert!(!root.join("turns.jsonl.zst-tmp").exists());
+
+        let herdr = root.join("herdr.jsonl");
+        let herdr_dest = root.join("herdr.jsonl.zst");
+        std::fs::write(&herdr, b"sidecar generation\n").unwrap();
+        let herdr_generation = detach_sidecar(&herdr, &herdr_dest).unwrap().unwrap();
+        for name in ["herdr.jsonl.frame-tmp", "herdr.jsonl.zst-tmp"] {
+            std::fs::write(root.join(name), b"partial sidecar seal debris").unwrap();
+        }
+        seal_generation(&herdr_generation, &herdr_dest)
+            .await
+            .unwrap();
+        assert!(!root.join("herdr.jsonl.frame-tmp").exists());
+        assert!(!root.join("herdr.jsonl.zst-tmp").exists());
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_temp_upgrade_rejects_symlink_nonregular_and_near_miss_evidence() {
+        use std::os::unix::fs::symlink;
+
+        let legacy = &["turns.jsonl.frame-tmp", "turns.jsonl.zst-tmp"];
+        for case in ["symlink", "directory", "near-miss"] {
+            let root = std::env::temp_dir()
+                .join(format!("plant-legacy-temp-{case}-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let retained = root.join("turns.jsonl.zst-tmp");
+            std::fs::write(&retained, b"exact regular evidence").unwrap();
+            let outside = root.with_extension(format!("{case}-outside"));
+            std::fs::write(&outside, b"outside evidence").unwrap();
+            let outside_before = std::fs::read(&outside).unwrap();
+            let suspect = match case {
+                "symlink" => {
+                    let path = root.join("turns.jsonl.frame-tmp");
+                    symlink(&outside, &path).unwrap();
+                    path
+                }
+                "directory" => {
+                    let path = root.join("turns.jsonl.frame-tmp");
+                    std::fs::create_dir(&path).unwrap();
+                    path
+                }
+                "near-miss" => {
+                    let path = root.join("turns.jsonl.frame-tm");
+                    std::fs::write(&path, b"near-miss evidence").unwrap();
+                    path
+                }
+                _ => unreachable!(),
+            };
+            let directory = AnchoredDirectory::open(&root).unwrap();
+            directory.lock_exclusive().unwrap();
+            assert!(directory
+                .cleanup_temps("turns.jsonl.zst", &["frame", "merged"], legacy)
+                .is_err());
+            assert!(std::fs::symlink_metadata(&suspect).is_ok());
+            assert_eq!(std::fs::read(&retained).unwrap(), b"exact regular evidence");
+            assert_eq!(std::fs::read(&outside).unwrap(), outside_before);
+            drop(directory);
+            let _ = std::fs::remove_dir_all(root);
+            let _ = std::fs::remove_file(outside);
+        }
+    }
+
+    #[tokio::test]
+    async fn corrupt_successful_compression_never_retires_detached_evidence() {
+        let root =
+            std::env::temp_dir().join(format!("plant-corrupt-compressor-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let body = b"sole detached evidence\n";
+        let digest = vaultr::vault::sha256_hex(body);
+        let source = root.join(format!("turns.jsonl.sealing-0-{digest}"));
+        let destination = root.join("turns.jsonl.zst");
+        std::fs::write(&source, body).unwrap();
+        let generation = vaultr::vault::DetachedGeneration {
+            path: source.clone(),
+            base_len: 0,
+            digest,
+        };
+
+        let error =
+            seal_generation_with(&generation, &destination, FrameCompressor::CorruptSuccess)
+                .await
+                .unwrap_err();
+
+        assert!(error.contains(&destination.display().to_string()));
+        assert!(!error.contains("sole detached evidence"));
+        assert_eq!(std::fs::read(&source).unwrap(), body);
+        assert!(destination.exists(), "bad commit remains diagnosable");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn sealing_retry_accepts_a_different_valid_frame_representation() {
+        let root = std::env::temp_dir().join(format!("plant-valid-frame-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let base = zstd::encode_all("prior generation\n".as_bytes(), 7).unwrap();
+        let body = b"detached generation\n";
+        let digest = vaultr::vault::sha256_hex(body);
+        let source = root.join(format!("turns.jsonl.sealing-{}-{digest}", base.len()));
+        let destination = root.join("turns.jsonl.zst");
+        std::fs::write(&source, body).unwrap();
+        let mut committed = base.clone();
+        committed.extend(zstd::encode_all(body.as_slice(), 1).unwrap());
+        std::fs::write(&destination, &committed).unwrap();
+        std::fs::File::open(&destination)
+            .unwrap()
+            .sync_all()
+            .unwrap();
+        AnchoredDirectory::open(&root).unwrap().sync().unwrap();
+        let generation = vaultr::vault::DetachedGeneration {
+            path: source.clone(),
+            base_len: base.len() as u64,
+            digest,
+        };
+
+        seal_generation(&generation, &destination).await.unwrap();
+
+        assert!(!source.exists());
+        assert_eq!(std::fs::read(&destination).unwrap(), committed);
+        assert_eq!(
+            zstd::decode_all(std::fs::File::open(&destination).unwrap()).unwrap(),
+            b"prior generation\ndetached generation\n"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn compressor_timeout_kills_and_reaps_the_child() {
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap() as libc::pid_t;
+
+        let error = wait_for_compressor(&mut child, Duration::from_millis(20))
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("killed and reaped"), "{error}");
+        assert!(child.id().is_none(), "wait retained an unreaped child");
+        // SAFETY: signal 0 performs no mutation and only probes the former pid.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+    }
+
+    /// Sealing a resumed sidecar appends a second zstd frame; zstd -d reads the
     /// concatenation back as gen1 + gen2. Requires zstd on PATH (skips otherwise).
     #[tokio::test]
-    async fn seal_file_appends_frames_for_resumed_sessions() {
+    async fn detached_sidecar_appends_frames_for_resumed_sessions() {
         if !which("zstd") {
             eprintln!("zstd not on PATH; skipping");
             return;
@@ -1354,17 +2353,19 @@ mod tests {
         let root = std::env::temp_dir().join(format!("plant-seal-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let raw = root.join("turns.jsonl");
-        let dest = raw.with_extension("jsonl.zst");
+        let raw = root.join("herdr.jsonl");
+        let dest = root.join("herdr.jsonl.zst");
 
         std::fs::write(&raw, "gen1-line\n").unwrap();
-        seal_file(&raw).await.expect("first seal");
+        let first = detach_sidecar(&raw, &dest).unwrap().unwrap();
+        seal_generation(&first, &dest).await.expect("first seal");
         assert!(!raw.exists(), "raw removed after seal");
         assert!(dest.is_file());
 
         // resume: raw reappears with new content only
         std::fs::write(&raw, "gen2-line\n").unwrap();
-        seal_file(&raw).await.expect("merge seal");
+        let second = detach_sidecar(&raw, &dest).unwrap().unwrap();
+        seal_generation(&second, &dest).await.expect("merge seal");
         assert!(!raw.exists());
 
         let out = std::process::Command::new("zstd")
@@ -1381,7 +2382,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detached_generation_retry_after_destination_rename_is_exactly_once() {
+    async fn detached_generation_retry_after_durable_destination_rename_is_exactly_once() {
         if !which("zstd") {
             eprintln!("zstd not on PATH; skipping");
             return;
@@ -1392,20 +2393,20 @@ mod tests {
         let sid = "detached-generation";
         let dir = vault.join("2026/07/20").join(sid);
         std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("turns.jsonl.zst");
 
         std::fs::write(dir.join("turns.jsonl"), "generation-one\n").unwrap();
         let first = crate::capture::detach_generation(&vault, sid, &dir)
             .await
             .unwrap()
             .unwrap();
-        seal_detached(&first).await.unwrap();
+        seal_generation(&first, &dest).await.unwrap();
 
         std::fs::write(dir.join("turns.jsonl"), "generation-two\n").unwrap();
         let second = crate::capture::detach_generation(&vault, sid, &dir)
             .await
             .unwrap()
             .unwrap();
-        let dest = dir.join("turns.jsonl.zst");
         let frame = dir.join("manual-frame.zst");
         let result = run(
             &[
@@ -1435,8 +2436,11 @@ mod tests {
             out.sync_all().unwrap();
         }
         std::fs::rename(&merged, &dest).unwrap();
+        // Fault boundary: the committed destination name is directory-durable,
+        // but retained detached evidence has not been removed.
+        AnchoredDirectory::open(&dir).unwrap().sync().unwrap();
 
-        seal_detached(&second).await.unwrap();
+        seal_generation(&second, &dest).await.unwrap();
         assert!(!second.path.exists(), "committed transaction cleaned");
         let decoded = zstd::decode_all(std::fs::File::open(&dest).unwrap()).unwrap();
         assert_eq!(
@@ -1444,6 +2448,72 @@ mod tests {
             "generation-one\ngeneration-two\n"
         );
 
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn herdr_retry_after_durable_destination_rename_is_byte_exactly_once() {
+        if !which("zstd") {
+            eprintln!("zstd not on PATH; skipping");
+            return;
+        }
+        let root = std::env::temp_dir().join(format!("plant-herdr-seal-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let raw = root.join("herdr.jsonl");
+        let dest = root.join("herdr.jsonl.zst");
+
+        std::fs::write(&raw, "generation-one\n").unwrap();
+        let first = detach_sidecar(&raw, &dest).unwrap().unwrap();
+        seal_generation(&first, &dest).await.unwrap();
+
+        std::fs::write(&raw, "generation-two\n").unwrap();
+        let second = detach_sidecar(&raw, &dest).unwrap().unwrap();
+        let frame = root.join("manual-herdr-frame.zst");
+        let result = run(
+            &[
+                "zstd",
+                "-19",
+                "-T0",
+                "-q",
+                "-f",
+                "-o",
+                frame.to_str().unwrap(),
+                second.path.to_str().unwrap(),
+            ],
+            Duration::from_secs(60),
+        )
+        .await;
+        assert!(
+            result.ok,
+            "fixture compression: {}",
+            result.failure_detail()
+        );
+        let merged = root.join("manual-herdr-merged.zst");
+        {
+            use std::io::Write;
+            let mut out = std::fs::File::create(&merged).unwrap();
+            out.write_all(&std::fs::read(&dest).unwrap()).unwrap();
+            out.write_all(&std::fs::read(&frame).unwrap()).unwrap();
+            out.sync_all().unwrap();
+        }
+        std::fs::rename(&merged, &dest).unwrap();
+        // Fault boundary: the committed destination name is directory-durable,
+        // but retained detached evidence has not been removed.
+        AnchoredDirectory::open(&root).unwrap().sync().unwrap();
+        let committed = std::fs::read(&dest).unwrap();
+
+        seal_generation(&second, &dest).await.unwrap();
+
+        assert!(
+            !second.path.exists(),
+            "retry only cleaned detached evidence"
+        );
+        assert_eq!(std::fs::read(&dest).unwrap(), committed);
+        let decoded = zstd::decode_all(std::fs::File::open(&dest).unwrap()).unwrap();
+        assert_eq!(
+            String::from_utf8(decoded).unwrap(),
+            "generation-one\ngeneration-two\n"
+        );
         let _ = std::fs::remove_dir_all(root);
     }
 

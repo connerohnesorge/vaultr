@@ -14,7 +14,7 @@ use std::time::SystemTime;
 use vaultr::recon;
 use vaultr::vault::{dated_session_dir, Meta};
 
-pub(crate) use persistence::{canonical_root, detach_generation, recover_all};
+pub(crate) use persistence::{canonical_root, detach_generation, recover_all, session_lock};
 
 pub struct CapturedRequest {
     pub method: String,
@@ -747,6 +747,79 @@ mod tests {
             !has_open_capture(&vault, &sid),
             "journal drained, staging cleared"
         );
+    }
+
+    #[tokio::test]
+    async fn recovery_removes_atomic_stage_temps_and_materializes_once() {
+        let (_g, vault) = set_home();
+        for complete in [true, false] {
+            let adapter = claude_adapter();
+            let sid = uuid::Uuid::new_v4().to_string();
+            let pending =
+                prepare_capture(&vault, &adapter, captured(Some(&sid)), body(&["pending"]))
+                    .await
+                    .unwrap();
+            let request_id = pending.request_part["request_id"].as_str().unwrap();
+            let path = staging_dir(&pending.root, &sid).join(format!(
+                "{}-{request_id}.tmp-{}",
+                pending.sequence,
+                uuid::Uuid::new_v4()
+            ));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let bytes = if complete {
+                let mut envelope = pending.request_part.clone();
+                envelope
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("response".into(), json!({"complete": true}));
+                serde_json::to_vec(&json!({
+                    "root": pending.root,
+                    "sequence": pending.sequence,
+                    "request_id": request_id,
+                    "envelope": envelope,
+                }))
+                .unwrap()
+            } else {
+                b"{\"root\":".to_vec()
+            };
+            fs::write(&path, bytes).unwrap();
+
+            recover_all(&vault).unwrap();
+
+            assert!(!path.exists(), "atomic temp debris removed");
+            let lines = turns_lines(&pending.dir);
+            assert_eq!(lines.len(), 1, "one incomplete Envelope");
+            assert_eq!(lines[0]["request_id"], request_id);
+            assert_eq!(lines[0]["response"]["complete"], json!(false));
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_rejects_near_miss_atomic_stage_temp_names() {
+        let (_g, vault) = set_home();
+        let adapter = claude_adapter();
+        let sid = uuid::Uuid::new_v4().to_string();
+        let pending = prepare_capture(&vault, &adapter, captured(Some(&sid)), body(&["pending"]))
+            .await
+            .unwrap();
+        let request_id = pending.request_part["request_id"].as_str().unwrap();
+        let path = staging_dir(&pending.root, &sid).join(format!(
+            "{}-{request_id}.tmp-{}-extra",
+            pending.sequence,
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"debris").unwrap();
+        let journal_before = fs::read(pending.dir.join("state.json")).unwrap();
+
+        assert!(recover_all(&vault).is_err());
+
+        assert!(path.exists(), "unrecognized evidence remains fail-closed");
+        assert_eq!(
+            fs::read(pending.dir.join("state.json")).unwrap(),
+            journal_before
+        );
+        assert!(turns_lines(&pending.dir).is_empty());
     }
 
     #[tokio::test]

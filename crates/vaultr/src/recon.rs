@@ -5,10 +5,11 @@
 //! final history — the archive is never loaded whole.
 
 use anyhow::{Context, Result};
+use serde::de::DeserializeOwned;
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::io::{BufRead, BufReader, Read};
 use std::path::Path;
 
 use crate::vault::CaptureGenerations;
@@ -98,17 +99,13 @@ pub fn reconstruct(path: &Path) -> Result<Recon> {
                     sealed.display()
                 ),
                 Some(len) if len > detached.base_len => {
-                    let mut suffix = File::open(&sealed)
+                    let suffix = File::open(&sealed)
                         .with_context(|| format!("open {}", sealed.display()))?;
-                    suffix
-                        .seek(SeekFrom::Start(detached.base_len))
-                        .with_context(|| format!("seek {}", sealed.display()))?;
-                    let decoder = zstd::Decoder::new(suffix).with_context(|| {
-                        format!("decode detached suffix at {}", sealed.display())
-                    })?;
-                    let digest = crate::vault::sha256_reader(decoder).with_context(|| {
-                        format!("verify detached suffix at {}", sealed.display())
-                    })?;
+                    let digest =
+                        crate::vault::decoded_zstd_suffix_digest(suffix, detached.base_len)
+                            .with_context(|| {
+                                format!("verify detached suffix at {}", sealed.display())
+                            })?;
                     if digest != detached.digest {
                         anyhow::bail!(
                             "reconstruct: sealed suffix conflicts with detached generation at {}",
@@ -156,6 +153,35 @@ pub fn reconstruct_reader<R: Read>(reader: R) -> Result<Recon> {
 enum Segment {
     Sealed,
     LiveRaw,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct JsonValueRange {
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Decode every complete concatenated JSON value from one physical record.
+/// Ranges are offsets in the supplied reader; `start` includes any whitespace
+/// separator before the value so random-access callers can trim it without
+/// retaining the record.
+pub fn decode_concatenated<R, T>(
+    reader: R,
+    mut visit: impl FnMut(T, JsonValueRange),
+) -> serde_json::Result<()>
+where
+    R: Read,
+    T: DeserializeOwned,
+{
+    let mut stream = serde_json::Deserializer::from_reader(reader).into_iter::<T>();
+    let mut start = 0;
+    while let Some(value) = stream.next() {
+        let value = value?;
+        let end = stream.byte_offset();
+        visit(value, JsonValueRange { start, end });
+        start = end;
+    }
+    Ok(())
 }
 
 impl Segment {
@@ -288,30 +314,14 @@ fn run_segment<R: BufRead>(mut reader: R, segment: Segment, st: &mut ReconState)
             + 1;
         let trimmed = &content[start..stop];
 
-        let mut stream = serde_json::Deserializer::from_slice(trimmed).into_iter::<Value>();
-        let mut consumed = 0usize;
-        loop {
-            match stream.next() {
-                Some(Ok(v)) => {
-                    consumed = stream.byte_offset();
-                    st.apply(&v);
-                }
-                Some(Err(_)) => {
-                    let rest = &trimmed[consumed..];
-                    if !rest.iter().any(|b| !b.is_ascii_whitespace()) {
-                        break; // only trailing whitespace remained
-                    }
-                    // Non-whitespace residue that cannot form a complete Envelope.
-                    if !terminated && segment == Segment::LiveRaw {
-                        break; // one unterminated final fragment on a live tail
-                    }
-                    anyhow::bail!(
-                        "reconstruct: {} record {record_no}: incomplete or malformed JSON",
-                        segment.label()
-                    );
-                }
-                None => break,
+        if decode_concatenated(trimmed, |value: Value, _| st.apply(&value)).is_err() {
+            if !terminated && segment == Segment::LiveRaw {
+                continue; // one unterminated final fragment on a live tail
             }
+            anyhow::bail!(
+                "reconstruct: {} record {record_no}: incomplete or malformed JSON",
+                segment.label()
+            );
         }
     }
     Ok(())

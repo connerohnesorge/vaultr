@@ -44,9 +44,17 @@ evidence MUST fail startup without altering persisted capture bytes. Tail
 reconciliation MUST scan backward independently of the staged record size and
 classify blank, valid terminated, malformed terminated, and unterminated
 evidence. It MUST append after a valid different request, accept a same-request
-record only when byte-exact, and repair only an exact staged prefix. Durability
-under this requirement covers Plant process crashes, not sudden host power
-loss.
+record only when byte-exact, and repair only an exact staged prefix. The
+classifier MUST skip trailing whitespace-only records and fragments, classify
+the file as blank only when every byte is whitespace, and use the same
+bounded-memory concatenated-value decoder as Reconstruction to isolate the final
+complete Envelope without materializing the complete record or a generic JSON
+tree. Every accepted value MUST contain a valid UUID `request_id`, and any
+terminated residue MUST be rejected without mutation. Recovery MUST open the
+raw generation through its retained session-directory descriptor without
+following symlinks and MUST use that same raw descriptor for classification,
+comparison, append, and repair. Durability under this requirement covers Plant
+process crashes, not sudden host power loss.
 
 #### Scenario: Plant restarts with abandoned preparations
 
@@ -113,6 +121,36 @@ loss.
 
 - WHEN the previous complete Envelope is larger than the staged Envelope by an arbitrary amount and has a different request identity
 - THEN reconciliation finds the complete previous record and appends the staged Envelope exactly once
+- AND memory use remains bounded independently of the previous record size
+
+#### Scenario: Legacy final record contains concatenated Envelopes
+
+- WHEN the final terminated physical record contains multiple concatenated valid Envelopes
+- THEN reconciliation isolates the final Envelope identity and exact byte range
+- AND an identical staged Envelope is not appended again
+
+#### Scenario: Whitespace follows the final committed Envelope
+
+- WHEN blank lines, spaces, tabs, or an unterminated whitespace fragment follow an exactly committed staged Envelope
+- THEN reconciliation scans past that whitespace and does not duplicate the Envelope
+- AND a file containing only whitespace accepts the staged Envelope exactly once
+
+#### Scenario: Final JSON value is not a valid Envelope
+
+- WHEN a terminated tail contains an object without `request_id`, `null`, an invalid request UUID, or non-whitespace residue
+- THEN reconciliation rejects the evidence without appending, truncating, retiring the journal entry, or deleting its stage
+
+#### Scenario: Atomic stage-write debris remains
+
+- WHEN exclusive startup recovery finds a regular stage entry named exactly `<sequence>-<request UUID>.tmp-<version-4 temp UUID>`
+- THEN it removes only that atomic-write debris and materializes a pending reservation as exactly one incomplete Envelope
+- AND any near-miss entry name is retained and causes recovery to fail closed
+
+#### Scenario: Raw generation is a symlink
+
+- WHEN the discovered `turns.jsonl` is a symlink to a file outside the retained session directory
+- THEN recovery fails without modifying the target, journal, or stage
+- AND successful reconciliation uses one no-follow raw descriptor from classification through mutation
 
 #### Scenario: Terminated tail is malformed
 
@@ -136,7 +174,20 @@ atomically detach the eligible raw generation so subsequent captures write a
 fresh raw file. The detached generation MUST remain reconstructable and
 digest-identified until its zstd frame is committed exactly once. A retry MUST
 distinguish an uncommitted destination from the exact post-rename,
-pre-detached-removal state. Vaultr MUST provide one validated canonical
+pre-detached-removal state. Herdr snapshot append and detachment MUST use the
+same session mutex, and Herdr generations MUST use the same recorded base-length
+and digest proof before cleanup so a retry cannot duplicate a committed frame.
+Scrubbing, detachment, and Sealing MUST retain one no-follow session-directory
+descriptor and descriptor-opened regular source, destination, and temporary
+files. Every cooperating maintenance process MUST retain an exclusive advisory
+session-directory lock from temp recovery through commit and cleanup. Under that
+single-owner precondition, rename and cleanup MUST verify that each directory
+entry still identifies the retained inode and MUST use directory-relative
+operations that do not follow symlinks. Hostile same-account writers that ignore
+the advisory lock are outside this contract. Source or merged file data and the
+committed destination name MUST be durable before detached evidence is removed,
+and the final removal MUST also be directory-durable.
+Vaultr MUST provide one validated canonical
 generation inventory consumed by Reconstruction, maintenance, and Plant
 Sealing. Plant maintenance MUST retain that inventory in a typed selection with
 an explicit generation kind; learning, pending-Sealing, and decoding decisions
@@ -157,6 +208,52 @@ generation formats MUST remain readable.
 
 - WHEN Plant restarts after detachment, destination rename, or detached-file removal
 - THEN Sealing resumes or recognizes the committed generation without omission or duplication
+
+#### Scenario: Herdr destination rename completes before raw cleanup
+
+- WHEN Herdr Sealing commits the detached frame and crashes before removing the detached raw generation
+- THEN retry verifies the exact sealed suffix against the retained base length and digest
+- AND it removes the detached evidence without appending the frame again
+
+#### Scenario: A generation entry is substituted before maintenance mutation
+
+- WHEN a static or pre-operation Capture or Herdr source, destination, or temporary directory entry no longer identifies the retained regular-file inode
+- THEN detachment or Sealing fails without following a symlink or modifying its target
+- AND retained evidence and captured-content redaction in diagnostics are preserved
+
+#### Scenario: Cooperative maintenance processes overlap
+
+- WHEN two Plant processes attempt maintenance in one session directory
+- THEN the retained exclusive directory lock serializes temp recovery, commit, and cleanup
+- AND one compressor cannot retire the other cooperating compressor's temp evidence
+
+#### Scenario: A previous-version temp remains after upgrade
+
+- WHEN restart finds a regular file named exactly `turns.scrub-tmp`, `turns.jsonl.frame-tmp`, `turns.jsonl.zst-tmp`, `herdr.jsonl.frame-tmp`, or `herdr.jsonl.zst-tmp`
+- THEN maintenance removes that descriptor-opened legacy temp under the exclusive session lock
+- AND a symlink, non-regular entry, or near-miss name is preserved and causes maintenance to fail closed
+
+#### Scenario: Power fails at the Sealing cleanup boundary
+
+- WHEN the merged destination data and destination rename are durable but detached evidence has not yet been removed
+- THEN retry recognizes the exact committed suffix and removes the detached generation without duplication
+- AND detached evidence is removed only after the committed destination name is directory-durable
+
+#### Scenario: Compression reports success with corrupt output
+
+- WHEN the compressor exits successfully but the committed suffix does not decode to the detached raw digest
+- THEN Sealing reports operational failure and retains the detached evidence
+- AND the diagnostic contains locations but no captured content
+
+#### Scenario: Retry finds a different valid frame representation
+
+- WHEN a committed suffix uses different valid zstd frame bytes that decode to the detached raw digest
+- THEN retry accepts the content proof and removes the detached evidence without rewriting the destination
+
+#### Scenario: Compression times out
+
+- WHEN zstd exceeds the compression timeout
+- THEN Plant kills and reaps the child before returning and cleaning its descriptor-owned temp
 
 #### Scenario: Reconstruction overlaps Sealing
 
