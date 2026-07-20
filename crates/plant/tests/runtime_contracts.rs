@@ -288,7 +288,7 @@ fn learner_claim_publication_failure_emits_no_paths() {
 
     let output = claim(&home, &sessions, "claude");
     fs::set_permissions(&learnings, fs::Permissions::from_mode(0o755)).unwrap();
-    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(output.status.code(), Some(2));
     assert!(
         output.stdout.is_empty(),
         "unclaimed paths escaped on stdout"

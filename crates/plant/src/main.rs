@@ -68,7 +68,7 @@ async fn dispatch(command: Command) -> i32 {
                     Ok(list) => list,
                     Err(e) => {
                         eprintln!("sessions eligible: claim failed: {e}");
-                        return 1;
+                        return 2;
                     }
                 },
                 None => sweep::eligible_sessions(&vault, args.idle, args.max, args.learner),
