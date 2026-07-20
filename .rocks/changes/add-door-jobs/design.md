@@ -18,8 +18,9 @@ typed code rather than bash or a bespoke declarative format.
 - Door state fails closed, is replaced atomically under a per-door
   cross-process lock, and carries a timestamp frontier with the paths already
   seen at that timestamp plus the exact ordered in-progress batch. The claim
-  deterministically supplies Plant's idempotency key, so process crashes
-  cannot create a second agent run.
+  includes a portable identity for the bounded bytes and deterministically
+  supplies Plant's idempotency key, so process crashes or same-path
+  replacement cannot create a second agent run with different content.
 - Loop prevention is structural first (doors may only watch ingestion roots
   that agents never write) with a rate breaker as defense-in-depth, because a
   self-sustaining door fires slowly (agent runtime spaces the fires) and would
@@ -90,18 +91,53 @@ that lands later at the same timestamp with a lower-sorting path. Each door
 therefore serializes evaluation with a per-door cross-process lock, fails
 closed on unreadable or invalid state, and persists a timestamp frontier plus
 the sorted set of paths already seen at that timestamp. It atomically persists
-the exact batch ordered by `(mtime,path)` before launch. The persisted claim
+the exact batch ordered by `(mtime,path)`, including total size and SHA-256 of
+the exact bounded bytes read, before launch. That content-bound claim
 determines the Plant idempotency key and survives both pre-launch and
-post-launch Door crashes. A retry resumes that claim; only a confirmed durable
+post-launch Door crashes. Hydration must reproduce the persisted mtime, size,
+and digest before launch. A retry resumes that claim; only a confirmed durable
 Plant `Succeeded` or `Failed` outcome advances the frontier and clears the
 claim atomically. Retryable and indeterminate results retain the claim and key.
+A migrated v1 in-progress claim keeps its historical Plant key, but durably
+binds current content identity under the lock before its first post-migration
+launch.
 
 The watch resolver selects one configured ingestion root and canonicalizes it.
 Both scanning and claim hydration open matches with no-follow semantics, verify
-the opened descriptor's canonical identity remains beneath that root, then
-`fstat` and read through that same descriptor. Traversal, symlink escapes, and
-pathname replacement between validation and read therefore fail closed or
-leave the already-opened safe file as the only content visible to the agent.
+the opened descriptor is a regular file beneath that root, and test frontier
+eligibility before reading content. Opens are nonblocking so matching FIFOs
+cannot stall a Door. One bounded 65,536-byte descriptor read is bracketed by
+`fstat`; device, inode, size, mtime, and ctime must remain identical. Traversal,
+symlink escapes, in-place writes, and pathname replacement therefore fail
+closed. Door tests run under pinned Bun on both Linux and macOS so the
+platform-specific lock and descriptor paths stay live. Hidden scanning is
+enabled only when the configured glob explicitly names a hidden segment, so
+the mail artifact watch can enter `.door` without broadening ordinary watches.
+
+Mail's append-only daily JSONL capture is not itself a Door input. Before the
+mail Door evaluates, a mail-specific producer reads only newline-terminated
+records under one run-wide byte budget and per-line cap, opening and closing
+one source at a time while deferring the single durable state commit until all
+sources pass. Its machine-local, gitignored `mail/.door/` state durably records
+`initialized` plus each source's relative path, device, inode, and EOF offset.
+The `.door` and `summons` directories must be real no-follow directories;
+state and existing artifacts are read only through bounded, nonblocking,
+no-follow regular-file descriptors. The first true run snapshots all existing
+EOFs and publishes nothing; a daily file discovered after initialization
+begins at offset zero. A tracked source that disappears, truncates, changes
+inode, or is replaced at its open pathname fails closed without advancing any
+offset.
+
+Only inbox records with nonempty Graph and trimmed Internet Message IDs are
+eligible, and the literal summon is matched only in subject, body preview, or
+body content. Each match is durably published as one immutable artifact keyed
+by `sha256(trimmed internetMessageId)` before the source-offset update is
+atomically saved. A crash in that interval replays the source line, verifies
+the existing artifact's trimmed Internet Message ID, and advances without
+rewriting or touching the artifact; a changed Graph ID does not conflict with
+the stable duplicate. The mail Door watches `mail/.door/summons/*.json`
+without a content filter, so later JSONL appends create new immutable paths and
+cannot hide or replay an older summon.
 
 New Plant and Door state directories are created one level at a time and both
 the new directory and its parent are fsynced before any fence, claim, lock, or
@@ -127,4 +163,7 @@ timestamp with a durable `closedThroughPath` boundary and a separate seen set.
 The boundary and seen paths survive claims at that timestamp and disappear
 only after the frontier advances to a newer timestamp. An existing v1
 in-progress claim retains its original Plant idempotency key until its durable
-outcome is recovered.
+outcome is recovered. Negative zero, a scalar frontier with no finite successor,
+and absolute or traversing legacy paths are rejected. Every constructed
+migration passes through the canonical v2 parser before it can be saved or
+used.

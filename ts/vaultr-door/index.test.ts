@@ -2,6 +2,7 @@ import { test, expect, beforeEach, afterEach } from "bun:test";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
+  existsSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
@@ -15,7 +16,12 @@ import {
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
-import { door, agentRun, setIngestionOpenHookForTest } from "./index.ts";
+import {
+  door,
+  agentRun,
+  setIngestionStatHookForTest,
+  setStaleRecoveryHookForTest,
+} from "./index.ts";
 
 let tmp: string;
 let vault: string;
@@ -85,7 +91,15 @@ function writeWorker(): string {
   const worker = join(tmp, "door-worker.ts");
   const library = pathToFileURL(resolve(import.meta.dir, "index.ts")).href;
   writeFileSync(worker, `
-const { door } = await import(${JSON.stringify(library)});
+const { door, setStaleRecoveryHookForTest } = await import(${JSON.stringify(library)});
+if (process.env.STALE_RECOVERY_READY && process.env.STALE_RECOVERY_RELEASE) {
+  setStaleRecoveryHookForTest(async (owner) => {
+    await Bun.write(process.env.STALE_RECOVERY_READY, JSON.stringify(owner));
+    while (!(await Bun.file(process.env.STALE_RECOVERY_RELEASE).exists())) {
+      await Bun.sleep(5);
+    }
+  });
+}
 const result = await door({
   name: "t",
   watch: "mail/*.md",
@@ -106,6 +120,14 @@ function spawnWorker(extraEnv: Record<string, string> = {}) {
     stdout: "pipe",
     stderr: "pipe",
   });
+}
+
+async function waitForFile(path: string): Promise<void> {
+  for (let attempt = 0; attempt < 200; attempt++) {
+    if (existsSync(path)) return;
+    await Bun.sleep(5);
+  }
+  throw new Error(`timed out waiting for ${path}`);
 }
 
 function landFile(rel: string, mtimeSec: number) {
@@ -133,7 +155,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  setIngestionOpenHookForTest();
+  setIngestionStatHookForTest();
+  setStaleRecoveryHookForTest();
   rmSync(tmp, { recursive: true, force: true });
 });
 
@@ -209,6 +232,48 @@ test("scalar hwm state migrates durably and conservatively closes its tied times
   expect(stubCalls()).toBe(1);
 });
 
+test("unsafe or non-representable legacy state fails before migration or launch", async () => {
+  landFile("mail/a.md", 1000);
+  mkdirSync(join(tmp, "state"), { recursive: true });
+  const cases = [
+    {
+      name: "absolute",
+      raw: JSON.stringify({
+        version: 1,
+        cursor: { mtimeMs: 0, path: "/tmp/outside" },
+        fires: [],
+      }),
+    },
+    {
+      name: "traversal",
+      raw: JSON.stringify({
+        version: 1,
+        cursor: { mtimeMs: 0, path: "mail/../outside" },
+        fires: [],
+      }),
+    },
+    { name: "negative-zero", raw: '{"hwm":-0,"fires":[]}' },
+    {
+      name: "unclosable",
+      raw: JSON.stringify({ hwm: Number.MAX_VALUE, fires: [] }),
+    },
+  ];
+
+  for (const legacy of cases) {
+    const path = join(tmp, "state", `${legacy.name}.json`);
+    writeFileSync(path, legacy.raw);
+    const result = await door({
+      name: legacy.name,
+      watch: "mail/*.md",
+      prompt: () => "must not launch",
+    });
+    expect(result.code).toBe(1);
+    expect(result.detail).toContain("failed closed");
+    expect(readFileSync(path, "utf8")).toBe(legacy.raw);
+    expect(stubCalls()).toBe(0);
+  }
+});
+
 test("v1 cursor and in-progress claim migrate without changing the Plant key", async () => {
   const name = "v1";
   const cursor = { mtimeMs: 1000000, path: "mail/a.md" };
@@ -237,6 +302,8 @@ test("v1 cursor and in-progress claim migrate without changing the Plant key", a
     frontier: { mtimeMs: cursor.mtimeMs, seen: [], closedThroughPath: cursor.path },
     claim: { key },
   });
+  expect(persisted.claim.files[0].sha256).toMatch(/^[0-9a-f]{64}$/);
+  expect(persisted.claim.files[0].size).toBe(Buffer.byteLength("content of mail/z.md"));
   expect(stubCalls()).toBe(0);
 
   expect((await door({ name, watch: "mail/z.md", prompt: () => "go" })).code).toBe(0);
@@ -326,21 +393,52 @@ test("concurrent door processes launch one batch once", async () => {
 
 test("two processes taking over one stale owner cannot remove the successor lock", async () => {
   landFile("mail/a.md", 1000);
-  writeIdempotentStub(0, { delay: 0.3 });
+  writeIdempotentStub(0, { delay: 1 });
   mkdirSync(join(tmp, "state"), { recursive: true });
   const exited = Bun.spawn(["/usr/bin/true"]);
   await exited.exited;
+  const stale = { pid: exited.pid, token: "stale-owner" };
+  const lock = join(tmp, "state", "t.lock");
   writeFileSync(
-    join(tmp, "state", "t.lock"),
-    `${JSON.stringify({ pid: exited.pid, token: "stale-owner" })}\n`,
+    lock,
+    `${JSON.stringify(stale)}\n`,
   );
 
-  const first = spawnWorker();
-  const second = spawnWorker();
-  const codes = await Promise.all([first.exited, second.exited]);
-  expect(codes.every((code) => code === 0 || code === 1 || code === 75)).toBe(true);
-  expect(codes.filter((code) => code === 0)).toHaveLength(1);
-  expect(codes.filter((code) => code !== 0)).toHaveLength(1);
+  const winnerReady = join(tmp, "winner-ready");
+  const winnerRelease = join(tmp, "winner-release");
+  const loserReady = join(tmp, "loser-ready");
+  const loserRelease = join(tmp, "loser-release");
+  const winner = spawnWorker({
+    STALE_RECOVERY_READY: winnerReady,
+    STALE_RECOVERY_RELEASE: winnerRelease,
+  });
+  const loser = spawnWorker({
+    STALE_RECOVERY_READY: loserReady,
+    STALE_RECOVERY_RELEASE: loserRelease,
+  });
+  await Promise.all([waitForFile(winnerReady), waitForFile(loserReady)]);
+  expect(JSON.parse(readFileSync(winnerReady, "utf8"))).toEqual(stale);
+  expect(JSON.parse(readFileSync(loserReady, "utf8"))).toEqual(stale);
+
+  writeFileSync(winnerRelease, "");
+  let successor: { pid: number; token: string } | undefined;
+  for (let attempt = 0; attempt < 200; attempt++) {
+    try {
+      const owner = JSON.parse(readFileSync(lock, "utf8"));
+      if (owner.token !== stale.token) {
+        successor = owner;
+        break;
+      }
+    } catch {}
+    await Bun.sleep(5);
+  }
+  expect(successor?.pid).toBe(winner.pid);
+  expect(successor?.token).not.toBe(stale.token);
+
+  writeFileSync(loserRelease, "");
+  expect(await loser.exited).toBe(75);
+  expect(JSON.parse(readFileSync(lock, "utf8"))).toEqual(successor);
+  expect(await winner.exited).toBe(0);
   expect(stubCalls()).toBe(1);
 });
 
@@ -388,12 +486,41 @@ test("a pre-launch crash resumes the persisted ordered claim and key", async () 
   expect(await crashed.exited).toBe(86);
   expect(stubCalls()).toBe(0);
   const claimed = JSON.parse(readFileSync(join(tmp, "state", "t.json"), "utf8"));
-  expect(claimed.claim.files).toEqual([{ mtimeMs: claimed.claim.files[0].mtimeMs, path: "mail/a.md" }]);
-  expect(claimed.claim.key).toHaveLength(64);
+  expect(claimed.claim.files[0]).toMatchObject({
+    mtimeMs: claimed.claim.files[0].mtimeMs,
+    path: "mail/a.md",
+    size: Buffer.byteLength("content of mail/a.md"),
+  });
+  expect(claimed.claim.files[0].sha256).toMatch(/^[0-9a-f]{64}$/);
+  expect(claimed.claim.key).toBe(
+    createHash("sha256").update(JSON.stringify({
+      door: "t",
+      from: claimed.claim.from,
+      files: claimed.claim.files,
+    })).digest("hex"),
+  );
 
   const retried = spawnWorker();
   expect(await retried.exited).toBe(0);
   expect(stubCalls()).toBe(1);
+});
+
+test("a same-path same-mtime regular replacement cannot hydrate a persisted claim", async () => {
+  landFile("mail/a.md", 1000);
+  const crashed = spawnWorker({ CRASH_IN_PROMPT: "1" });
+  expect(await crashed.exited).toBe(86);
+  const statePath = join(tmp, "state", "t.json");
+  const before = JSON.parse(readFileSync(statePath, "utf8"));
+  expect(before.claim.files[0].size).toBe(Buffer.byteLength("content of mail/a.md"));
+
+  writeFileSync(join(vault, "mail", "a.md"), "changed of mail/a.md");
+  utimesSync(join(vault, "mail", "a.md"), 1000, 1000);
+  const retried = spawnWorker();
+  expect(await retried.exited).toBe(1);
+  expect(stubCalls()).toBe(0);
+  const after = JSON.parse(readFileSync(statePath, "utf8"));
+  expect(after.claim.key).toBe(before.claim.key);
+  expect(after.claim.files).toEqual(before.claim.files);
 });
 
 test("a post-launch crash reuses Plant's durable outcome without relaunch", async () => {
@@ -479,12 +606,25 @@ test("an unrelated escaping symlink outside the glob does not disable the door",
   expect(stubCalls()).toBe(1);
 });
 
-test("a pathname swapped after open cannot change the descriptor-backed content", async () => {
+test("a matching fifo is rejected without blocking", async () => {
+  const fifo = join(vault, "mail", "pipe.md");
+  expect(Bun.spawnSync(["mkfifo", fifo]).exitCode).toBe(0);
+  const worker = spawnWorker();
+  const code = await Promise.race([
+    worker.exited,
+    Bun.sleep(1000).then(() => -1),
+  ]);
+  if (code === -1) worker.kill();
+  expect(code).toBe(0);
+  expect(stubCalls()).toBe(0);
+});
+
+test("a pathname swapped after the first stat fails before launch", async () => {
   landFile("mail/a.md", 1000);
   const outside = join(tmp, "outside.md");
   writeFileSync(outside, "hostile outside content");
   let opens = 0;
-  setIngestionOpenHookForTest((path) => {
+  setIngestionStatHookForTest((path) => {
     if (path !== "a.md" || ++opens !== 2) return;
     renameSync(join(vault, "mail", "a.md"), join(vault, "mail", "a.opened"));
     symlinkSync(outside, join(vault, "mail", "a.md"));
@@ -495,11 +635,93 @@ test("a pathname swapped after open cannot change the descriptor-backed content"
     watch: "mail/*.md",
     prompt: (files) => files.map((file) => file.text).join("\n"),
   });
-  expect(result.code).toBe(0);
+  expect(result.code).toBe(1);
+  expect(result.detail).toContain("file changed while reading");
   expect(opens).toBe(2);
-  expect(readFileSync(stubLog, "utf8")).toContain("content of mail/a.md");
-  expect(readFileSync(stubLog, "utf8")).not.toContain("hostile outside content");
+  expect(stubCalls()).toBe(0);
+  expect(JSON.parse(readFileSync(join(tmp, "state", "t.json"), "utf8")).claim).toBeDefined();
+});
+
+test("an in-place write after the first stat fails and retries the stable file once", async () => {
+  landFile("mail/a.md", 1000);
+  await Bun.sleep(10);
+  let reads = 0;
+  setIngestionStatHookForTest((path) => {
+    if (path !== "a.md" || ++reads !== 1) return;
+    writeFileSync(join(vault, "mail", path), "changed of mail/a.md");
+    utimesSync(join(vault, "mail", path), 1000, 1000);
+  });
+  const spec = {
+    name: "t",
+    watch: "mail/*.md",
+    prompt: (files: any[]) => files[0].text,
+  };
+
+  const changed = await door(spec);
+  expect(changed.code).toBe(1);
+  expect(changed.detail).toContain("file changed while reading");
+  expect(stubCalls()).toBe(0);
+
+  setIngestionStatHookForTest();
+  expect((await door(spec)).code).toBe(0);
+  expect(readFileSync(stubLog, "utf8")).toContain("changed of mail/a.md");
+  expect((await door(spec)).detail).toBe("no new files");
   expect(stubCalls()).toBe(1);
+});
+
+test("large files contribute at most 65,536 bytes to the prompt", async () => {
+  const path = join(vault, "mail", "large.md");
+  writeFileSync(path, `${"a".repeat(65_536)}outside-read-limit`);
+  utimesSync(path, 1000, 1000);
+
+  const result = await door({
+    name: "t",
+    watch: "mail/*.md",
+    prompt: (files) => `${Buffer.byteLength(files[0]!.text)}:${files[0]!.text.includes("outside-read-limit")}`,
+  });
+  expect(result.code).toBe(0);
+  expect(readFileSync(stubLog, "utf8")).toContain("65536:false");
+  expect(stubCalls()).toBe(1);
+});
+
+test("an explicitly watched hidden ingestion directory is scanned", async () => {
+  landFile("mail/.door/summons/a.json", 1000);
+
+  const result = await door({
+    name: "t",
+    watch: "mail/.door/summons/*.json",
+    prompt: (files) => files[0]!.text,
+  });
+  expect(result.code).toBe(0);
+  expect(stubCalls()).toBe(1);
+  expect(readFileSync(stubLog, "utf8")).toContain("mail/.door/summons/a.json");
+});
+
+test("an ordinary watch does not broaden to hidden files", async () => {
+  landFile("mail/visible.md", 1000);
+  landFile("mail/.secret.md", 1001);
+
+  const result = await door({
+    name: "t",
+    watch: "mail/*.md",
+    prompt: (files) => files.map((file) => file.path).join("\n"),
+  });
+  expect(result.code).toBe(0);
+  expect(stubCalls()).toBe(1);
+  expect(readFileSync(stubLog, "utf8")).toContain("mail/visible.md");
+  expect(readFileSync(stubLog, "utf8")).not.toContain("mail/.secret.md");
+});
+
+test("files behind the frontier are not read again", async () => {
+  landFile("mail/a.md", 1000);
+  let reads = 0;
+  setIngestionStatHookForTest(() => reads++);
+  const spec = { name: "t", watch: "mail/*.md", prompt: () => "go" };
+
+  expect((await door(spec)).code).toBe(0);
+  expect(reads).toBe(2);
+  expect((await door(spec)).detail).toBe("no new files");
+  expect(reads).toBe(2);
 });
 
 test("a claimed file replaced by an escaping symlink is rejected before retry launch", async () => {

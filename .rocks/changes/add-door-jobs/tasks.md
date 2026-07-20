@@ -15,9 +15,9 @@
 - [x] 2.5 Add corrupt-state, tied-mtime, concurrent-process, before-launch crash, and after-launch crash tests against a fake idempotent `plant agent run`
 - [x] 2.6 Replace the cursor with a timestamp frontier and durable seen paths, require machine-readable durable Plant outcomes before claim advance, canonicalize every path beneath one selected ingestion root, and cover traversal, symlink, indeterminate-result, and lower-sorting tied-mtime cases
 - [x] 2.7 Durably link new Plant/Door state directories, migrate shipped hwm/v1 states conservatively, publish complete locks atomically, restore Bun.Glob no-follow matching, and replace the receipt fields with one tagged enum
-- [x] 2.8 Fail closed on incomplete legacy locks, guard stale takeover with a kernel lock, bind ingestion reads to no-follow descriptors, preserve the v1 cursor boundary, and separate Plant durable state and Agent Run receipt ownership
+- [x] 2.8 Fail closed on incomplete/invalid legacy state, prove guarded stale takeover, bind claims to stable bounded-content identities from nonblocking no-follow descriptor reads with cross-platform Bun CI, preserve the v1 cursor/key boundary, and separate Plant durable state and Agent Run receipt ownership
 
 ## 3. First doors and ingestion
 
 - [x] 3.1 Add a Teamer sync job to `vault/jobs/` landing Teams chats as watchable Vault Content on a 30m cadence
-- [x] 3.2 Add one real email door and one real Teams door as `door-<name>.30m.ts` jobs and prove an end-to-end fire against a live Herdr session (message file → agent session → ledger outcome)
+- [x] 3.2 Add one real email door over machine-local immutable Internet-Message-ID artifacts and one real Teams door as `door-<name>.30m.ts` jobs, and prove an isolated end-to-end mail fire against live Herdr (JSONL projection → immutable artifact → one durable agent outcome)

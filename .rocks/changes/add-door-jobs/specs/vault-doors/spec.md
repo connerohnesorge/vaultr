@@ -22,9 +22,12 @@ A door MUST fail closed on unreadable or invalid state and MUST serialize each
 door's evaluation with a per-door cross-process lock. It MUST persist a
 timestamp frontier and the durable sorted set of paths already processed at
 that timestamp, select all unseen files in total `(mtime,path)` batch order,
-atomically persist the exact ordered in-progress batch before launch, and
-derive a stable Plant Agent Run idempotency key from that claim. A retry MUST
-resume the persisted claim. Only a machine-readable Plant result confirming a
+atomically persist the exact ordered in-progress batch plus a portable total
+size and SHA-256 identity for each file's exact bounded bytes before launch,
+and derive a stable Plant Agent Run idempotency key from that content-bound
+claim. Hydration MUST reproduce the claimed mtime, size, and digest before
+launch. A retry MUST resume the persisted claim. Only a machine-readable Plant
+result confirming a
 durably recorded `Succeeded` or `Failed` outcome MAY atomically advance the
 frontier through the claim and clear it. Retryable, operationally failed,
 missing, malformed, or otherwise indeterminate results MUST retain the claim
@@ -39,7 +42,12 @@ under one kernel-backed per-door recovery lock, with the observed PID and token
 reread and matched while guarded before unlink and directory fsync. If that
 guard is unavailable or the owner changed, the Door MUST fail closed or retry
 without unlinking the canonical lock. A given file MUST never launch a second
-agent run.
+agent run. Legacy scalar and cursor migrations MUST reject negative zero,
+frontiers with no representable finite successor, and absolute or traversing
+paths. Every migrated value MUST pass canonical v2 parsing before it is saved
+or used. A migrated v1 in-progress claim MUST retain its historical Plant key
+and MUST durably bind portable content identities under the Door lock before
+its first post-migration launch.
 
 #### Scenario: A sync batch produces one session
 
@@ -96,6 +104,13 @@ agent run.
 - THEN the next invocation resumes the same ordered claim and idempotency key
 - AND the batch launches once
 
+#### Scenario: Claimed path is replaced without changing mtime
+
+- WHEN a claimed regular file is replaced with different bounded bytes at the same path and mtime before retry
+- THEN hydration detects the size or digest mismatch and fails closed
+- AND the persisted claim and key remain unchanged
+- AND no Plant agent run is launched for the replacement
+
 #### Scenario: Door crashes after launch
 
 - WHEN a door crashes after Plant durably records the launch outcome but before the frontier save
@@ -107,6 +122,13 @@ agent run.
 - WHEN a Door reads a shipped scalar `hwm` state
 - THEN it atomically persists a valid v2 timestamp frontier under the Door lock before evaluation
 - AND it closes the entire legacy high-water timestamp at the next representable timestamp so no file can fire twice
+
+#### Scenario: Corrupt legacy state cannot launch during migration
+
+- WHEN a shipped scalar contains negative zero or no finite successor, or a v1 cursor path is absolute or traversing
+- THEN migration fails closed without replacing the legacy state
+- AND canonical v2 parsing occurs before any migrated value is saved or used
+- AND no agent session is launched
 
 #### Scenario: Shipped v1 cursor is migrated
 
@@ -121,11 +143,14 @@ agent run.
 The library MUST select exactly one allowlisted ingestion root — a path written
 only by sync jobs — for each watch glob. It MUST reject traversal and
 canonicalize the selected root. Every scanned or hydrated file MUST be opened
-with no-follow semantics, its opened descriptor identity MUST be verified
-beneath that root, and its metadata and content MUST be read from that same
-descriptor. A real path outside the selected root, including a symlink escape,
-MUST be rejected before launch. A door whose watch glob falls outside the
-allowlist MUST fail loudly before launch, so a door cannot subscribe to
+with nonblocking no-follow semantics and MUST be verified as a regular file
+beneath that root. Scan eligibility against the timestamp frontier MUST be
+decided before content is read. At most 65,536 bytes of content MUST then be
+read from that same descriptor. Pre-read and post-read descriptor metadata
+MUST match for device, inode, size, mtime, and ctime; any change MUST fail
+before launch. A real path outside the selected root, including a symlink
+escape, MUST be rejected before launch. A door whose watch glob falls outside
+the allowlist MUST fail loudly before launch, so a door cannot subscribe to
 agent-written Vault Content.
 
 #### Scenario: Watching agent-written content is rejected
@@ -151,6 +176,118 @@ agent-written Vault Content.
 - WHEN a matching pathname is replaced by an escaping symlink after the Door opens it
 - THEN metadata and content are read only from the already-opened no-follow descriptor
 - AND outside-root content does not enter the prompt or launch
+
+#### Scenario: Match changes during its descriptor read
+
+- WHEN an in-place writer changes a matching file after the Door's first descriptor stat
+- THEN the post-read stat detects the identity or stability change and the Door fails before launch
+- AND a later stable evaluation can process the file once
+
+#### Scenario: Large match is bounded
+
+- WHEN a matching file exceeds 65,536 bytes
+- THEN the Door reads and exposes only its first 65,536 bytes
+- AND it does not read or decode the remainder
+
+#### Scenario: Matching FIFO cannot block
+
+- WHEN the watch glob matches a FIFO or another non-regular filesystem object
+- THEN the nonblocking open and descriptor type check return without reading it
+- AND Door evaluation does not block or launch for that object
+
+#### Scenario: Processed path is behind the frontier
+
+- WHEN a scanned regular file is not eligible against the durable frontier
+- THEN the Door closes its descriptor without reading content
+
+#### Scenario: Hidden paths require an explicit hidden segment
+
+- WHEN an ordinary glob such as `mail/*.md` is evaluated
+- THEN hidden matches such as `mail/.secret.md` are excluded
+- AND a glob explicitly naming `mail/.door/` can evaluate that hidden ingestion path
+
+### Requirement: Mail projection produces immutable Door inputs
+
+Before the mail Door evaluates, its mail-specific producer MUST stream only
+newline-terminated records from the append-only daily JSONL capture under one
+run-wide byte budget and a per-line cap. It MUST open and close one source at a
+time and MUST defer its single durable state commit until every source passes.
+Machine-local, ignored `mail/.door/` state MUST durably record a version,
+initialization flag, and each source's relative path, device, inode, and EOF
+offset. `.door` and `summons` MUST be real non-symlink directories. Projector
+state and existing artifacts MUST be opened with no-follow, nonblocking
+semantics, verified as regular files, and read under small explicit size
+bounds before JSON parsing. The first true run MUST snapshot every existing
+source EOF and publish zero artifacts; a source first discovered after
+initialization MUST start at offset zero. A tracked source that disappears,
+truncates, changes inode, or no longer names the opened regular file MUST fail
+closed without advancing any source offset.
+
+The producer MUST accept only inbox records with nonempty Graph `id` and
+trimmed `internetMessageId`, and MUST match the literal summon only in
+`subject`, `bodyPreview`, or `body.content`. It MUST durably publish one
+non-overwriting artifact keyed by `sha256(trimmed internetMessageId)`, retaining
+the Graph ID and complete message, before atomically advancing the source
+offset. A retry that finds the artifact MUST parse and verify the same trimmed
+Internet Message ID without rewriting or touching it; other message fields,
+including a Graph ID changed by a move, MUST NOT create a conflict for that
+stable duplicate. The mail Door MUST watch only
+`mail/.door/summons/*.json`, with no content filter.
+
+#### Scenario: Historical bootstrap does not replay
+
+- WHEN the projector initializes against daily JSONL files containing historical summons
+- THEN it durably snapshots their current device, inode, and EOF offsets
+- AND it creates no artifacts or agent launch
+
+#### Scenario: New daily source starts at zero
+
+- WHEN a new daily JSONL source appears after initialization
+- THEN the projector begins that source at offset zero
+- AND each complete newly appended summon remains eligible
+
+#### Scenario: Summon follows a large daily prefix
+
+- WHEN a summoned message is appended after more than 65,536 bytes of earlier daily JSONL
+- THEN bounded incremental projection publishes its immutable artifact
+- AND the mail Door can launch one agent for that message
+
+#### Scenario: Artifact precedes offset advancement
+
+- WHEN the producer crashes after fsyncing an artifact but before its atomic offset save
+- THEN retry verifies the artifact's trimmed Internet Message ID
+- AND it advances the offset without changing the artifact inode, bytes, or mtime
+- AND the mail Door launches that immutable path at most once
+
+#### Scenario: Graph ID changes for a stable duplicate
+
+- WHEN a replay carries the same trimmed Internet Message ID with a different Graph ID
+- THEN the existing artifact is accepted without rewrite or conflict
+- AND no duplicate artifact is published
+
+#### Scenario: Source is replaced or truncated
+
+- WHEN a tracked JSONL source is replaced, disappears, or shrinks below its durable offset
+- THEN projection fails closed without changing any durable offset
+- AND the mail Door does not evaluate newly projected input
+
+#### Scenario: Partial or over-budget data
+
+- WHEN a source ends in a partial line or the run-wide byte budget is exhausted
+- THEN no offset advances past incomplete or unread bytes
+- AND a later run can resume from the durable offset
+
+#### Scenario: Projector runtime files are hostile filesystem objects
+
+- WHEN `.door` or `summons` is a symlink, or state or an existing artifact is a symlink, FIFO, non-regular file, or over its read bound
+- THEN projection rejects the object without blocking, following it, or parsing unbounded bytes
+- AND no source offset advances
+
+#### Scenario: Many historical daily sources
+
+- WHEN projection evaluates many tracked daily JSONL files
+- THEN it holds at most one source descriptor at a time
+- AND it publishes the combined next offsets only after every source passes
 
 ### Requirement: Rolling-window fire breaker
 

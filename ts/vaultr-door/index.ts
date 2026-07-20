@@ -15,6 +15,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readSync,
   realpathSync,
   renameSync,
   statSync,
@@ -49,10 +50,19 @@ const kernelLock = (() => {
   }
 })();
 
-let afterIngestionOpenForTest: ((path: string) => void) | undefined;
+let afterIngestionStatForTest: ((path: string) => void) | undefined;
+let beforeStaleRecoveryForTest:
+  | ((owner: { pid: number; token: string }) => void | Promise<void>)
+  | undefined;
 
-export function setIngestionOpenHookForTest(hook?: (path: string) => void): void {
-  afterIngestionOpenForTest = hook;
+export function setIngestionStatHookForTest(hook?: (path: string) => void): void {
+  afterIngestionStatForTest = hook;
+}
+
+export function setStaleRecoveryHookForTest(
+  hook?: (owner: { pid: number; token: string }) => void | Promise<void>,
+): void {
+  beforeStaleRecoveryForTest = hook;
 }
 
 export type AgentRunReceipt =
@@ -120,6 +130,8 @@ export interface DoorFile {
   path: string; // vault-root-relative
   abs: string;
   mtimeMs: number;
+  size: number;
+  sha256: string;
   text: string; // file content (first 64 KiB), for content filters and prompts
 }
 
@@ -140,10 +152,17 @@ export interface DoorResult {
   detail: string;
 }
 
-interface ClaimFile {
+interface FileOrder {
   mtimeMs: number;
   path: string;
 }
+
+interface ClaimFile extends FileOrder {
+  size: number;
+  sha256: string;
+}
+
+type LegacyClaimFile = FileOrder;
 
 interface Frontier {
   mtimeMs: number;
@@ -158,7 +177,7 @@ interface LegacyCursor {
 
 interface DoorClaim {
   from: Frontier;
-  files: ClaimFile[];
+  files: Array<ClaimFile | LegacyClaimFile>;
   key: string;
   legacyCursor?: LegacyCursor;
 }
@@ -179,7 +198,7 @@ function lockPath(name: string): string {
   return `${stateDir()}/${name}.lock`;
 }
 
-function compareFile(a: ClaimFile, b: ClaimFile): number {
+function compareFile(a: FileOrder, b: FileOrder): number {
   if (a.mtimeMs !== b.mtimeMs) return a.mtimeMs < b.mtimeMs ? -1 : 1;
   return a.path < b.path ? -1 : a.path > b.path ? 1 : 0;
 }
@@ -191,28 +210,51 @@ function sameFrontier(a: Frontier, b: Frontier): boolean {
     && a.seen.every((path, index) => path === b.seen[index]);
 }
 
-function validFile(value: unknown): value is ClaimFile {
-  const file = value as ClaimFile;
+function validTimestamp(value: unknown): value is number {
+  return typeof value === "number"
+    && Number.isFinite(value)
+    && value >= 0
+    && !Object.is(value, -0);
+}
+
+function validFileOrder(value: unknown): value is FileOrder {
+  const file = value as FileOrder;
   return !!file
-    && Number.isFinite(file.mtimeMs)
-    && file.mtimeMs >= 0
+    && validTimestamp(file.mtimeMs)
     && typeof file.path === "string"
     && file.path.length > 0;
+}
+
+function validLegacyClaimFile(value: unknown): value is LegacyClaimFile {
+  const file = value as Record<string, unknown>;
+  return validFileOrder(value)
+    && file.size === undefined
+    && file.sha256 === undefined;
+}
+
+function validClaimFile(value: unknown): value is ClaimFile {
+  const file = value as ClaimFile;
+  return validFileOrder(file)
+    && Number.isSafeInteger(file.size)
+    && file.size >= 0
+    && typeof file.sha256 === "string"
+    && /^[0-9a-f]{64}$/.test(file.sha256);
 }
 
 function validLegacyCursor(value: unknown): value is LegacyCursor {
   const cursor = value as LegacyCursor;
   return !!cursor
-    && Number.isFinite(cursor.mtimeMs)
-    && cursor.mtimeMs >= 0
-    && typeof cursor.path === "string";
+    && validTimestamp(cursor.mtimeMs)
+    && typeof cursor.path === "string"
+    && (cursor.path === ""
+      ? cursor.mtimeMs === 0
+      : validRelativePath(cursor.path, true));
 }
 
 function validFrontier(value: unknown): value is Frontier {
   const frontier = value as Frontier;
   return !!frontier
-    && Number.isFinite(frontier.mtimeMs)
-    && frontier.mtimeMs >= 0
+    && validTimestamp(frontier.mtimeMs)
     && Array.isArray(frontier.seen)
     && frontier.seen.every((path) => typeof path === "string" && path.length > 0)
     && frontier.seen.every((path) => validRelativePath(path, true))
@@ -223,7 +265,7 @@ function validFrontier(value: unknown): value is Frontier {
         && frontier.seen.every((path) => path > frontier.closedThroughPath!)));
 }
 
-function isNew(file: ClaimFile, frontier: Frontier): boolean {
+function isNew(file: FileOrder, frontier: Frontier): boolean {
   return file.mtimeMs > frontier.mtimeMs
     || (file.mtimeMs === frontier.mtimeMs
       && (frontier.closedThroughPath === undefined || file.path > frontier.closedThroughPath)
@@ -236,24 +278,31 @@ function claimKey(name: string, from: Frontier, files: ClaimFile[]): string {
     .digest("hex");
 }
 
-function legacyClaimKey(name: string, from: LegacyCursor, files: ClaimFile[]): string {
+function legacyClaimKey(name: string, from: LegacyCursor, files: FileOrder[]): string {
   return createHash("sha256")
-    .update(JSON.stringify({ door: name, from, files }))
+    .update(JSON.stringify({
+      door: name,
+      from,
+      files: files.map(({ mtimeMs, path }) => ({ mtimeMs, path })),
+    }))
     .digest("hex");
 }
 
 function conservativeFrontier(mtimeMs: number): Frontier {
+  if (!validTimestamp(mtimeMs)) throw new Error("invalid legacy timestamp");
   const value = new Float64Array([mtimeMs]);
   const bits = new BigUint64Array(value.buffer);
   bits[0] = bits[0]! + 1n;
-  if (!Number.isFinite(value[0])) throw new Error("legacy timestamp cannot be closed");
+  if (!validTimestamp(value[0]) || value[0]! <= mtimeMs) {
+    throw new Error("legacy timestamp cannot be closed");
+  }
   return { mtimeMs: value[0]!, seen: [] };
 }
 
 function parseState(name: string, value: unknown): DoorState {
   const raw = value as Record<string, unknown>;
   if (!raw || typeof raw !== "object" || !Array.isArray(raw.fires)
-    || !raw.fires.every((fire) => Number.isFinite(fire) && (fire as number) >= 0)
+    || !raw.fires.every(validTimestamp)
     || (raw.paused !== undefined && typeof raw.paused !== "string")
     || raw.version !== 2
     || !validFrontier(raw.frontier)) {
@@ -269,9 +318,12 @@ function parseState(name: string, value: unknown): DoorState {
   if (raw.claim !== undefined) {
     const claim = raw.claim as DoorClaim;
     const legacy = claim?.legacyCursor;
+    const files = Array.isArray(claim?.files) ? claim.files : [];
+    const identifiedFiles = files.length > 0 && files.every(validClaimFile);
+    const unboundLegacyFiles = files.length > 0 && files.every(validLegacyClaimFile);
     if (!claim || !validFrontier(claim.from) || !sameFrontier(claim.from, state.frontier)
-      || !Array.isArray(claim.files) || claim.files.length === 0
-      || !claim.files.every(validFile)
+      || files.length === 0
+      || (legacy ? !identifiedFiles && !unboundLegacyFiles : !identifiedFiles)
       || claim.files.some((file) => !validRelativePath(file.path, true))
       || new Set(claim.files.map((file) => file.path)).size !== claim.files.length
       || claim.files.some((file, i) =>
@@ -284,7 +336,7 @@ function parseState(name: string, value: unknown): DoorState {
           || claim.from.closedThroughPath !== legacy.path
           || claim.from.seen.length !== 0
           || claim.key !== legacyClaimKey(name, legacy, claim.files)
-        : claim.key !== claimKey(name, claim.from, claim.files))) {
+        : claim.key !== claimKey(name, claim.from, claim.files as ClaimFile[]))) {
       throw new Error("invalid door claim");
     }
     state.claim = claim;
@@ -296,7 +348,7 @@ function migrateLegacyState(name: string, value: unknown): DoorState {
   const raw = value as Record<string, unknown>;
   if (!raw || typeof raw !== "object"
     || !Array.isArray(raw.fires)
-    || !raw.fires.every((fire) => Number.isFinite(fire) && (fire as number) >= 0)
+    || !raw.fires.every(validTimestamp)
     || (raw.paused !== undefined && typeof raw.paused !== "string")) {
     throw new Error("invalid legacy door state");
   }
@@ -304,7 +356,7 @@ function migrateLegacyState(name: string, value: unknown): DoorState {
     fires: raw.fires as number[],
     ...(raw.paused === undefined ? {} : { paused: raw.paused as string }),
   };
-  if (raw.version === undefined && Number.isFinite(raw.hwm) && (raw.hwm as number) >= 0
+  if (raw.version === undefined && validTimestamp(raw.hwm)
     && raw.cursor === undefined && raw.claim === undefined) {
     return {
       version: 2,
@@ -326,11 +378,11 @@ function migrateLegacyState(name: string, value: unknown): DoorState {
     ...metadata,
   };
   if (raw.claim !== undefined) {
-    const claim = raw.claim as { from: LegacyCursor; files: ClaimFile[]; key: string };
+    const claim = raw.claim as { from: LegacyCursor; files: LegacyClaimFile[]; key: string };
     if (!claim || !validLegacyCursor(claim.from)
       || compareFile(claim.from, cursor) !== 0
       || !Array.isArray(claim.files) || claim.files.length === 0
-      || !claim.files.every(validFile)
+      || !claim.files.every(validLegacyClaimFile)
       || claim.files.some((file) => !validRelativePath(file.path, true))
       || new Set(claim.files.map((file) => file.path)).size !== claim.files.length
       || claim.files.some((file, index) =>
@@ -354,7 +406,7 @@ function loadState(name: string): DoorState {
   try {
     const value = JSON.parse(readFileSync(statePath(name), "utf8"));
     if ((value as Record<string, unknown>)?.version === 2) return parseState(name, value);
-    const state = migrateLegacyState(name, value);
+    const state = parseState(name, migrateLegacyState(name, value));
     saveState(name, state);
     return state;
   } catch (error: any) {
@@ -538,6 +590,7 @@ async function acquireLock(name: string): Promise<(() => void) | undefined> {
         throw error;
       }
       if (pidAlive(owner.pid)) return undefined;
+      await beforeStaleRecoveryForTest?.(owner);
       await recoverStaleLock(path, owner);
       continue;
     }
@@ -601,6 +654,8 @@ function resolveIngestionRoot(watch: string): IngestionRoot {
 interface LoadedIngestionFile {
   abs: string;
   mtimeMs: number;
+  size: number;
+  sha256: string;
   text: string;
 }
 
@@ -618,7 +673,11 @@ function openedPathBeneath(root: IngestionRoot, fd: number, path: string): strin
   return canonical;
 }
 
-function loadIngestionFile(root: IngestionRoot, path: string): LoadedIngestionFile | undefined {
+function loadIngestionFile(
+  root: IngestionRoot,
+  path: string,
+  shouldRead?: (mtimeMs: number) => boolean,
+): LoadedIngestionFile | undefined {
   if (!validRelativePath(path, true)) {
     throw new Error(`invalid path beneath ingestion root: ${path}`);
   }
@@ -626,24 +685,49 @@ function loadIngestionFile(root: IngestionRoot, path: string): LoadedIngestionFi
   if (!isBeneath(root.path, lexical)) {
     throw new Error(`path escapes ingestion root: ${path}`);
   }
-  if (typeof constants.O_NOFOLLOW !== "number") {
-    throw new Error("no-follow file opens are unavailable");
+  if (typeof constants.O_NOFOLLOW !== "number" || typeof constants.O_NONBLOCK !== "number") {
+    throw new Error("nonblocking no-follow file opens are unavailable");
   }
   let fd: number;
   try {
-    fd = openSync(lexical, constants.O_RDONLY | constants.O_NOFOLLOW);
+    fd = openSync(
+      lexical,
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
   } catch (error: any) {
     if (error?.code === "ELOOP") throw new Error(`symlink escapes ingestion root: ${path}`);
     throw error;
   }
   try {
+    const before = fstatSync(fd);
+    if (!before.isFile()) return undefined;
+    if (!Number.isSafeInteger(before.size) || before.size < 0) {
+      throw new Error(`file size cannot be represented safely: ${path}`);
+    }
     openedPathBeneath(root, fd, path);
-    afterIngestionOpenForTest?.(path);
-    const stat = fstatSync(fd);
-    if (!stat.isFile()) return undefined;
-    const text = readFileSync(fd, "utf8").slice(0, 65536);
+    if (shouldRead && !shouldRead(before.mtimeMs)) return undefined;
+    afterIngestionStatForTest?.(path);
+    const buffer = Buffer.allocUnsafe(65_536);
+    const bytesRead = readSync(fd, buffer, 0, buffer.length, 0);
+    const after = fstatSync(fd);
+    if (
+      before.dev !== after.dev
+      || before.ino !== after.ino
+      || before.size !== after.size
+      || before.mtimeMs !== after.mtimeMs
+      || before.ctimeMs !== after.ctimeMs
+    ) {
+      throw new Error(`file changed while reading: ${path}`);
+    }
     const abs = openedPathBeneath(root, fd, path);
-    return { abs, mtimeMs: stat.mtimeMs, text };
+    const bytes = buffer.subarray(0, bytesRead);
+    return {
+      abs,
+      mtimeMs: before.mtimeMs,
+      size: before.size,
+      sha256: createHash("sha256").update(bytes).digest("hex"),
+      text: bytes.toString("utf8"),
+    };
   } finally {
     closeSync(fd);
   }
@@ -657,9 +741,15 @@ function claimRelativePath(root: IngestionRoot, path: string): string {
 }
 
 function hydrateClaim(root: IngestionRoot, claim: DoorClaim): DoorFile[] {
+  if (!claim.files.every(validClaimFile)) {
+    throw new Error("legacy claim content identity was not bound");
+  }
   return claim.files.map((file) => {
     const loaded = loadIngestionFile(root, claimRelativePath(root, file.path));
-    if (!loaded || loaded.mtimeMs !== file.mtimeMs) {
+    if (!loaded
+      || loaded.mtimeMs !== file.mtimeMs
+      || loaded.size !== file.size
+      || loaded.sha256 !== file.sha256) {
       throw new Error(`claimed file changed before launch: ${file.path}`);
     }
     return {
@@ -670,7 +760,29 @@ function hydrateClaim(root: IngestionRoot, claim: DoorClaim): DoorFile[] {
   });
 }
 
-function advanceFrontier(from: Frontier, files: ClaimFile[]): Frontier {
+function bindLegacyClaimIdentity(
+  name: string,
+  root: IngestionRoot,
+  state: DoorState,
+): void {
+  const claim = state.claim;
+  if (!claim?.legacyCursor || claim.files.every(validClaimFile)) return;
+  claim.files = claim.files.map((file) => {
+    const loaded = loadIngestionFile(root, claimRelativePath(root, file.path));
+    if (!loaded || loaded.mtimeMs !== file.mtimeMs) {
+      throw new Error(`legacy claimed file changed before identity binding: ${file.path}`);
+    }
+    return {
+      mtimeMs: file.mtimeMs,
+      path: file.path,
+      size: loaded.size,
+      sha256: loaded.sha256,
+    };
+  });
+  saveState(name, state);
+}
+
+function advanceFrontier(from: Frontier, files: FileOrder[]): Frontier {
   const mtimeMs = files[files.length - 1]!.mtimeMs;
   if (mtimeMs < from.mtimeMs) return from;
   const atFrontier = files
@@ -712,22 +824,27 @@ export async function door(spec: DoorSpec): Promise<DoorResult> {
       const files: DoorFile[] = [];
       for (const path of new Bun.Glob(root.pattern).scanSync({
         cwd: root.path,
+        dot: root.pattern.split("/").some((segment) => segment.startsWith(".")),
         followSymlinks: false,
         onlyFiles: false,
       })) {
         try {
-          const loaded = loadIngestionFile(root, path);
+          const vaultPath = `${root.prefix}/${path}`;
+          const loaded = loadIngestionFile(
+            root,
+            path,
+            (mtimeMs) => isNew({ mtimeMs, path: vaultPath }, state.frontier),
+          );
           if (!loaded) continue;
           const mtimeMs = loaded.mtimeMs;
-          const vaultPath = `${root.prefix}/${path}`;
-          if (isNew({ mtimeMs, path: vaultPath }, state.frontier)) {
-            files.push({
-              path: vaultPath,
-              abs: loaded.abs,
-              mtimeMs,
-              text: loaded.text,
-            });
-          }
+          files.push({
+            path: vaultPath,
+            abs: loaded.abs,
+            mtimeMs,
+            size: loaded.size,
+            sha256: loaded.sha256,
+            text: loaded.text,
+          });
         } catch (error: any) {
           if (error?.code === "ENOENT") continue; // raced away mid-scan
           throw error;
@@ -746,7 +863,12 @@ export async function door(spec: DoorSpec): Promise<DoorResult> {
         return { code: 1, detail: `paused: ${state.paused} — re-arm by deleting "paused" in ${statePath(name)}` };
       }
 
-      const claimFiles = matched.map(({ mtimeMs, path }) => ({ mtimeMs, path }));
+      const claimFiles = matched.map(({ mtimeMs, path, size, sha256 }) => ({
+        mtimeMs,
+        path,
+        size,
+        sha256,
+      }));
       state.claim = {
         from: state.frontier,
         files: claimFiles,
@@ -755,7 +877,8 @@ export async function door(spec: DoorSpec): Promise<DoorResult> {
       saveState(name, state);
     }
 
-    const claim = state.claim;
+    bindLegacyClaimIdentity(name, root, state);
+    const claim = state.claim!;
     const matched = hydrateClaim(root, claim);
     const result = await agentRun(spec.prompt(matched), {
       label: `door-${name}`,
