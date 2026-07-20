@@ -54,8 +54,8 @@ fn agent_run_distinguishes_retryable_and_indeterminate_state() {
 
     let retryable = run(&home, &sessions, "retryable");
     assert_eq!(retryable.status.code(), Some(75));
-    assert_eq!(result(&retryable)["state"], "retryable");
-    assert_eq!(result(&retryable)["durable"], false);
+    assert_eq!(result(&retryable)["outcome"], "retryable");
+    assert!(result(&retryable).get("durable").is_none());
 
     let key = "pending";
     let runs = home.join(".local/state/plant/agent-runs");
@@ -67,8 +67,8 @@ fn agent_run_distinguishes_retryable_and_indeterminate_state() {
     .unwrap();
     let indeterminate = run(&home, &sessions, key);
     assert_eq!(indeterminate.status.code(), Some(1));
-    assert_eq!(result(&indeterminate)["state"], "indeterminate");
-    assert_eq!(result(&indeterminate)["durable"], false);
+    assert_eq!(result(&indeterminate)["outcome"], "indeterminate");
+    assert!(result(&indeterminate).get("durable").is_none());
 
     fs::remove_dir_all(tmp).unwrap();
 }

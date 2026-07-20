@@ -162,17 +162,29 @@ pub enum AgentRunOutcome {
     Failed(String),
 }
 
-#[derive(Debug, PartialEq)]
-pub enum DurableAgentOutcome {
-    Succeeded(String),
-    Failed(String),
+#[derive(Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum AgentRunReceipt {
+    Succeeded { detail: String },
+    Failed { detail: String },
+    UntrackedSucceeded { detail: String },
+    UntrackedFailed { detail: String },
+    Retryable { detail: String },
+    Indeterminate { detail: String },
 }
 
-#[derive(Debug, PartialEq)]
-pub enum IdempotentAgentRun {
-    Durable(DurableAgentOutcome),
-    Retryable(String),
-    Indeterminate(String),
+impl AgentRunReceipt {
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Self::Succeeded { .. } | Self::UntrackedSucceeded { .. } => 0,
+            Self::Retryable { .. } => 75,
+            Self::Failed { .. } | Self::UntrackedFailed { .. } | Self::Indeterminate { .. } => 1,
+        }
+    }
+
+    fn durable(&self) -> bool {
+        matches!(self, Self::Succeeded { .. } | Self::Failed { .. })
+    }
 }
 
 #[derive(Deserialize, Serialize)]
@@ -185,7 +197,7 @@ enum DurableAgentRun {
 
 enum IdempotencyClaim {
     Execute(PathBuf),
-    Prior(DurableAgentOutcome),
+    Prior(AgentRunReceipt),
     Pending,
 }
 
@@ -200,7 +212,7 @@ fn idempotency_path(dir: &Path, key: &str) -> io::Result<PathBuf> {
 }
 
 fn claim_agent_run(dir: &Path, key: &str) -> io::Result<IdempotencyClaim> {
-    std::fs::create_dir_all(dir)?;
+    crate::jobs::ensure_dir_durable(dir)?;
     let path = idempotency_path(dir, key)?;
     let record = DurableAgentRun::InProgress {
         key: key.to_string(),
@@ -227,11 +239,11 @@ fn claim_agent_run(dir: &Path, key: &str) -> io::Result<IdempotencyClaim> {
                 DurableAgentRun::InProgress { key } => (key, IdempotencyClaim::Pending),
                 DurableAgentRun::Succeeded { key, detail } => (
                     key,
-                    IdempotencyClaim::Prior(DurableAgentOutcome::Succeeded(detail)),
+                    IdempotencyClaim::Prior(AgentRunReceipt::Succeeded { detail }),
                 ),
                 DurableAgentRun::Failed { key, detail } => (
                     key,
-                    IdempotencyClaim::Prior(DurableAgentOutcome::Failed(detail)),
+                    IdempotencyClaim::Prior(AgentRunReceipt::Failed { detail }),
                 ),
             };
             if recorded_key != key {
@@ -246,16 +258,23 @@ fn claim_agent_run(dir: &Path, key: &str) -> io::Result<IdempotencyClaim> {
     }
 }
 
-fn persist_agent_outcome(path: &Path, key: &str, outcome: &DurableAgentOutcome) -> io::Result<()> {
+fn persist_agent_outcome(path: &Path, key: &str, outcome: &AgentRunReceipt) -> io::Result<()> {
+    if !outcome.durable() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "only conclusive outcomes are durable",
+        ));
+    }
     let record = match outcome {
-        DurableAgentOutcome::Succeeded(detail) => DurableAgentRun::Succeeded {
+        AgentRunReceipt::Succeeded { detail } => DurableAgentRun::Succeeded {
             key: key.to_string(),
             detail: detail.clone(),
         },
-        DurableAgentOutcome::Failed(detail) => DurableAgentRun::Failed {
+        AgentRunReceipt::Failed { detail } => DurableAgentRun::Failed {
             key: key.to_string(),
             detail: detail.clone(),
         },
+        _ => unreachable!("durability checked above"),
     };
     let mut bytes =
         serde_json::to_vec(&record).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -265,43 +284,43 @@ fn persist_agent_outcome(path: &Path, key: &str, outcome: &DurableAgentOutcome) 
 
 /// Run an agent at most once for a caller-supplied stable key. Conclusive
 /// outcomes are replayed without touching Herdr; uncertain state fails closed.
-pub(crate) async fn run_agent_idempotent(agent_run: AgentRun, key: &str) -> IdempotentAgentRun {
+pub(crate) async fn run_agent_idempotent(agent_run: AgentRun, key: &str) -> AgentRunReceipt {
     let dir = crate::jobs::state_dir().join("agent-runs");
     let path = match claim_agent_run(&dir, key) {
         Ok(IdempotencyClaim::Execute(path)) => path,
-        Ok(IdempotencyClaim::Prior(outcome)) => return IdempotentAgentRun::Durable(outcome),
+        Ok(IdempotencyClaim::Prior(outcome)) => return outcome,
         Ok(IdempotencyClaim::Pending) => {
-            return IdempotentAgentRun::Indeterminate(
-                "idempotent agent run has no conclusive outcome; refusing duplicate launch"
+            return AgentRunReceipt::Indeterminate {
+                detail: "idempotent agent run has no conclusive outcome; refusing duplicate launch"
                     .to_string(),
-            )
+            }
         }
         Err(error) => {
-            return IdempotentAgentRun::Indeterminate(format!(
-                "idempotency state unavailable: {error}"
-            ))
+            return AgentRunReceipt::Indeterminate {
+                detail: format!("idempotency state unavailable: {error}"),
+            }
         }
     };
 
     let outcome = match run_agent(agent_run).await {
         AgentRunOutcome::Unavailable => {
             return match std::fs::remove_file(&path).and_then(|_| crate::jobs::sync_dir(&dir)) {
-                Ok(()) => {
-                    IdempotentAgentRun::Retryable("herdr unavailable before launch".to_string())
-                }
-                Err(error) => IdempotentAgentRun::Indeterminate(format!(
-                    "could not release unavailable idempotency claim: {error}"
-                )),
+                Ok(()) => AgentRunReceipt::Retryable {
+                    detail: "herdr unavailable before launch".to_string(),
+                },
+                Err(error) => AgentRunReceipt::Indeterminate {
+                    detail: format!("could not release unavailable idempotency claim: {error}"),
+                },
             };
         }
-        AgentRunOutcome::Succeeded(detail) => DurableAgentOutcome::Succeeded(detail),
-        AgentRunOutcome::Failed(detail) => DurableAgentOutcome::Failed(detail),
+        AgentRunOutcome::Succeeded(detail) => AgentRunReceipt::Succeeded { detail },
+        AgentRunOutcome::Failed(detail) => AgentRunReceipt::Failed { detail },
     };
     match persist_agent_outcome(&path, key, &outcome) {
-        Ok(()) => IdempotentAgentRun::Durable(outcome),
-        Err(error) => IdempotentAgentRun::Indeterminate(format!(
-            "could not persist conclusive agent outcome: {error}"
-        )),
+        Ok(()) => outcome,
+        Err(error) => AgentRunReceipt::Indeterminate {
+            detail: format!("could not persist conclusive agent outcome: {error}"),
+        },
     }
 }
 
@@ -835,12 +854,14 @@ mod tests {
         persist_agent_outcome(
             &path,
             "door-batch",
-            &DurableAgentOutcome::Succeeded("done once".to_string()),
+            &AgentRunReceipt::Succeeded {
+                detail: "done once".to_string(),
+            },
         )
         .unwrap();
         assert!(matches!(
             claim_agent_run(&dir, "door-batch").unwrap(),
-            IdempotencyClaim::Prior(DurableAgentOutcome::Succeeded(ref detail))
+            IdempotencyClaim::Prior(AgentRunReceipt::Succeeded { ref detail })
                 if detail == "done once"
         ));
 
@@ -854,11 +875,91 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[test]
+    fn receipt_variants_derive_protocol_properties() {
+        for (receipt, outcome, code, durable) in [
+            (
+                AgentRunReceipt::Succeeded {
+                    detail: "ok".into(),
+                },
+                "succeeded",
+                0,
+                true,
+            ),
+            (
+                AgentRunReceipt::Failed {
+                    detail: "bad".into(),
+                },
+                "failed",
+                1,
+                true,
+            ),
+            (
+                AgentRunReceipt::UntrackedSucceeded {
+                    detail: "ok".into(),
+                },
+                "untracked_succeeded",
+                0,
+                false,
+            ),
+            (
+                AgentRunReceipt::UntrackedFailed {
+                    detail: "bad".into(),
+                },
+                "untracked_failed",
+                1,
+                false,
+            ),
+            (
+                AgentRunReceipt::Retryable {
+                    detail: "later".into(),
+                },
+                "retryable",
+                75,
+                false,
+            ),
+            (
+                AgentRunReceipt::Indeterminate {
+                    detail: "unknown".into(),
+                },
+                "indeterminate",
+                1,
+                false,
+            ),
+        ] {
+            assert_eq!(receipt.exit_code(), code);
+            assert_eq!(receipt.durable(), durable);
+            let json = serde_json::to_value(&receipt).unwrap();
+            assert_eq!(json["outcome"], outcome);
+            assert!(json.get("durable").is_none());
+        }
+    }
+
     #[tokio::test]
     #[ignore = "requires a live Herdr session and signed-in Codex CLI"]
     async fn live_agent_lifecycle_preserves_focus_and_cleans_up() {
-        let focused_before = focused_workspace().await.expect("focused Herdr workspace");
         let label = format!("plant-lifecycle-smoke-{}", std::process::id());
+        let monitoring_label = label.clone();
+        let monitor = tokio::spawn(async move {
+            let mut seen = false;
+            for _ in 0..300 {
+                if let Some(workspaces) = workspaces().await {
+                    let matching: Vec<_> = workspaces
+                        .iter()
+                        .filter(|workspace| workspace.label.as_deref() == Some(&monitoring_label))
+                        .collect();
+                    if matching.iter().any(|workspace| workspace.focused) {
+                        return true;
+                    }
+                    if matching.is_empty() && seen {
+                        return false;
+                    }
+                    seen |= !matching.is_empty();
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            false
+        });
         let outcome = run_agent(AgentRun {
             label: label.clone(),
             cwd: std::env::current_dir().unwrap().display().to_string(),
@@ -875,10 +976,7 @@ mod tests {
             matches!(outcome, AgentRunOutcome::Succeeded(_)),
             "{outcome:?}"
         );
-        assert_eq!(
-            focused_workspace().await.as_deref(),
-            Some(focused_before.as_str())
-        );
+        assert!(!monitor.await.unwrap(), "smoke workspace stole focus");
         assert!(
             workspaces()
                 .await

@@ -39,10 +39,12 @@ that key before starting the Herdr lifecycle, and durably record each
 conclusive `Succeeded` or `Failed` outcome before returning. A repeated key
 MUST return its prior durable outcome without creating another Herdr workspace.
 Unreadable, corrupt, or unresolved in-progress idempotency state MUST fail
-closed without launching. The command MUST emit a machine-readable final result
-that distinguishes durable `Succeeded`/`Failed` outcomes from retryable and
-indeterminate operational state; it MUST NOT report claim or persistence
-failures as a conclusive `Failed` outcome.
+closed without launching. Plant MUST durably link newly created state
+directories before publishing a job fence, Agent Run claim, or outcome. The
+command MUST directly serialize one tagged `AgentRunReceipt` enum whose variant
+determines exit status and durability; it MUST NOT independently serialize
+state, durability, and exit-code fields that can disagree or report claim or
+persistence failures as a conclusive `Failed` outcome.
 
 #### Scenario: A completed agent run is retried
 
@@ -68,3 +70,9 @@ failures as a conclusive `Failed` outcome.
 - WHEN the Herdr lifecycle finishes but Plant cannot durably persist its conclusive outcome
 - THEN Plant reports an indeterminate non-durable result
 - AND it does not misreport a durable `Failed` outcome
+
+#### Scenario: Agent Run state directory is new
+
+- WHEN Plant must create one or more missing state-directory levels before publishing a claim
+- THEN it fsyncs each new directory and its parent before starting Herdr
+- AND the claim is not published through an unlinked directory entry

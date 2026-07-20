@@ -56,14 +56,14 @@ The jobs contract already requires agent jobs to drive panes only via
 `plant agent run`, and `plant-agent-jobs` made Plant's Herdr lifecycle the
 single owner of workspace creation, readiness, delivery, wait, and cleanup.
 The library is a thin typed client over that interface: it supplies the
-persisted batch's stable idempotency key and requires a machine-readable Plant
-result that distinguishes durable `Succeeded`/`Failed` outcomes from
-retryable or indeterminate execution state, never a second lifecycle
-implementation. Plant durably claims each key before Herdr side effects,
-records conclusive outcomes before returning, and returns an already-recorded
-outcome without creating another workspace. A pre-launch unavailable probe is
-retryable; pending or inaccessible idempotency state and outcome-persistence
-failure are indeterminate. Neither advances Door state.
+persisted batch's stable idempotency key and parses Plant's serialized
+`AgentRunReceipt` tagged enum, whose variant alone determines exit status and
+durability, never a second lifecycle implementation. Plant durably claims each
+key before Herdr side effects, records conclusive outcomes before returning,
+and returns an already-recorded outcome without creating another workspace. A
+pre-launch unavailable probe is retryable; pending or inaccessible idempotency
+state and outcome-persistence failure are indeterminate. Neither advances Door
+state.
 
 ### ADR-0004: Loop prevention is allowlist-by-construction plus a rate breaker
 
@@ -94,3 +94,18 @@ The watch resolver selects one configured ingestion root, canonicalizes it,
 and resolves both scanned and claimed files through that root. Traversal and
 real paths outside the selected root, including symlink escapes, fail closed
 before content is read or an agent is launched.
+
+New Plant and Door state directories are created one level at a time and both
+the new directory and its parent are fsynced before any fence, claim, lock, or
+outcome is published. Door lock owner metadata is fsynced in a temporary inode
+before an atomic hard link publishes the canonical lock name, so a crash can
+leave an ignorable temp file or a complete reclaimable lock, never an empty
+canonical lock.
+
+Shipped scalar `hwm` and v1 `(mtime,path)` states migrate under the Door lock
+and the v2 replacement is durable before evaluation. Because neither legacy
+schema can prove which paths at its high-water timestamp already fired, the
+migration advances to the immediately following representable timestamp. This
+preserves never-fire-twice but can conservatively skip an unprocessed file tied
+exactly at the legacy timestamp. An existing v1 in-progress claim retains its
+original Plant idempotency key until its durable outcome is recovered.

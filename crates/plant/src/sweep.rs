@@ -353,14 +353,19 @@ fn job_sids_at(path: &Path) -> HashSet<String> {
 
 pub fn register_job_sid(sid: &str) {
     let path = job_sids_path();
-    let _ = std::fs::create_dir_all(path.parent().unwrap());
+    let parent = path.parent().unwrap();
+    if crate::jobs::ensure_dir_durable(parent).is_err() {
+        return;
+    }
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)
+        .open(&path)
     {
-        let _ = writeln!(f, "{sid}");
+        let _ = writeln!(f, "{sid}")
+            .and_then(|_| f.sync_all())
+            .and_then(|_| crate::jobs::sync_dir(parent));
     }
 }
 

@@ -28,7 +28,10 @@ resume the persisted claim. Only a machine-readable Plant result confirming a
 durably recorded `Succeeded` or `Failed` outcome MAY atomically advance the
 frontier through the claim and clear it. Retryable, operationally failed,
 missing, malformed, or otherwise indeterminate results MUST retain the claim
-and key. A given file MUST never launch a second agent run.
+and key. New Door state-directory levels MUST be durably linked before a lock,
+claim, migration, or outcome is published. Lock owner metadata MUST be complete
+and fsynced before the canonical lock path becomes visible. A given file MUST
+never launch a second agent run.
 
 #### Scenario: A sync batch produces one session
 
@@ -53,6 +56,12 @@ and key. A given file MUST never launch a second agent run.
 - THEN the per-door lock permits only one process to claim and launch the batch
 - AND the other process does not launch it
 
+#### Scenario: Lock publisher crashes
+
+- WHEN a Door process crashes while preparing lock owner metadata
+- THEN it cannot leave an incomplete canonical lock
+- AND an empty lock left by the shipped implementation is safely reclaimed
+
 #### Scenario: Files share a timestamp
 
 - WHEN `z.md` is durably processed and `a.md` lands later with the same mtime
@@ -70,6 +79,13 @@ and key. A given file MUST never launch a second agent run.
 - WHEN a door crashes after Plant durably records the launch outcome but before the frontier save
 - THEN the next invocation reuses the persisted key and Plant's durable prior outcome
 - AND no second Herdr workspace is created
+
+#### Scenario: Shipped state is migrated
+
+- WHEN a Door reads a shipped scalar `hwm` state or v1 `(mtime,path)` cursor state
+- THEN it atomically persists a valid v2 timestamp frontier under the Door lock before evaluation
+- AND it closes the legacy high-water timestamp conservatively so no file can fire twice
+- AND a v1 in-progress claim retains its original Plant idempotency key
 
 ### Requirement: Ingestion-only watch roots
 
@@ -93,6 +109,12 @@ agent-written Vault Content.
 - THEN the library returns a failure before reading that file or launching an agent
 - AND any durable in-progress claim remains intact
 
+#### Scenario: Unrelated symlink escape is outside the watch
+
+- WHEN an escaping symlink does not match the Door's watch glob
+- THEN no-follow glob scanning excludes it from evaluation
+- AND matching safe files remain eligible
+
 ### Requirement: Rolling-window fire breaker
 
 The library MUST pause a door that exceeds the configured fires-per-window
@@ -109,9 +131,10 @@ manual re-arm before the door fires again.
 
 The library MUST launch agent sessions only through `plant agent run`, MUST
 pass the persisted claim's stable idempotency key, and MUST require Plant's
-machine-readable result separating durable `Succeeded`/`Failed` outcomes from
-retryable and indeterminate state. It MUST NOT reimplement any part of the
-Herdr lifecycle owned by Plant.
+tagged `AgentRunReceipt`, deriving durability and the expected process exit
+status from the receipt variant. It MUST NOT reconstruct independently supplied
+state, durability, and exit-code fields or reimplement any part of the Herdr
+lifecycle owned by Plant.
 
 #### Scenario: Non-durable result does not advance the claim
 

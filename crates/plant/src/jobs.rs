@@ -235,11 +235,49 @@ pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
     File::open(path)?.sync_all()
 }
 
+pub(crate) fn ensure_dir_durable(path: &Path) -> io::Result<()> {
+    let mut missing = Vec::new();
+    let mut cursor = path;
+    loop {
+        match std::fs::metadata(cursor) {
+            Ok(metadata) if metadata.is_dir() => break,
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("{} is not a directory", cursor.display()),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing.push(cursor.to_path_buf());
+                cursor = cursor.parent().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "directory has no existing parent",
+                    )
+                })?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    for dir in missing.into_iter().rev() {
+        match std::fs::create_dir(&dir) {
+            Ok(()) => {}
+            Err(error)
+                if error.kind() == io::ErrorKind::AlreadyExists
+                    && std::fs::metadata(&dir)?.is_dir() => {}
+            Err(error) => return Err(error),
+        }
+        sync_dir(&dir)?;
+        sync_dir(dir.parent().expect("created directory has a parent"))?;
+    }
+    Ok(())
+}
+
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
-    std::fs::create_dir_all(parent)?;
+    ensure_dir_durable(parent)?;
     let tmp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
     let result = (|| {
         let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
@@ -279,7 +317,7 @@ fn ledger_has_attempt(name: &str, attempt_id: &str) -> io::Result<bool> {
 
 fn verify_ledger_writable(name: &str) -> io::Result<()> {
     let dir = state_dir().join("jobs");
-    std::fs::create_dir_all(&dir)?;
+    ensure_dir_durable(&dir)?;
     let path = ledger_path(name);
     if path.exists() {
         OpenOptions::new().append(true).open(&path)?;
@@ -298,7 +336,7 @@ fn verify_ledger_writable(name: &str) -> io::Result<()> {
 
 fn begin_attempt(name: &str) -> io::Result<AttemptStart> {
     let dir = attempt_dir();
-    std::fs::create_dir_all(&dir)?;
+    ensure_dir_durable(&dir)?;
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -370,7 +408,7 @@ fn record(
     detail: &str,
 ) -> io::Result<()> {
     let dir = state_dir().join("jobs");
-    std::fs::create_dir_all(&dir)?;
+    ensure_dir_durable(&dir)?;
     let rec = serde_json::json!({
         "ts": epoch_now(),
         "iso": crate::capture::iso_now(),
@@ -706,5 +744,19 @@ mod tests {
         assert_eq!(tail_line(""), None);
         let long = format!("first\n{}", "x".repeat(400));
         assert_eq!(tail_line(&long).unwrap().len(), 300);
+    }
+
+    #[test]
+    fn durable_directory_creation_handles_nested_and_existing_paths() {
+        let root = std::env::temp_dir().join(format!(
+            "plant-durable-dir-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let nested = root.join("a/b");
+        ensure_dir_durable(&nested).unwrap();
+        ensure_dir_durable(&nested).unwrap();
+        assert!(nested.is_dir());
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

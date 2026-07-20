@@ -8,17 +8,17 @@ import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
   fsyncSync,
+  linkSync,
   mkdirSync,
   openSync,
   readFileSync,
-  readdirSync,
   realpathSync,
   renameSync,
   statSync,
   unlinkSync,
   writeSync,
 } from "node:fs";
-import { basename, isAbsolute, relative, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
 const HOME = process.env.HOME ?? "";
 const vaultRoot = () => process.env.DOOR_VAULT_ROOT ?? `${HOME}/.dotfiles/vault`;
@@ -30,11 +30,13 @@ const allowedRoots = () => (process.env.DOOR_ROOTS ?? "mail,teams,tickets").spli
 
 const WINDOW_MS = 3_600_000;
 
-export type AgentState = "Succeeded" | "Failed" | "Retryable" | "Indeterminate";
-
-export type AgentResult =
-  | { state: "Succeeded" | "Failed"; durable: boolean; detail: string }
-  | { state: "Retryable" | "Indeterminate"; durable: false; detail: string };
+export type AgentRunReceipt =
+  | { outcome: "succeeded"; detail: string }
+  | { outcome: "failed"; detail: string }
+  | { outcome: "untracked_succeeded"; detail: string }
+  | { outcome: "untracked_failed"; detail: string }
+  | { outcome: "retryable"; detail: string }
+  | { outcome: "indeterminate"; detail: string };
 
 export interface AgentOpts {
   cli?: "claude" | "codex";
@@ -50,7 +52,27 @@ export interface AgentOpts {
 /** Typed client over `plant agent run` — the only sanctioned way to drive an
  * agent pane. A conclusive result is durable only when Plant says its stable
  * idempotency record was committed. */
-export async function agentRun(prompt: string, opts: AgentOpts = {}): Promise<AgentResult> {
+function receiptExitCode(receipt: AgentRunReceipt): 0 | 1 | 75 {
+  if (receipt.outcome === "succeeded" || receipt.outcome === "untracked_succeeded") return 0;
+  return receipt.outcome === "retryable" ? 75 : 1;
+}
+
+function receiptDurable(receipt: AgentRunReceipt): boolean {
+  return receipt.outcome === "succeeded" || receipt.outcome === "failed";
+}
+
+function parseReceipt(value: unknown): AgentRunReceipt | undefined {
+  const receipt = value as Record<string, unknown>;
+  if (!receipt || typeof receipt !== "object" || Array.isArray(receipt)
+    || Object.keys(receipt).some((key) => key !== "outcome" && key !== "detail")
+    || typeof receipt.detail !== "string"
+    || !["succeeded", "failed", "untracked_succeeded", "untracked_failed", "retryable", "indeterminate"].includes(receipt.outcome as string)) {
+    return undefined;
+  }
+  return receipt as AgentRunReceipt;
+}
+
+export async function agentRun(prompt: string, opts: AgentOpts = {}): Promise<AgentRunReceipt> {
   const argv = [plantBin(), "agent", "run", "--cli", opts.cli ?? "claude", "--label", opts.label ?? "agent"];
   for (const [flag, v] of [["--model", opts.model], ["--args", opts.args], ["--cwd", opts.cwd], ["--timeout", opts.timeout], ["--cleanup", opts.cleanup], ["--idempotency-key", opts.idempotencyKey]] as const) {
     if (v) argv.push(flag, v);
@@ -59,36 +81,14 @@ export async function agentRun(prompt: string, opts: AgentOpts = {}): Promise<Ag
   const [out, err, code] = await Promise.all([new Response(proc.stdout).text(), new Response(proc.stderr).text(), proc.exited]);
   const lastLine = (s: string) => s.split("\n").map((l) => l.trim()).filter(Boolean).pop();
   const fallback = lastLine(err) ?? lastLine(out) ?? "no output";
-  let receipt: Record<string, unknown>;
+  let receipt: AgentRunReceipt | undefined;
   try {
-    const parsed = JSON.parse(lastLine(out) ?? "");
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error();
-    receipt = parsed;
-  } catch {
-    return { state: "Indeterminate", durable: false, detail: `missing Plant result (exit ${code}): ${fallback}` };
+    receipt = parseReceipt(JSON.parse(lastLine(out) ?? ""));
+  } catch {}
+  if (!receipt || receiptExitCode(receipt) !== code) {
+    return { outcome: "indeterminate", detail: `invalid Plant receipt (exit ${code}): ${fallback}` };
   }
-  const states: Record<string, AgentState> = {
-    succeeded: "Succeeded",
-    failed: "Failed",
-    retryable: "Retryable",
-    indeterminate: "Indeterminate",
-  };
-  const state = typeof receipt.state === "string" ? states[receipt.state] : undefined;
-  const valid = receipt.type === "plant.agent.run"
-    && receipt.version === 1
-    && state !== undefined
-    && typeof receipt.detail === "string"
-    && typeof receipt.durable === "boolean"
-    && ((state === "Succeeded" && code === 0)
-      || (state === "Failed" && code === 1)
-      || (state === "Retryable" && code === 75 && receipt.durable === false)
-      || (state === "Indeterminate" && code === 1 && receipt.durable === false));
-  if (!valid) {
-    return { state: "Indeterminate", durable: false, detail: `invalid Plant result (exit ${code}): ${fallback}` };
-  }
-  return state === "Retryable" || state === "Indeterminate"
-    ? { state, durable: false, detail: receipt.detail }
-    : { state, durable: receipt.durable, detail: receipt.detail };
+  return receipt;
 }
 
 export interface DoorFile {
@@ -125,10 +125,16 @@ interface Frontier {
   seen: string[];
 }
 
+interface LegacyCursor {
+  mtimeMs: number;
+  path: string;
+}
+
 interface DoorClaim {
   from: Frontier;
   files: ClaimFile[];
   key: string;
+  legacyCursor?: LegacyCursor;
 }
 
 interface DoorState {
@@ -167,6 +173,14 @@ function validFile(value: unknown): value is ClaimFile {
     && file.path.length > 0;
 }
 
+function validLegacyCursor(value: unknown): value is LegacyCursor {
+  const cursor = value as LegacyCursor;
+  return !!cursor
+    && Number.isFinite(cursor.mtimeMs)
+    && cursor.mtimeMs >= 0
+    && typeof cursor.path === "string";
+}
+
 function validFrontier(value: unknown): value is Frontier {
   const frontier = value as Frontier;
   return !!frontier
@@ -189,6 +203,20 @@ function claimKey(name: string, from: Frontier, files: ClaimFile[]): string {
     .digest("hex");
 }
 
+function legacyClaimKey(name: string, from: LegacyCursor, files: ClaimFile[]): string {
+  return createHash("sha256")
+    .update(JSON.stringify({ door: name, from, files }))
+    .digest("hex");
+}
+
+function conservativeFrontier(mtimeMs: number): Frontier {
+  const value = new Float64Array([mtimeMs]);
+  const bits = new BigUint64Array(value.buffer);
+  bits[0] = bits[0]! + 1n;
+  if (!Number.isFinite(value[0])) throw new Error("legacy timestamp cannot be closed");
+  return { mtimeMs: value[0]!, seen: [] };
+}
+
 function parseState(name: string, value: unknown): DoorState {
   const raw = value as Record<string, unknown>;
   if (!raw || typeof raw !== "object" || !Array.isArray(raw.fires)
@@ -207,16 +235,21 @@ function parseState(name: string, value: unknown): DoorState {
   };
   if (raw.claim !== undefined) {
     const claim = raw.claim as DoorClaim;
+    const legacy = claim?.legacyCursor;
     if (!claim || !validFrontier(claim.from) || !sameFrontier(claim.from, state.frontier)
       || !Array.isArray(claim.files) || claim.files.length === 0
       || !claim.files.every(validFile)
       || claim.files.some((file) => !validRelativePath(file.path, true))
       || new Set(claim.files.map((file) => file.path)).size !== claim.files.length
       || claim.files.some((file, i) =>
-        !isNew(file, claim.from)
+        (legacy ? compareFile(file, legacy) <= 0 : !isNew(file, claim.from))
         || (i > 0 && compareFile(claim.files[i - 1]!, file) >= 0))
       || typeof claim.key !== "string"
-      || claim.key !== claimKey(name, claim.from, claim.files)) {
+      || (legacy
+        ? !validLegacyCursor(legacy)
+          || claim.from.mtimeMs !== conservativeFrontier(legacy.mtimeMs).mtimeMs
+          || claim.key !== legacyClaimKey(name, legacy, claim.files)
+        : claim.key !== claimKey(name, claim.from, claim.files))) {
       throw new Error("invalid door claim");
     }
     state.claim = claim;
@@ -224,9 +257,67 @@ function parseState(name: string, value: unknown): DoorState {
   return state;
 }
 
+function migrateLegacyState(name: string, value: unknown): DoorState {
+  const raw = value as Record<string, unknown>;
+  if (!raw || typeof raw !== "object"
+    || !Array.isArray(raw.fires)
+    || !raw.fires.every((fire) => Number.isFinite(fire) && (fire as number) >= 0)
+    || (raw.paused !== undefined && typeof raw.paused !== "string")) {
+    throw new Error("invalid legacy door state");
+  }
+  const metadata = {
+    fires: raw.fires as number[],
+    ...(raw.paused === undefined ? {} : { paused: raw.paused as string }),
+  };
+  if (raw.version === undefined && Number.isFinite(raw.hwm) && (raw.hwm as number) >= 0
+    && raw.cursor === undefined && raw.claim === undefined) {
+    return {
+      version: 2,
+      frontier: conservativeFrontier(raw.hwm as number),
+      ...metadata,
+    };
+  }
+  if (raw.version !== 1 || !validLegacyCursor(raw.cursor)) {
+    throw new Error("unsupported door state version");
+  }
+  const cursor = raw.cursor;
+  const state: DoorState = {
+    version: 2,
+    frontier: conservativeFrontier(cursor.mtimeMs),
+    ...metadata,
+  };
+  if (raw.claim !== undefined) {
+    const claim = raw.claim as { from: LegacyCursor; files: ClaimFile[]; key: string };
+    if (!claim || !validLegacyCursor(claim.from)
+      || compareFile(claim.from, cursor) !== 0
+      || !Array.isArray(claim.files) || claim.files.length === 0
+      || !claim.files.every(validFile)
+      || claim.files.some((file) => !validRelativePath(file.path, true))
+      || new Set(claim.files.map((file) => file.path)).size !== claim.files.length
+      || claim.files.some((file, index) =>
+        compareFile(file, cursor) <= 0
+        || (index > 0 && compareFile(claim.files[index - 1]!, file) >= 0))
+      || typeof claim.key !== "string"
+      || claim.key !== legacyClaimKey(name, cursor, claim.files)) {
+      throw new Error("invalid legacy door claim");
+    }
+    state.claim = {
+      from: state.frontier,
+      files: claim.files,
+      key: claim.key,
+      legacyCursor: cursor,
+    };
+  }
+  return state;
+}
+
 function loadState(name: string): DoorState {
   try {
-    return parseState(name, JSON.parse(readFileSync(statePath(name), "utf8")));
+    const value = JSON.parse(readFileSync(statePath(name), "utf8"));
+    if ((value as Record<string, unknown>)?.version === 2) return parseState(name, value);
+    const state = migrateLegacyState(name, value);
+    saveState(name, state);
+    return state;
   } catch (error: any) {
     if (error?.code === "ENOENT") {
       return { version: 2, frontier: { mtimeMs: 0, seen: [] }, fires: [] };
@@ -244,8 +335,34 @@ function syncDirectory(path: string): void {
   }
 }
 
+function ensureDirectoryDurable(path: string): void {
+  const missing: string[] = [];
+  let cursor = resolve(path);
+  while (true) {
+    try {
+      if (!statSync(cursor).isDirectory()) throw new Error(`${cursor} is not a directory`);
+      break;
+    } catch (error: any) {
+      if (error?.code !== "ENOENT") throw error;
+      missing.push(cursor);
+      const parent = dirname(cursor);
+      if (parent === cursor) throw error;
+      cursor = parent;
+    }
+  }
+  for (const dir of missing.reverse()) {
+    try {
+      mkdirSync(dir, { mode: 0o700 });
+    } catch (error: any) {
+      if (error?.code !== "EEXIST" || !statSync(dir).isDirectory()) throw error;
+    }
+    syncDirectory(dir);
+    syncDirectory(dirname(dir));
+  }
+}
+
 function saveState(name: string, state: DoorState): void {
-  mkdirSync(stateDir(), { recursive: true });
+  ensureDirectoryDurable(stateDir());
   const path = statePath(name);
   const tmp = `${path}.tmp-${randomUUID()}`;
   let fd: number | undefined;
@@ -283,40 +400,60 @@ function pidAlive(pid: number): boolean {
   }
 }
 
+function publishLock(path: string, owner: { pid: number; token: string }): boolean {
+  const tmp = `${path}.tmp-${owner.token}`;
+  let fd: number | undefined;
+  let linked = false;
+  try {
+    fd = openSync(tmp, "wx", 0o600);
+    writeSync(fd, `${JSON.stringify(owner)}\n`);
+    fsyncSync(fd);
+    closeSync(fd);
+    fd = undefined;
+    try {
+      linkSync(tmp, path);
+      linked = true;
+    } catch (error: any) {
+      if (error?.code === "EEXIST") return false;
+      throw error;
+    }
+    syncDirectory(stateDir());
+    return true;
+  } catch (error) {
+    if (linked) {
+      try {
+        unlinkSync(path);
+        syncDirectory(stateDir());
+      } catch {}
+    }
+    throw error;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+    try {
+      unlinkSync(tmp);
+      syncDirectory(stateDir());
+    } catch {}
+  }
+}
+
 function acquireLock(name: string): (() => void) | undefined {
-  mkdirSync(stateDir(), { recursive: true });
+  ensureDirectoryDurable(stateDir());
   const path = lockPath(name);
   for (let attempt = 0; attempt < 3; attempt++) {
     const token = randomUUID();
-    let fd: number;
-    try {
-      fd = openSync(path, "wx", 0o600);
-    } catch (error: any) {
-      if (error?.code !== "EEXIST") throw error;
-      const owner = lockOwner(path);
-      if (pidAlive(owner.pid)) return undefined;
+    if (!publishLock(path, { pid: process.pid, token })) {
+      let owner: { pid: number; token: string };
       try {
+        owner = lockOwner(path);
+      } catch {
         unlinkSync(path);
         syncDirectory(stateDir());
-      } catch (unlinkError: any) {
-        if (unlinkError?.code !== "ENOENT") throw unlinkError;
+        continue;
       }
-      continue;
-    }
-    try {
-      writeSync(fd, `${JSON.stringify({ pid: process.pid, token })}\n`);
-      fsyncSync(fd);
-      closeSync(fd);
+      if (pidAlive(owner.pid)) return undefined;
+      unlinkSync(path);
       syncDirectory(stateDir());
-    } catch (error) {
-      try {
-        closeSync(fd);
-      } catch {}
-      try {
-        unlinkSync(path);
-        syncDirectory(stateDir());
-      } catch {}
-      throw error;
+      continue;
     }
     return () => {
       if (lockOwner(path).token !== token) {
@@ -390,32 +527,6 @@ function resolveIngestionFile(root: IngestionRoot, path: string): string {
   return canonical;
 }
 
-/** Walk without following directory symlinks, validating every symlink before
- * deciding whether its file target matches the watch glob. */
-function scanIngestionPaths(root: IngestionRoot): string[] {
-  const glob = new Bun.Glob(root.pattern);
-  const pending = [""];
-  const matches: string[] = [];
-  while (pending.length > 0) {
-    const dir = pending.pop()!;
-    for (const entry of readdirSync(resolve(root.path, dir), { withFileTypes: true })) {
-      const path = dir ? `${dir}/${entry.name}` : entry.name;
-      if (entry.isSymbolicLink()) {
-        const target = realpathSync(resolve(root.path, path));
-        if (!isBeneath(root.path, target)) {
-          throw new Error(`symlink escapes ingestion root: ${path}`);
-        }
-        if (statSync(target).isFile() && glob.match(path)) matches.push(path);
-      } else if (entry.isDirectory()) {
-        pending.push(path);
-      } else if (entry.isFile() && glob.match(path)) {
-        matches.push(path);
-      }
-    }
-  }
-  return matches;
-}
-
 function claimRelativePath(root: IngestionRoot, path: string): string {
   if (!path.startsWith(`${root.prefix}/`)) {
     throw new Error(`claimed path is outside ingestion root "${root.prefix}": ${path}`);
@@ -440,6 +551,7 @@ function hydrateClaim(root: IngestionRoot, claim: DoorClaim): DoorFile[] {
 
 function advanceFrontier(from: Frontier, files: ClaimFile[]): Frontier {
   const mtimeMs = files[files.length - 1]!.mtimeMs;
+  if (mtimeMs < from.mtimeMs) return from;
   const atFrontier = files
     .filter((file) => file.mtimeMs === mtimeMs)
     .map((file) => file.path);
@@ -471,7 +583,11 @@ export async function door(spec: DoorSpec): Promise<DoorResult> {
 
     if (!state.claim) {
       const files: DoorFile[] = [];
-      for (const path of scanIngestionPaths(root)) {
+      for (const path of new Bun.Glob(root.pattern).scanSync({
+        cwd: root.path,
+        followSymlinks: false,
+        onlyFiles: false,
+      })) {
         try {
           const abs = resolveIngestionFile(root, path);
           const stat = statSync(abs);
@@ -516,8 +632,8 @@ export async function door(spec: DoorSpec): Promise<DoorResult> {
       ...spec.agent,
       idempotencyKey: claim.key,
     });
-    if (!result.durable) {
-      return result.state === "Retryable"
+    if (!receiptDurable(result)) {
+      return result.outcome === "retryable"
         ? { code: 75, detail: `agent retryable, ${matched.length} file(s) held: ${result.detail}` }
         : { code: 1, detail: `agent outcome indeterminate, ${matched.length} file(s) held: ${result.detail}` };
     }
@@ -526,7 +642,7 @@ export async function door(spec: DoorSpec): Promise<DoorResult> {
     state.frontier = advanceFrontier(claim.from, claim.files);
     delete state.claim;
     saveState(name, state);
-    return result.state === "Succeeded"
+    return result.outcome === "succeeded"
       ? { code: 0, detail: `fired on ${matched.length} file(s): ${result.detail}` }
       : { code: 1, detail: `agent failed after claiming ${matched.length} file(s): ${result.detail}` };
   } catch (error) {

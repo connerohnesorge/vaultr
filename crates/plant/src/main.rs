@@ -18,7 +18,7 @@ use std::time::{Duration, SystemTime};
 
 fn crash_log() -> PathBuf {
     let dir = jobs::state_dir();
-    let _ = std::fs::create_dir_all(&dir);
+    let _ = jobs::ensure_dir_durable(&dir);
     dir.join("crash.log")
 }
 
@@ -218,42 +218,25 @@ async fn subcommand(argv: &[String]) -> Option<i32> {
                 preset_session_id,
                 discover_session_id: cli == "codex",
             };
-            let label = run.label.clone();
-            let (state, durable, detail, code) = match flag("--idempotency-key") {
-                Some(key) => match herdr::run_agent_idempotent(run, &key).await {
-                    herdr::IdempotentAgentRun::Durable(herdr::DurableAgentOutcome::Succeeded(
-                        detail,
-                    )) => ("succeeded", true, detail, 0),
-                    herdr::IdempotentAgentRun::Durable(herdr::DurableAgentOutcome::Failed(
-                        detail,
-                    )) => ("failed", true, detail, 1),
-                    herdr::IdempotentAgentRun::Retryable(detail) => {
-                        ("retryable", false, detail, 75)
-                    }
-                    herdr::IdempotentAgentRun::Indeterminate(detail) => {
-                        ("indeterminate", false, detail, 1)
-                    }
-                },
+            let receipt = match flag("--idempotency-key") {
+                Some(key) => herdr::run_agent_idempotent(run, &key).await,
                 None => match herdr::run_agent(run).await {
-                    herdr::AgentRunOutcome::Succeeded(detail) => ("succeeded", false, detail, 0),
-                    herdr::AgentRunOutcome::Unavailable => {
-                        ("retryable", false, "herdr unavailable".to_string(), 75)
+                    herdr::AgentRunOutcome::Succeeded(detail) => {
+                        herdr::AgentRunReceipt::UntrackedSucceeded { detail }
                     }
-                    herdr::AgentRunOutcome::Failed(detail) => ("failed", false, detail, 1),
+                    herdr::AgentRunOutcome::Unavailable => herdr::AgentRunReceipt::Retryable {
+                        detail: "herdr unavailable".to_string(),
+                    },
+                    herdr::AgentRunOutcome::Failed(detail) => {
+                        herdr::AgentRunReceipt::UntrackedFailed { detail }
+                    }
                 },
             };
             println!(
                 "{}",
-                serde_json::json!({
-                    "type": "plant.agent.run",
-                    "version": 1,
-                    "state": state,
-                    "durable": durable,
-                    "detail": detail,
-                    "label": label,
-                })
+                serde_json::to_string(&receipt).expect("receipt serializes")
             );
-            Some(code)
+            Some(receipt.exit_code())
         }
         _ => None,
     }

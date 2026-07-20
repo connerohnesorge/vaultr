@@ -1,4 +1,5 @@
 import { test, expect, beforeEach, afterEach } from "bun:test";
+import { createHash } from "node:crypto";
 import {
   chmodSync,
   mkdtempSync,
@@ -22,12 +23,12 @@ let stubLog: string;
 
 function writeStub(exitCode: number) {
   const result = exitCode === 0
-    ? '{"type":"plant.agent.run","version":1,"state":"succeeded","durable":true,"detail":"stub done"}'
+    ? '{"outcome":"succeeded","detail":"stub done"}'
     : exitCode === 1
-      ? '{"type":"plant.agent.run","version":1,"state":"failed","durable":true,"detail":"stub done"}'
+      ? '{"outcome":"failed","detail":"stub done"}'
       : exitCode === 75
-        ? '{"type":"plant.agent.run","version":1,"state":"retryable","durable":false,"detail":"stub unavailable"}'
-        : '{"type":"plant.agent.run","version":1,"state":"failed","durable":true,"detail":"bad exit"}';
+        ? '{"outcome":"retryable","detail":"stub unavailable"}'
+        : '{"outcome":"failed","detail":"bad exit"}';
   writeFileSync(stub, `#!/bin/sh\nprintf '%s ' "$@" >> "${stubLog}"\ncat >> "${stubLog}"\nprintf '\\n---\\n' >> "${stubLog}"\nprintf '%s\\n' '${result}'\nexit ${exitCode}\n`);
   chmodSync(stub, 0o755);
 }
@@ -46,9 +47,9 @@ if [ -n "$key" ] && [ -f "${outcomes}/$key" ]; then
   cat >/dev/null
   code="$(cat "${outcomes}/$key")"
   if [ "$code" = 0 ]; then
-    echo '{"type":"plant.agent.run","version":1,"state":"succeeded","durable":true,"detail":"stub cached"}'
+    echo '{"outcome":"succeeded","detail":"stub cached"}'
   else
-    echo '{"type":"plant.agent.run","version":1,"state":"failed","durable":true,"detail":"stub cached"}'
+    echo '{"outcome":"failed","detail":"stub cached"}'
   fi
   exit "$code"
 fi
@@ -62,9 +63,9 @@ if [ -n "$key" ]; then
 fi
 ${opts.killParent ? 'kill -KILL "$PPID"' : ""}
 if [ "${exitCode}" = 0 ]; then
-  echo '{"type":"plant.agent.run","version":1,"state":"succeeded","durable":true,"detail":"stub done"}'
+  echo '{"outcome":"succeeded","detail":"stub done"}'
 else
-  echo '{"type":"plant.agent.run","version":1,"state":"failed","durable":true,"detail":"stub done"}'
+  echo '{"outcome":"failed","detail":"stub done"}'
 fi
 exit ${exitCode}
 `);
@@ -111,6 +112,10 @@ function landFile(rel: string, mtimeSec: number) {
   mkdirSync(join(abs, ".."), { recursive: true });
   writeFileSync(abs, `content of ${rel}`);
   utimesSync(abs, mtimeSec, mtimeSec);
+}
+
+function legacyKey(name: string, from: { mtimeMs: number; path: string }, files: { mtimeMs: number; path: string }[]) {
+  return createHash("sha256").update(JSON.stringify({ door: name, from, files })).digest("hex");
 }
 
 beforeEach(() => {
@@ -183,6 +188,74 @@ test("corrupt state fails closed without replacement or launch", async () => {
   expect(stubCalls()).toBe(0);
 });
 
+test("scalar hwm state migrates durably and conservatively closes its tied timestamp", async () => {
+  landFile("mail/tie.md", 1000);
+  const path = join(tmp, "state", "hwm.json");
+  mkdirSync(join(tmp, "state"), { recursive: true });
+  writeFileSync(path, JSON.stringify({ hwm: 1000000, fires: [123] }));
+  const spec = { name: "hwm", watch: "mail/*.md", prompt: () => "go" };
+
+  expect((await door(spec)).detail).toBe("no new files");
+  const migrated = JSON.parse(readFileSync(path, "utf8"));
+  expect(migrated.version).toBe(2);
+  expect(migrated.frontier.mtimeMs).toBeGreaterThan(1000000);
+  expect(migrated.frontier.seen).toEqual([]);
+  expect(stubCalls()).toBe(0);
+
+  landFile("mail/new.md", 1001);
+  expect((await door(spec)).code).toBe(0);
+  expect(stubCalls()).toBe(1);
+});
+
+test("v1 cursor and in-progress claim migrate without changing the Plant key", async () => {
+  const name = "v1";
+  const cursor = { mtimeMs: 999000, path: "mail/old.md" };
+  const files = [{ mtimeMs: 1000000, path: "mail/claim.md" }];
+  const key = legacyKey(name, cursor, files);
+  landFile("mail/claim.md", 1000);
+  mkdirSync(join(tmp, "state"), { recursive: true });
+  writeFileSync(join(tmp, "state", `${name}.json`), JSON.stringify({
+    version: 1,
+    cursor,
+    fires: [],
+    claim: { from: cursor, files, key },
+  }));
+
+  const beforeLaunch = await door({
+    name,
+    watch: "mail/claim.md",
+    prompt: () => {
+      throw new Error("crash before launch");
+    },
+  });
+  expect(beforeLaunch.code).toBe(1);
+  const persisted = JSON.parse(readFileSync(join(tmp, "state", `${name}.json`), "utf8"));
+  expect(persisted).toMatchObject({ version: 2, claim: { key } });
+  expect(stubCalls()).toBe(0);
+
+  expect((await door({ name, watch: "mail/claim.md", prompt: () => "go" })).code).toBe(0);
+  expect(readFileSync(stubLog, "utf8")).toContain(`--idempotency-key ${key}`);
+  const migrated = JSON.parse(readFileSync(join(tmp, "state", `${name}.json`), "utf8"));
+  expect(migrated.version).toBe(2);
+  expect(migrated.claim).toBeUndefined();
+});
+
+test("v1 cursor without a claim closes the entire legacy tie", async () => {
+  landFile("mail/a.md", 1000);
+  const path = join(tmp, "state", "v1-tie.json");
+  mkdirSync(join(tmp, "state"), { recursive: true });
+  writeFileSync(path, JSON.stringify({
+    version: 1,
+    cursor: { mtimeMs: 1000000, path: "mail/z.md" },
+    fires: [],
+  }));
+  const spec = { name: "v1-tie", watch: "mail/*.md", prompt: () => "go" };
+
+  expect((await door(spec)).detail).toBe("no new files");
+  expect(JSON.parse(readFileSync(path, "utf8")).frontier.mtimeMs).toBeGreaterThan(1000000);
+  expect(stubCalls()).toBe(0);
+});
+
 test("a later lower-sorting path at the frontier timestamp is not missed", async () => {
   const spec = { name: "t", watch: "mail/*.md", prompt: (files: any[]) => files.map((file) => file.path).join(" ") };
   landFile("mail/z.md", 1000);
@@ -199,9 +272,36 @@ test("concurrent door processes launch one batch once", async () => {
   landFile("mail/a.md", 1000);
   writeIdempotentStub(0, { delay: 0.3 });
   const first = spawnWorker();
+  let owner: any;
+  for (let attempt = 0; attempt < 50 && !owner; attempt++) {
+    try {
+      owner = JSON.parse(readFileSync(join(tmp, "state", "t.lock"), "utf8"));
+    } catch {
+      await Bun.sleep(10);
+    }
+  }
+  expect(owner).toMatchObject({ pid: expect.any(Number), token: expect.any(String) });
   const second = spawnWorker();
   const codes = await Promise.all([first.exited, second.exited]);
   expect(codes.sort((a, b) => a - b)).toEqual([0, 75]);
+  expect(stubCalls()).toBe(1);
+});
+
+test("an empty lock left by a crashed old publisher is reclaimed", async () => {
+  landFile("mail/a.md", 1000);
+  mkdirSync(join(tmp, "state"), { recursive: true });
+  writeFileSync(join(tmp, "state", "t.lock"), "");
+  const result = await door({ name: "t", watch: "mail/*.md", prompt: () => "go" });
+  expect(result.code).toBe(0);
+  expect(stubCalls()).toBe(1);
+});
+
+test("a crash while preparing owner metadata leaves only an ignorable temp lock", async () => {
+  landFile("mail/a.md", 1000);
+  mkdirSync(join(tmp, "state"), { recursive: true });
+  writeFileSync(join(tmp, "state", "t.lock.tmp-crashed"), "");
+  const result = await door({ name: "t", watch: "mail/*.md", prompt: () => "go" });
+  expect(result.code).toBe(0);
   expect(stubCalls()).toBe(1);
 });
 
@@ -253,7 +353,7 @@ exit 1
 printf '%s ' "$@" >> "${stubLog}"
 cat >> "${stubLog}"
 printf '\\n---\\n' >> "${stubLog}"
-echo '{"type":"plant.agent.run","version":1,"state":"succeeded","durable":false,"detail":"not recorded"}'
+echo '{"outcome":"untracked_succeeded","detail":"not recorded"}'
 exit 0
 `);
   chmodSync(stub, 0o755);
@@ -290,6 +390,16 @@ test("a scanned symlink escaping the ingestion root fails closed", async () => {
   expect(result.code).toBe(1);
   expect(result.detail).toContain("symlink escapes ingestion root");
   expect(stubCalls()).toBe(0);
+});
+
+test("an unrelated escaping symlink outside the glob does not disable the door", async () => {
+  const outside = join(tmp, "outside.txt");
+  writeFileSync(outside, "unrelated");
+  symlinkSync(outside, join(vault, "mail", "escape.txt"));
+  landFile("mail/a.md", 1000);
+  const result = await door({ name: "t", watch: "mail/*.md", prompt: () => "go" });
+  expect(result.code).toBe(0);
+  expect(stubCalls()).toBe(1);
 });
 
 test("a claimed file replaced by an escaping symlink is rejected before retry launch", async () => {
@@ -345,13 +455,20 @@ test("breaker pauses a runaway door and stays paused until re-armed", async () =
 
 test("agentRun accepts only a valid machine-readable Plant result", async () => {
   writeStub(0);
-  expect(await agentRun("p")).toMatchObject({ state: "Succeeded", durable: true });
+  expect(await agentRun("p")).toEqual({ outcome: "succeeded", detail: "stub done" });
   writeStub(75);
-  expect(await agentRun("p")).toMatchObject({ state: "Retryable", durable: false });
+  expect(await agentRun("p")).toEqual({ outcome: "retryable", detail: "stub unavailable" });
   writeStub(1);
-  expect(await agentRun("p")).toMatchObject({ state: "Failed", durable: true });
+  expect(await agentRun("p")).toEqual({ outcome: "failed", detail: "stub done" });
   writeStub(3);
-  expect(await agentRun("p")).toMatchObject({ state: "Indeterminate", durable: false });
+  expect((await agentRun("p")).outcome).toBe("indeterminate");
+  writeFileSync(stub, `#!/bin/sh
+cat >/dev/null
+echo '{"state":"succeeded","durable":true,"detail":"old protocol"}'
+exit 0
+`);
+  chmodSync(stub, 0o755);
+  expect((await agentRun("p")).outcome).toBe("indeterminate");
   rmSync(stubLog);
   writeStub(0);
   await agentRun("the prompt", { cli: "codex", model: "gpt-5.6-sol", timeout: "10m" });
