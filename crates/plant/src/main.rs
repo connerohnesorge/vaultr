@@ -38,6 +38,7 @@ fn vault_root() -> PathBuf {
 /// findings), `plant compress once [--idle 60m]`, `plant jobs run <name>` (manual
 /// trigger of a vault/jobs script), and `plant agent run --cli claude|codex [--model M]
 /// [--args '…'] [--label L] [--cleanup always|on-success|never] [--timeout 45m] [--cwd D]`
+/// [--idempotency-key K]
 /// with the prompt on stdin — the ONLY sanctioned way for job scripts to drive an agent
 /// (Herdr pane orchestration; never `claude -p`). Exit: 0 succeeded, 75 herdr
 /// unavailable (retry later), 1 failed. Requested --cleanup is honored only when
@@ -196,10 +197,11 @@ async fn subcommand(argv: &[String]) -> Option<i32> {
             // the pane once the run finishes (discover_session_id below).
             let mut launch =
                 jobs::launch_line(&cli, flag("--model").as_deref(), flag("--args").as_deref());
+            let mut preset_session_id = None;
             if cli == "claude" {
                 let sid = uuid::Uuid::new_v4().to_string();
-                sweep::register_job_sid(&sid);
                 launch.push_str(&format!(" --session-id '{sid}'"));
+                preset_session_id = Some(sid);
             }
             let run = herdr::AgentRun {
                 label: flag("--label").unwrap_or_else(|| "agent".to_string()),
@@ -212,10 +214,15 @@ async fn subcommand(argv: &[String]) -> Option<i32> {
                     .and_then(|v| jobs::parse_duration(&v))
                     .unwrap_or(Duration::from_secs(45 * 60)),
                 cleanup: jobs::cleanup_policy(requested, &jobs::Cfg::load(&vault_root())),
+                preset_session_id,
                 discover_session_id: cli == "codex",
             };
             let label = run.label.clone();
-            match herdr::run_agent(run).await {
+            let outcome = match flag("--idempotency-key") {
+                Some(key) => herdr::run_agent_idempotent(run, &key).await,
+                None => herdr::run_agent(run).await,
+            };
+            match outcome {
                 herdr::AgentRunOutcome::Succeeded(detail) => {
                     println!("[agent:{label}] succeeded: {detail}");
                     Some(0)

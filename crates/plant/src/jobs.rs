@@ -13,7 +13,10 @@
 //! renames take effect without a restart.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::fs::{File, OpenOptions};
+use std::io::{self, Write};
+use std::os::fd::AsRawFd;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -180,35 +183,223 @@ pub fn epoch_now() -> u64 {
         .unwrap_or(0)
 }
 
-fn last_record_ts(name: &str) -> Option<u64> {
-    let text =
-        std::fs::read_to_string(state_dir().join("jobs").join(format!("{name}.jsonl"))).ok()?;
-    let line = text.lines().rev().find(|l| !l.trim().is_empty())?;
-    serde_json::from_str::<serde_json::Value>(line)
-        .ok()?
-        .get("ts")?
-        .as_u64()
+fn ledger_path(name: &str) -> PathBuf {
+    state_dir().join("jobs").join(format!("{name}.jsonl"))
 }
 
-fn record(name: &str, outcome: &str, started: SystemTime, detail: &str) {
+fn last_record_ts(name: &str) -> io::Result<Option<u64>> {
+    let text = match std::fs::read_to_string(ledger_path(name)) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let Some(line) = text.lines().rev().find(|l| !l.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let record: serde_json::Value =
+        serde_json::from_str(line).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    record
+        .get("ts")
+        .and_then(serde_json::Value::as_u64)
+        .map(Some)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "job record has no ts"))
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct AttemptFence {
+    id: String,
+    started_ts: u64,
+    retryable: bool,
+}
+
+struct AttemptGuard {
+    name: String,
+    fence: AttemptFence,
+    _lock: File,
+}
+
+enum AttemptStart {
+    Ready(AttemptGuard),
+    Blocked(String),
+}
+
+fn attempt_dir() -> PathBuf {
+    state_dir().join("job-attempts")
+}
+
+fn attempt_path(name: &str) -> PathBuf {
+    attempt_dir().join(format!("{name}.json"))
+}
+
+pub(crate) fn sync_dir(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    let tmp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&tmp, path)?;
+        sync_dir(parent)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+    result
+}
+
+fn write_fence(path: &Path, fence: &AttemptFence) -> io::Result<()> {
+    let mut bytes =
+        serde_json::to_vec(fence).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    bytes.push(b'\n');
+    atomic_write(path, &bytes)
+}
+
+fn ledger_has_attempt(name: &str, attempt_id: &str) -> io::Result<bool> {
+    let text = match std::fs::read_to_string(ledger_path(name)) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    for line in text.lines().filter(|line| !line.trim().is_empty()) {
+        let record: serde_json::Value = serde_json::from_str(line)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if record.get("attempt_id").and_then(serde_json::Value::as_str) == Some(attempt_id) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn verify_ledger_writable(name: &str) -> io::Result<()> {
     let dir = state_dir().join("jobs");
-    let _ = std::fs::create_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    let path = ledger_path(name);
+    if path.exists() {
+        OpenOptions::new().append(true).open(&path)?;
+        last_record_ts(name)?;
+        return Ok(());
+    }
+    let marker = dir.join(format!(".{name}.probe-{}", uuid::Uuid::new_v4()));
+    let result = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)
+        .and_then(|file| file.sync_all());
+    let _ = std::fs::remove_file(marker);
+    result
+}
+
+fn begin_attempt(name: &str) -> io::Result<AttemptStart> {
+    let dir = attempt_dir();
+    std::fs::create_dir_all(&dir)?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join(format!("{name}.lock")))?;
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::WouldBlock {
+            Ok(AttemptStart::Blocked(
+                "another process holds the attempt lock".to_string(),
+            ))
+        } else {
+            Err(error)
+        };
+    }
+    verify_ledger_writable(name)?;
+
+    let path = attempt_path(name);
+    let existing = match std::fs::read_to_string(&path) {
+        Ok(text) => Some(
+            serde_json::from_str::<AttemptFence>(&text)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?,
+        ),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    if let Some(existing) = existing {
+        if !existing.retryable && !ledger_has_attempt(name, &existing.id)? {
+            return Ok(AttemptStart::Blocked(format!(
+                "attempt {} has no durable final outcome",
+                existing.id
+            )));
+        }
+        std::fs::remove_file(&path)?;
+        sync_dir(&dir)?;
+    }
+
+    let fence = AttemptFence {
+        id: uuid::Uuid::new_v4().to_string(),
+        started_ts: epoch_now(),
+        retryable: false,
+    };
+    write_fence(&path, &fence)?;
+    Ok(AttemptStart::Ready(AttemptGuard {
+        name: name.to_string(),
+        fence,
+        _lock: lock,
+    }))
+}
+
+impl AttemptGuard {
+    fn mark_retryable(&mut self) -> io::Result<()> {
+        self.fence.retryable = true;
+        write_fence(&attempt_path(&self.name), &self.fence)
+    }
+
+    fn clear(&self) -> io::Result<()> {
+        std::fs::remove_file(attempt_path(&self.name))?;
+        sync_dir(&attempt_dir())
+    }
+}
+
+fn record(
+    name: &str,
+    attempt_id: &str,
+    outcome: &str,
+    started: SystemTime,
+    detail: &str,
+) -> io::Result<()> {
+    let dir = state_dir().join("jobs");
+    std::fs::create_dir_all(&dir)?;
     let rec = serde_json::json!({
         "ts": epoch_now(),
         "iso": crate::capture::iso_now(),
+        "attempt_id": attempt_id,
         "outcome": outcome,
         "duration_ms": started.elapsed().map(|d| d.as_millis() as u64).unwrap_or(0),
         "detail": detail,
     });
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
+    let mut line =
+        serde_json::to_vec(&rec).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    line.push(b'\n');
+    let mut file = OpenOptions::new()
         .create(true)
         .append(true)
-        .open(dir.join(format!("{name}.jsonl")))
-    {
-        let _ = writeln!(f, "{rec}");
-    }
+        .open(ledger_path(name))?;
+    file.write_all(&line)?;
+    file.sync_data()?;
     println!("[job:{name}] {outcome} ({detail})");
+    Ok(())
+}
+
+fn finish_attempt(
+    attempt: &AttemptGuard,
+    outcome: &str,
+    started: SystemTime,
+    detail: &str,
+) -> io::Result<()> {
+    record(&attempt.name, &attempt.fence.id, outcome, started, detail)?;
+    attempt.clear()
 }
 
 /// Exit status -> ledger outcome. None = don't record, retry next tick (75/EX_TEMPFAIL
@@ -252,6 +443,17 @@ const SCRIPT_BACKSTOP: Duration = Duration::from_secs(3 * 3600);
 
 pub async fn run_job(job: &Job) -> i32 {
     let started = SystemTime::now();
+    let mut attempt = match begin_attempt(&job.name) {
+        Ok(AttemptStart::Ready(attempt)) => attempt,
+        Ok(AttemptStart::Blocked(detail)) => {
+            eprintln!("[job:{}] dispatch blocked: {detail}", job.name);
+            return 1;
+        }
+        Err(e) => {
+            eprintln!("[job:{}] attempt fence failed: {e}", job.name);
+            return 1;
+        }
+    };
     // Exec the script directly: the shebang picks the interpreter. A missing
     // shebang or exec bit fails at spawn (ENOEXEC/EACCES) and is recorded below.
     let mut cmd = tokio::process::Command::new(&job.path);
@@ -259,7 +461,11 @@ pub async fn run_job(job: &Job) -> i32 {
         .env("PATH", script_path_env())
         .env(
             "PLANT_LAST_TS",
-            last_record_ts(&job.name).unwrap_or(0).to_string(),
+            last_record_ts(&job.name)
+                .ok()
+                .flatten()
+                .unwrap_or(0)
+                .to_string(),
         )
         .kill_on_drop(true)
         .stdin(std::process::Stdio::null())
@@ -268,19 +474,31 @@ pub async fn run_job(job: &Job) -> i32 {
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            record(&job.name, "failed", started, &format!("spawn: {e}"));
+            if let Err(record_error) =
+                finish_attempt(&attempt, "failed", started, &format!("spawn: {e}"))
+            {
+                eprintln!("[job:{}] final record failed: {record_error}", job.name);
+            }
             return 1;
         }
     };
     let out = match tokio::time::timeout(SCRIPT_BACKSTOP, child.wait_with_output()).await {
         Ok(Ok(out)) => out,
         Ok(Err(e)) => {
-            record(&job.name, "failed", started, &format!("wait: {e}"));
+            if let Err(record_error) =
+                finish_attempt(&attempt, "failed", started, &format!("wait: {e}"))
+            {
+                eprintln!("[job:{}] final record failed: {record_error}", job.name);
+            }
             return 1;
         }
         Err(_) => {
             // kill_on_drop reaped the child when the future was dropped by timeout
-            record(&job.name, "failed", started, "killed: 3h backstop");
+            if let Err(record_error) =
+                finish_attempt(&attempt, "failed", started, "killed: 3h backstop")
+            {
+                eprintln!("[job:{}] final record failed: {record_error}", job.name);
+            }
             return 1;
         }
     };
@@ -289,8 +507,19 @@ pub async fn run_job(job: &Job) -> i32 {
         .unwrap_or_else(|| "no output".to_string());
     let code = out.status.code();
     match outcome_for(code) {
-        Some(outcome) => record(&job.name, outcome, started, &detail),
-        None => println!("[job:{}] retry next tick ({detail})", job.name),
+        Some(outcome) => {
+            if let Err(e) = finish_attempt(&attempt, outcome, started, &detail) {
+                eprintln!("[job:{}] final record failed: {e}", job.name);
+                return 1;
+            }
+        }
+        None => {
+            if let Err(e) = attempt.mark_retryable() {
+                eprintln!("[job:{}] retry fence failed: {e}", job.name);
+                return 1;
+            }
+            println!("[job:{}] retry next tick ({detail})", job.name);
+        }
     }
     match code {
         Some(0) => 0,
@@ -335,8 +564,15 @@ pub async fn scheduler(cfg: Cfg) {
             if running.lock().unwrap().contains(&job.name) {
                 continue;
             }
-            let due = last_record_ts(&job.name)
-                .is_none_or(|ts| epoch_now().saturating_sub(ts) >= job.every.as_secs());
+            let due = match last_record_ts(&job.name) {
+                Ok(last) => {
+                    last.is_none_or(|ts| epoch_now().saturating_sub(ts) >= job.every.as_secs())
+                }
+                Err(e) => {
+                    eprintln!("[job:{}] ledger unreadable: {e}", job.name);
+                    false
+                }
+            };
             if !due {
                 continue;
             }

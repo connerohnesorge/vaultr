@@ -16,23 +16,57 @@ watch, filter, and prompt.
 - THEN detection, fencing, policy, breaking, and launch behavior come from the library
 - AND the door script contains no hand-rolled fencing or launch code
 
-### Requirement: Batch firing with a high-water fence
+### Requirement: Crash-idempotent ordered batch claims
 
-A door MUST fire at most once per run: all files newer than the door's
-persisted high-water mark that match the watch glob and pass the filter are
-interpolated into a single prompt, and the mark MUST advance only after the
-launch outcome is recorded so a given file never fires twice.
+A door MUST fail closed on unreadable or invalid state and MUST serialize each
+door's evaluation with a per-door cross-process lock. It MUST select files in
+total `(mtime,path)` order after its persisted cursor, atomically persist the
+exact ordered in-progress batch before launch, and derive a stable Plant Agent
+Run idempotency key from that claim. A retry MUST resume the persisted claim.
+After a conclusive `Succeeded` or `Failed` outcome, the door MUST atomically
+advance the cursor through the claim and clear it; `Unavailable` MUST retain
+the claim and key. A given file MUST never launch a second agent run.
 
 #### Scenario: A sync batch produces one session
 
 - WHEN a sync lands 20 matching files before the door's next run
 - THEN the door launches exactly one agent session whose prompt references all 20
-- AND the high-water mark advances past them after the outcome is recorded
+- AND the ordered cursor advances past them after the outcome is durably recorded
 
 #### Scenario: Nothing new means no launch
 
-- WHEN no matching file is newer than the high-water mark
+- WHEN no matching file sorts after the persisted `(mtime,path)` cursor
 - THEN the door exits without contacting Herdr
+
+#### Scenario: Corrupt state fails closed
+
+- WHEN a door's state cannot be parsed or violates the state schema
+- THEN the door returns a failure without replacing the state
+- AND no agent session is launched
+
+#### Scenario: Concurrent door processes
+
+- WHEN two processes evaluate the same door concurrently
+- THEN the per-door lock permits only one process to claim and launch the batch
+- AND the other process does not launch it
+
+#### Scenario: Files share a timestamp
+
+- WHEN multiple matching files have the same mtime
+- THEN their paths provide a deterministic total order
+- AND each file after the persisted cursor is included without re-firing an earlier file
+
+#### Scenario: Door crashes before launch
+
+- WHEN a door crashes after persisting its claim but before calling Plant
+- THEN the next invocation resumes the same ordered claim and idempotency key
+- AND the batch launches once
+
+#### Scenario: Door crashes after launch
+
+- WHEN a door crashes after Plant durably records the launch outcome but before the cursor save
+- THEN the next invocation reuses the persisted key and Plant's durable prior outcome
+- AND no second Herdr workspace is created
 
 ### Requirement: Ingestion-only watch roots
 
@@ -61,13 +95,14 @@ manual re-arm before the door fires again.
 
 ### Requirement: Typed launch over plant agent run
 
-The library MUST launch agent sessions only through `plant agent run` and MUST
-surface the lifecycle outcome as a typed
+The library MUST launch agent sessions only through `plant agent run`, MUST
+pass the persisted claim's stable idempotency key, and MUST surface the lifecycle outcome as a typed
 `Unavailable`/`Failed`/`Succeeded` result. It MUST NOT reimplement any part of
 the Herdr lifecycle owned by Plant.
 
 #### Scenario: Unavailable does not advance the fence
 
 - WHEN `plant agent run` reports Herdr unavailable
-- THEN the door's high-water mark does not advance
+- THEN the door's ordered cursor does not advance
+- AND the in-progress claim and idempotency key remain durable
 - AND the same files are eligible on the next run

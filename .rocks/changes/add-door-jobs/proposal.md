@@ -15,9 +15,10 @@ over the new files, so a message can start (and, through the existing
   being forced through `/bin/bash`, so a door can be a TypeScript job run by
   Bun with no interpreter special-casing in Plant.
 - A new Bun/TypeScript library in this workspace (`ts/`) owns the door
-  routine: new-file detection against a per-door high-water mark, an
-  ingestion-only allowlist of watchable roots, a rolling-window fire breaker,
-  and a typed wrapper over `plant agent run` mirroring the
+  routine: new-file detection against an ordered per-door cursor, a durable
+  in-progress batch claim under a cross-process lock, an ingestion-only
+  allowlist of watchable roots, a rolling-window fire breaker, and a typed
+  idempotent wrapper over `plant agent run` mirroring the
   `Unavailable`/`Failed`/`Succeeded` outcome contract.
 - A door is then an ordinary job script (`door-<name>.<interval>.ts`) of ~10
   lines: watch glob, filter predicate, prompt builder. Batch firing — one

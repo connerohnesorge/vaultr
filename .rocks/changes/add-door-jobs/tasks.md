@@ -9,9 +9,10 @@
 ## 2. Door library (Bun/TypeScript)
 
 - [ ] 2.1 Scaffold the `ts/` Bun package in the workspace with flake + Home Manager packaging so door jobs can import it
-- [ ] 2.2 Implement the typed `plant agent run` wrapper surfacing `Unavailable`/`Failed`/`Succeeded`, with a test against a stubbed binary
-- [ ] 2.3 Implement `door()`: glob scan vs persisted high-water mark, filter predicate, batch prompt build, fence advance only after outcome recording, with unit tests for double-fire and Unavailable-no-advance
-- [ ] 2.4 Implement the ingestion-root allowlist (loud rejection before launch) and the rolling-window breaker with manual re-arm, with tests for both
+- [x] 2.2 Deepen `plant agent run` with a stable idempotency key, durable fail-closed claim/outcome lookup, and typed `Unavailable`/`Failed`/`Succeeded` replay, with focused Rust tests
+- [x] 2.3 Implement `door()`: fail-closed atomic state, per-door cross-process lock, ordered `(mtime,path)` cursor, exact persisted batch claim, stable claim-derived idempotency key, and conclusive-outcome cursor advance
+- [x] 2.4 Implement the ingestion-root allowlist (loud rejection before launch) and the rolling-window breaker with manual re-arm, with tests for both
+- [x] 2.5 Add corrupt-state, tied-mtime, concurrent-process, before-launch crash, and after-launch crash tests against a fake idempotent `plant agent run`
 
 ## 3. First doors and ingestion
 

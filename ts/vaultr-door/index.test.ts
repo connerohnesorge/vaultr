@@ -1,7 +1,8 @@
-import { test, expect, beforeEach } from "bun:test";
+import { test, expect, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, readFileSync, utimesSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import { door, agentRun } from "./index.ts";
 
 let tmp: string;
@@ -14,12 +15,69 @@ function writeStub(exitCode: number) {
   chmodSync(stub, 0o755);
 }
 
+function writeIdempotentStub(exitCode: number, opts: { delay?: number; killParent?: boolean } = {}) {
+  const outcomes = join(tmp, "stub-outcomes");
+  writeFileSync(stub, `#!/bin/sh
+key=
+previous=
+for arg in "$@"; do
+  if [ "$previous" = "--idempotency-key" ]; then key="$arg"; fi
+  previous="$arg"
+done
+mkdir -p "${outcomes}"
+if [ -n "$key" ] && [ -f "${outcomes}/$key" ]; then
+  cat >/dev/null
+  echo "stub cached"
+  exit "$(cat "${outcomes}/$key")"
+fi
+printf '%s ' "$@" >> "${stubLog}"
+cat >> "${stubLog}"
+printf '\\n---\\n' >> "${stubLog}"
+${opts.delay ? `sleep ${opts.delay}` : ""}
+if [ -n "$key" ]; then
+  printf '%s\\n' "${exitCode}" > "${outcomes}/$key.tmp"
+  mv "${outcomes}/$key.tmp" "${outcomes}/$key"
+fi
+${opts.killParent ? 'kill -KILL "$PPID"' : ""}
+echo "stub done"
+exit ${exitCode}
+`);
+  chmodSync(stub, 0o755);
+}
+
 function stubCalls(): number {
   try {
     return readFileSync(stubLog, "utf8").split("---").filter((s) => s.trim()).length;
   } catch {
     return 0;
   }
+}
+
+function writeWorker(): string {
+  const worker = join(tmp, "door-worker.ts");
+  const library = pathToFileURL(resolve(import.meta.dir, "index.ts")).href;
+  writeFileSync(worker, `
+const { door } = await import(${JSON.stringify(library)});
+const result = await door({
+  name: "t",
+  watch: "mail/*.md",
+  prompt: () => {
+    if (process.env.CRASH_IN_PROMPT === "1") process.exit(86);
+    return "go";
+  },
+});
+console.log(JSON.stringify(result));
+process.exit(result.code);
+`);
+  return worker;
+}
+
+function spawnWorker(extraEnv: Record<string, string> = {}) {
+  return Bun.spawn([process.execPath, writeWorker()], {
+    env: { ...process.env, ...extraEnv },
+    stdout: "pipe",
+    stderr: "pipe",
+  });
 }
 
 function landFile(rel: string, mtimeSec: number) {
@@ -42,6 +100,10 @@ beforeEach(() => {
   writeStub(0);
 });
 
+afterEach(() => {
+  rmSync(tmp, { recursive: true, force: true });
+});
+
 test("batch fires once and the fence prevents a double fire", async () => {
   landFile("mail/a.md", 1000);
   landFile("mail/b.md", 1001);
@@ -53,6 +115,7 @@ test("batch fires once and the fence prevents a double fire", async () => {
   expect(log).toContain("mail/a.md");
   expect(log).toContain("mail/b.md");
   expect(log).toContain("--label door-t");
+  expect(log).toContain("--idempotency-key");
 
   const second = await door(spec);
   expect(second.code).toBe(0);
@@ -72,13 +135,76 @@ test("Unavailable does not advance the fence; files fire on the next run", async
   expect(retried.detail).toContain("fired on 1 file");
 });
 
-test("failed launch keeps the batch for retry", async () => {
+test("a conclusive failed outcome advances the cursor without a second launch", async () => {
   landFile("mail/a.md", 1000);
   const spec = { name: "t", watch: "mail/*.md", prompt: () => "go" };
   writeStub(1);
   expect((await door(spec)).code).toBe(1);
   writeStub(0);
-  expect((await door(spec)).detail).toContain("fired on 1 file");
+  expect((await door(spec)).detail).toBe("no new files");
+  expect(stubCalls()).toBe(1);
+});
+
+test("corrupt state fails closed without replacement or launch", async () => {
+  landFile("mail/a.md", 1000);
+  const path = join(tmp, "state", "t.json");
+  mkdirSync(join(tmp, "state"), { recursive: true });
+  writeFileSync(path, "{");
+  const result = await door({ name: "t", watch: "mail/*.md", prompt: () => "go" });
+  expect(result.code).toBe(1);
+  expect(result.detail).toContain("failed closed");
+  expect(readFileSync(path, "utf8")).toBe("{");
+  expect(stubCalls()).toBe(0);
+});
+
+test("tied mtimes advance in deterministic path order without misses", async () => {
+  const spec = { name: "t", watch: "mail/*.md", prompt: (files: any[]) => files.map((file) => file.path).join(" ") };
+  landFile("mail/a.md", 1000);
+  expect((await door(spec)).code).toBe(0);
+  landFile("mail/b.md", 1000);
+  expect((await door(spec)).code).toBe(0);
+  expect(stubCalls()).toBe(2);
+  expect(readFileSync(stubLog, "utf8")).toContain("mail/b.md");
+  const state = JSON.parse(readFileSync(join(tmp, "state", "t.json"), "utf8"));
+  expect(state.cursor.path).toBe("mail/b.md");
+});
+
+test("concurrent door processes launch one batch once", async () => {
+  landFile("mail/a.md", 1000);
+  writeIdempotentStub(0, { delay: 0.3 });
+  const first = spawnWorker();
+  const second = spawnWorker();
+  const codes = await Promise.all([first.exited, second.exited]);
+  expect(codes.sort((a, b) => a - b)).toEqual([0, 75]);
+  expect(stubCalls()).toBe(1);
+});
+
+test("a pre-launch crash resumes the persisted ordered claim and key", async () => {
+  landFile("mail/a.md", 1000);
+  const crashed = spawnWorker({ CRASH_IN_PROMPT: "1" });
+  expect(await crashed.exited).toBe(86);
+  expect(stubCalls()).toBe(0);
+  const claimed = JSON.parse(readFileSync(join(tmp, "state", "t.json"), "utf8"));
+  expect(claimed.claim.files).toEqual([{ mtimeMs: claimed.claim.files[0].mtimeMs, path: "mail/a.md" }]);
+  expect(claimed.claim.key).toHaveLength(64);
+
+  const retried = spawnWorker();
+  expect(await retried.exited).toBe(0);
+  expect(stubCalls()).toBe(1);
+});
+
+test("a post-launch crash reuses Plant's durable outcome without relaunch", async () => {
+  landFile("mail/a.md", 1000);
+  writeIdempotentStub(0, { killParent: true });
+  const crashed = spawnWorker();
+  expect(await crashed.exited).not.toBe(0);
+  expect(stubCalls()).toBe(1);
+  expect(JSON.parse(readFileSync(join(tmp, "state", "t.json"), "utf8")).claim).toBeDefined();
+
+  const retried = spawnWorker();
+  expect(await retried.exited).toBe(0);
+  expect(stubCalls()).toBe(1);
+  expect(JSON.parse(readFileSync(join(tmp, "state", "t.json"), "utf8")).claim).toBeUndefined();
 });
 
 test("non-ingestion watch roots are rejected before any launch", async () => {

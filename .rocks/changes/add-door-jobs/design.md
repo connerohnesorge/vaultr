@@ -15,6 +15,10 @@ typed code rather than bash or a bespoke declarative format.
 - The fragile parts — dedup fencing, watch-root policy, fire-rate breaking,
   agent launch — are written once in a shared TypeScript library, not
   re-authored per door.
+- Door state fails closed, is replaced atomically under a per-door
+  cross-process lock, and carries an ordered `(mtime,path)` cursor plus the
+  exact in-progress batch. The claim deterministically supplies Plant's
+  idempotency key, so process crashes cannot create a second agent run.
 - Loop prevention is structural first (doors may only watch ingestion roots
   that agents never write) with a rate breaker as defense-in-depth, because a
   self-sustaining door fires slowly (agent runtime spaces the fires) and would
@@ -45,15 +49,18 @@ Doors-as-jobs deletes both: cadence comes from the filename, scheduling and
 outcome recording come from Plant, and the door file is real code where real
 code is wanted (filters, prompt building).
 
-### ADR-0003: TS library wraps `plant agent run`; lifecycle stays in Plant
+### ADR-0003: TS library wraps idempotent `plant agent run`; lifecycle stays in Plant
 
 The jobs contract already requires agent jobs to drive panes only via
 `plant agent run`, and `plant-agent-jobs` made Plant's Herdr lifecycle the
 single owner of workspace creation, readiness, delivery, wait, and cleanup.
-The library is a thin typed client over that interface — structured
-`Unavailable`/`Failed`/`Succeeded` results — never a second lifecycle
-implementation. This also keeps doors portable: if door logic ever moves into
-Plant, it was always speaking Plant's interface.
+The library is a thin typed client over that interface: it supplies the
+persisted batch's stable idempotency key and receives structured
+`Unavailable`/`Failed`/`Succeeded` results, never a second lifecycle
+implementation. Plant durably claims each key before Herdr side effects,
+records conclusive outcomes before returning, and returns an already-recorded
+outcome without creating another workspace. An unavailable pre-launch Herdr
+probe remains retryable and does not become a conclusive outcome.
 
 ### ADR-0004: Loop prevention is allowlist-by-construction plus a rate breaker
 
@@ -66,3 +73,15 @@ rejects any other watch glob loudly on first run. A rolling-window breaker
 manual re-arm) backstops allowlist mistakes. Rejected: consecutive-fire
 breakers (real loops fire slowly and never trip them) and provenance tagging
 (machinery disproportionate to the residual risk once paths are partitioned).
+
+### ADR-0005: Door batches are ordered durable claims
+
+A scalar mtime cannot distinguish files with tied timestamps, and saving it
+after launch leaves a crash window that can launch the same batch twice. Each
+door therefore serializes evaluation with a per-door cross-process lock, fails
+closed on unreadable or invalid state, and atomically persists the exact batch
+ordered by `(mtime,path)` before launch. The persisted claim determines the
+Plant idempotency key and survives both pre-launch and post-launch Door
+crashes. A retry resumes that claim; after a conclusive Plant outcome it
+advances the cursor and clears the claim atomically. `Unavailable` retains the
+claim and its key for a later attempt.

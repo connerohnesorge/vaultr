@@ -31,3 +31,30 @@ Plant MUST NOT hardwire or map interpreters per extension.
 - WHEN a job cannot be spawned (e.g. missing execute permission)
 - THEN Plant records a failed attempt with the spawn error in the job ledger
 - AND the scheduler continues unaffected
+
+### Requirement: Idempotent Plant agent runs
+
+`plant agent run` MUST accept an optional stable idempotency key, durably claim
+that key before starting the Herdr lifecycle, and durably record each
+conclusive `Succeeded` or `Failed` outcome before returning. A repeated key
+MUST return its prior durable outcome without creating another Herdr workspace.
+Unreadable, corrupt, or unresolved in-progress idempotency state MUST fail
+closed without launching.
+
+#### Scenario: A completed agent run is retried
+
+- WHEN `plant agent run` receives a key whose conclusive outcome is already durable
+- THEN it returns the recorded outcome
+- AND it does not create or reclaim a Herdr workspace
+
+#### Scenario: Duplicate launch state is uncertain
+
+- WHEN a key is already claimed without a conclusive durable outcome
+- THEN `plant agent run` fails closed
+- AND it does not create another Herdr workspace
+
+#### Scenario: Herdr is unavailable before launch
+
+- WHEN the initial Herdr availability probe returns `Unavailable`
+- THEN Plant removes the key's pre-launch claim durably
+- AND a later call with the same key may retry

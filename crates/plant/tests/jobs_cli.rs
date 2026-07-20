@@ -94,6 +94,15 @@ fn manual_jobs_propagate_normalized_statuses() {
         .unwrap()
         .contains("\"detail\":\"spawn:"));
 
+    let retry_again = run(&home, &sessions, "retry");
+    assert_eq!(retry_again.status.code(), Some(75));
+    assert!(!ledger.join("retry.jsonl").exists());
+    assert!(
+        fs::read_to_string(home.join(".local/state/plant/job-attempts/retry.json"))
+            .unwrap()
+            .contains("\"retryable\":true")
+    );
+
     let missing_home = tmp.join("missing-home");
     write_job(&jobs.join("spawn.1h.sh"), "#!/bin/sh\nexit 0\n");
     let output = run(&missing_home, &sessions, "spawn");
@@ -103,6 +112,85 @@ fn manual_jobs_propagate_normalized_statuses() {
             .unwrap()
             .contains("\"detail\":\"spawn:")
     );
+
+    fs::remove_dir_all(tmp).unwrap();
+}
+
+#[test]
+fn unavailable_ledger_prevents_job_side_effects() {
+    let tmp = std::env::temp_dir().join(format!(
+        "plant-jobs-ledger-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let home = tmp.join("home");
+    let vault = tmp.join("vault");
+    let sessions = vault.join("sessions");
+    let jobs = vault.join("jobs");
+    fs::create_dir_all(home.join(".dotfiles")).unwrap();
+    fs::create_dir_all(home.join(".local/state/plant")).unwrap();
+    fs::create_dir_all(&sessions).unwrap();
+    fs::create_dir_all(&jobs).unwrap();
+    fs::write(home.join(".local/state/plant/jobs"), "not a directory").unwrap();
+    write_job(
+        &jobs.join("blocked.1h.sh"),
+        "#!/bin/sh\ntouch \"$HOME/side-effect\"\n",
+    );
+
+    let output = run(&home, &sessions, "blocked");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(!home.join("side-effect").exists());
+
+    fs::remove_dir_all(tmp).unwrap();
+}
+
+#[test]
+fn final_record_failure_keeps_attempt_fenced() {
+    let tmp = std::env::temp_dir().join(format!(
+        "plant-jobs-record-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let home = tmp.join("home");
+    let vault = tmp.join("vault");
+    let sessions = vault.join("sessions");
+    let jobs = vault.join("jobs");
+    fs::create_dir_all(home.join(".dotfiles")).unwrap();
+    fs::create_dir_all(&sessions).unwrap();
+    fs::create_dir_all(&jobs).unwrap();
+    write_job(
+        &jobs.join("record-fails.1h.sh"),
+        "#!/bin/sh\n\
+         echo called >> \"$HOME/calls\"\n\
+         rmdir \"$HOME/.local/state/plant/jobs\"\n\
+         echo unavailable > \"$HOME/.local/state/plant/jobs\"\n",
+    );
+
+    let first = run(&home, &sessions, "record-fails");
+    assert_eq!(first.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&first.stderr).contains("final record failed"));
+
+    fs::remove_file(home.join(".local/state/plant/jobs")).unwrap();
+    fs::create_dir_all(home.join(".local/state/plant/jobs")).unwrap();
+    let second = run(&home, &sessions, "record-fails");
+    assert_eq!(second.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&second.stderr).contains("dispatch blocked"));
+    assert_eq!(
+        fs::read_to_string(home.join("calls"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert!(home
+        .join(".local/state/plant/job-attempts/record-fails.json")
+        .exists());
 
     fs::remove_dir_all(tmp).unwrap();
 }

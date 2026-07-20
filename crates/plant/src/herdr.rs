@@ -2,8 +2,10 @@ use crate::capture::{cached_session_ids, iso_now, session_dir};
 use crate::sweep::{run, run30};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::io::Write;
+use std::fs::OpenOptions;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -126,6 +128,9 @@ pub struct AgentRun {
     pub prompt: String,
     pub timeout: Duration,
     pub cleanup: WorkspaceCleanup,
+    /// Claude session ids are minted with the launch command, but registration
+    /// waits until this run actually passes any idempotency lookup.
+    pub preset_session_id: Option<String>,
     /// Claude sids are preset + registered before launch; codex conversation ids are
     /// server-assigned, so for codex we read the id herdr reports for this pane once the
     /// run finishes and register it, keeping learn from dispatching on the self-capture.
@@ -157,6 +162,135 @@ pub enum AgentRunOutcome {
     Failed(String),
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+enum DurableAgentRun {
+    InProgress { key: String },
+    Succeeded { key: String, detail: String },
+    Failed { key: String, detail: String },
+}
+
+enum IdempotencyClaim {
+    Execute(PathBuf),
+    Prior(AgentRunOutcome),
+    Pending,
+}
+
+fn idempotency_path(dir: &Path, key: &str) -> io::Result<PathBuf> {
+    if key.is_empty() || key.len() > 1024 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "idempotency key must contain 1..=1024 bytes",
+        ));
+    }
+    Ok(dir.join(format!("{:x}.json", Sha256::digest(key.as_bytes()))))
+}
+
+fn claim_agent_run(dir: &Path, key: &str) -> io::Result<IdempotencyClaim> {
+    std::fs::create_dir_all(dir)?;
+    let path = idempotency_path(dir, key)?;
+    let record = DurableAgentRun::InProgress {
+        key: key.to_string(),
+    };
+    let mut bytes =
+        serde_json::to_vec(&record).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    bytes.push(b'\n');
+    match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(mut file) => {
+            let result = file
+                .write_all(&bytes)
+                .and_then(|_| file.sync_all())
+                .and_then(|_| crate::jobs::sync_dir(dir));
+            if let Err(error) = result {
+                let _ = std::fs::remove_file(&path);
+                return Err(error);
+            }
+            Ok(IdempotencyClaim::Execute(path))
+        }
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let record: DurableAgentRun = serde_json::from_str(&std::fs::read_to_string(&path)?)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+            let (recorded_key, claim) = match record {
+                DurableAgentRun::InProgress { key } => (key, IdempotencyClaim::Pending),
+                DurableAgentRun::Succeeded { key, detail } => (
+                    key,
+                    IdempotencyClaim::Prior(AgentRunOutcome::Succeeded(detail)),
+                ),
+                DurableAgentRun::Failed { key, detail } => (
+                    key,
+                    IdempotencyClaim::Prior(AgentRunOutcome::Failed(detail)),
+                ),
+            };
+            if recorded_key != key {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "idempotency digest collision",
+                ));
+            }
+            Ok(claim)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+fn persist_agent_outcome(path: &Path, key: &str, outcome: &AgentRunOutcome) -> io::Result<()> {
+    let record = match outcome {
+        AgentRunOutcome::Succeeded(detail) => DurableAgentRun::Succeeded {
+            key: key.to_string(),
+            detail: detail.clone(),
+        },
+        AgentRunOutcome::Failed(detail) => DurableAgentRun::Failed {
+            key: key.to_string(),
+            detail: detail.clone(),
+        },
+        AgentRunOutcome::Unavailable => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Unavailable is not a conclusive outcome",
+            ))
+        }
+    };
+    let mut bytes =
+        serde_json::to_vec(&record).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    bytes.push(b'\n');
+    crate::jobs::atomic_write(path, &bytes)
+}
+
+/// Run an agent at most once for a caller-supplied stable key. Conclusive
+/// outcomes are replayed without touching Herdr; uncertain state fails closed.
+pub(crate) async fn run_agent_idempotent(agent_run: AgentRun, key: &str) -> AgentRunOutcome {
+    let dir = crate::jobs::state_dir().join("agent-runs");
+    let path = match claim_agent_run(&dir, key) {
+        Ok(IdempotencyClaim::Execute(path)) => path,
+        Ok(IdempotencyClaim::Prior(outcome)) => return outcome,
+        Ok(IdempotencyClaim::Pending) => {
+            return AgentRunOutcome::Failed(
+                "idempotent agent run has no conclusive outcome; refusing duplicate launch"
+                    .to_string(),
+            )
+        }
+        Err(error) => {
+            return AgentRunOutcome::Failed(format!("idempotency state unavailable: {error}"))
+        }
+    };
+
+    let outcome = run_agent(agent_run).await;
+    if outcome == AgentRunOutcome::Unavailable {
+        return match std::fs::remove_file(&path).and_then(|_| crate::jobs::sync_dir(&dir)) {
+            Ok(()) => AgentRunOutcome::Unavailable,
+            Err(error) => AgentRunOutcome::Failed(format!(
+                "could not release unavailable idempotency claim: {error}"
+            )),
+        };
+    }
+    match persist_agent_outcome(&path, key, &outcome) {
+        Ok(()) => outcome,
+        Err(error) => AgentRunOutcome::Failed(format!(
+            "could not persist conclusive agent outcome: {error}"
+        )),
+    }
+}
+
 fn socket_path() -> PathBuf {
     std::env::var("HERDR_SOCKET_PATH")
         .map(PathBuf::from)
@@ -184,18 +318,30 @@ pub(crate) async fn pane_list() -> Option<Vec<Pane>> {
     .flatten()
 }
 
-/// Herdr reports `idle` for a bare shell too. Trust only panes where it has
-/// recognized a running agent, or a failed CLI launch could receive shell input.
-async fn pane_has_agent(pane: &str) -> bool {
-    serde_json::from_str::<PaneListReply>(&run30(&["herdr", "pane", "list"]).await.out)
-        .ok()
-        .is_some_and(|reply| {
-            reply
-                .result
-                .panes
-                .iter()
-                .any(|p| p.pane_id == pane && p.agent.is_some())
-        })
+/// Herdr reports `idle` for a bare shell too. Only native Claude/Codex panes in
+/// a prompt-safe state may receive TUI input.
+fn pane_accepts_prompt(panes: &[Pane], pane: &str) -> bool {
+    panes.iter().any(|candidate| {
+        candidate.pane_id == pane
+            && matches!(candidate.agent.as_deref(), Some("claude" | "codex"))
+            && matches!(candidate.agent_status.as_str(), "idle" | "done")
+    })
+}
+
+async fn wait_for_prompt_ready(pane: &str, timeout: Duration) -> bool {
+    tokio::time::timeout(timeout, async {
+        loop {
+            if pane_list()
+                .await
+                .is_some_and(|panes| pane_accepts_prompt(&panes, pane))
+            {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+    })
+    .await
+    .unwrap_or(false)
 }
 
 async fn workspaces() -> Option<Vec<Workspace>> {
@@ -262,6 +408,9 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
         );
         return AgentRunOutcome::Unavailable;
     }
+    if let Some(session_id) = &agent_run.preset_session_id {
+        crate::sweep::register_job_sid(session_id);
+    }
     let stale = close_by_label(&agent_run.label).await;
     if stale > 0 {
         println!(
@@ -309,22 +458,8 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
                 launched.failure_detail()
             ));
         }
-        let ready = run(
-            &[
-                "herdr",
-                "wait",
-                "agent-status",
-                pane,
-                "--status",
-                "idle",
-                "--timeout",
-                "60000",
-            ],
-            Duration::from_secs(70),
-        )
-        .await;
-        if !ready.ok {
-            let detail = ready.failure_detail();
+        if !wait_for_prompt_ready(pane, Duration::from_secs(60)).await {
+            let detail = "native Claude/Codex pane did not reach idle or done";
             eprintln!(
                 "[herdr:{}] agent did not become ready in pane {pane} ({detail})",
                 agent_run.label
@@ -333,8 +468,13 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
         }
         // Agent detection precedes TUI input readiness by ~1-2 seconds.
         tokio::time::sleep(Duration::from_secs(3)).await;
-        if !pane_has_agent(pane).await {
-            return AgentRunOutcome::Failed("CLI never launched (pane has no agent)".to_string());
+        if !pane_list()
+            .await
+            .is_some_and(|panes| pane_accepts_prompt(&panes, pane))
+        {
+            return AgentRunOutcome::Failed(
+                "CLI pane was not a ready native Claude/Codex agent after settle".to_string(),
+            );
         }
         let needle: String = agent_run.prompt.chars().take(30).collect();
         let mut landed = false;
@@ -422,7 +562,10 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
                 tokio::time::sleep(Duration::from_secs(2)).await;
             }
             match registered {
-                Some(sid) => println!("[herdr:{}] registered job self-capture {sid}", agent_run.label),
+                Some(sid) => println!(
+                    "[herdr:{}] registered job self-capture {sid}",
+                    agent_run.label
+                ),
                 None => eprintln!(
                     "[herdr:{}] no agent_session id for pane {pane}; self-capture may reach learn",
                     agent_run.label
@@ -611,6 +754,42 @@ mod tests {
     }
 
     #[test]
+    fn prompt_readiness_requires_native_idle_or_done_agent() {
+        let pane = |agent: Option<&str>, status: &str| Pane {
+            workspace_id: "w1".to_string(),
+            tab_id: "w1:t1".to_string(),
+            pane_id: "w1:p1".to_string(),
+            terminal_id: "t1".to_string(),
+            cwd: "/tmp".to_string(),
+            focused: false,
+            agent_status: status.to_string(),
+            agent: agent.map(str::to_string),
+            agent_session: None,
+        };
+        for (agent, status, expected) in [
+            (Some("claude"), "idle", true),
+            (Some("claude"), "done", true),
+            (Some("codex"), "idle", true),
+            (Some("codex"), "done", true),
+            (Some("claude"), "working", false),
+            (Some("codex"), "blocked", false),
+            (Some("codex"), "unknown", false),
+            (Some("unknown"), "idle", false),
+            (None, "idle", false),
+        ] {
+            assert_eq!(
+                pane_accepts_prompt(&[pane(agent, status)], "w1:p1"),
+                expected,
+                "{agent:?}/{status}"
+            );
+        }
+        assert!(!pane_accepts_prompt(
+            &[pane(Some("codex"), "done")],
+            "other"
+        ));
+    }
+
+    #[test]
     fn cleanup_follows_policy_and_outcome() {
         let succeeded = AgentRunOutcome::Succeeded("done".into());
         let failed = AgentRunOutcome::Failed("timeout".into());
@@ -622,6 +801,43 @@ mod tests {
             WorkspaceCleanup::Always,
             &AgentRunOutcome::Unavailable
         ));
+    }
+
+    #[test]
+    fn idempotency_state_replays_outcomes_and_fails_closed() {
+        let dir = std::env::temp_dir().join(format!(
+            "plant-agent-runs-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let path = match claim_agent_run(&dir, "door-batch") {
+            Ok(IdempotencyClaim::Execute(path)) => path,
+            _ => panic!("first claim should execute"),
+        };
+        assert!(matches!(
+            claim_agent_run(&dir, "door-batch").unwrap(),
+            IdempotencyClaim::Pending
+        ));
+        persist_agent_outcome(
+            &path,
+            "door-batch",
+            &AgentRunOutcome::Succeeded("done once".to_string()),
+        )
+        .unwrap();
+        assert!(matches!(
+            claim_agent_run(&dir, "door-batch").unwrap(),
+            IdempotencyClaim::Prior(AgentRunOutcome::Succeeded(ref detail))
+                if detail == "done once"
+        ));
+
+        let corrupt = match claim_agent_run(&dir, "corrupt") {
+            Ok(IdempotencyClaim::Execute(path)) => path,
+            _ => panic!("first corrupt claim should execute"),
+        };
+        std::fs::write(corrupt, "{").unwrap();
+        assert!(claim_agent_run(&dir, "corrupt").is_err());
+
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[tokio::test]
@@ -636,6 +852,7 @@ mod tests {
             prompt: "Reply with exactly HERDR_LIFECYCLE_SMOKE_OK and do not use tools.".into(),
             timeout: Duration::from_secs(120),
             cleanup: WorkspaceCleanup::Always,
+            preset_session_id: None,
             discover_session_id: false,
         })
         .await;
