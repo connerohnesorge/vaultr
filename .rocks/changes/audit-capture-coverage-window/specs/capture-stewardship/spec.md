@@ -49,7 +49,8 @@ NOT mutate any Session Capture or transcript.
 
 #### Scenario: Large capture and transcript
 
-- WHEN coverage audits Capture and transcript evidence much larger than one record
+- WHEN release coverage audits hold record size and ID cardinality constant while
+  decoded Capture evidence scales through at least 919 MiB
 - THEN it streams both inputs with memory bounded by the largest record plus comparison ID sets
 
 #### Scenario: Genuine in-window gap

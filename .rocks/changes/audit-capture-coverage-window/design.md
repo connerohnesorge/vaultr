@@ -60,6 +60,13 @@ therefore bounded by the largest physical record plus the comparison ID sets,
 not by either file's decoded size. Any capture open, decode, or record error
 fails the audit instead of silently erasing evidence.
 
+Release-CLI acceptance evidence and its reproducible streamed-to-zstd generator
+live in `crates/plant/STRESS.md`. With record size, the two-ID cardinality, and
+the two-line native transcript held constant, scaling decoded capture evidence
+from 128.015 MiB to 919.110 MiB increased median RSS from 13,172,736 to
+13,303,808 bytes (1.00%); the largest measured RSS was 13,320,192 bytes. No
+decoded archive or generated fixture is committed.
+
 ## Harness support and denominator
 
 Envelope harness identity is wire truth. Codex has no comparable native

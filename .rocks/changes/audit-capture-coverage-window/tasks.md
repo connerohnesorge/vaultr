@@ -17,5 +17,5 @@
 - [x] 3.2 Unit test: complete multi-call Claude window reports 100% and empty residual
 - [x] 3.3 Unit test: one in-window native id absent from Envelopes appears in residual and lowers coverage
 - [x] 3.4 Unit test: mixed sealed/raw generations entered through either sibling include concatenated records, tolerate only the live tail, and report the two fixture gaps
-- [x] 3.5 Unit test: malformed or unreadable capture evidence fails and large Capture/transcript fixtures stream successfully
+- [x] 3.5 Unit test malformed/unreadable evidence and large-record correctness; prove bounded release-CLI RSS with constant ID cardinality at 128 MiB and at least 919 MiB decoded capture evidence
 - [x] 3.6 Unit test: Codex and a Claude zero-denominator fixture fail explicitly without a percentage

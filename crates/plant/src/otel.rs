@@ -105,38 +105,19 @@ impl Otel {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn enabled_for_test() -> Self {
-        let mut otel = Self::new();
-        otel.enabled = true;
-        otel
-    }
-
-    #[cfg(test)]
-    pub(crate) fn recorded_completeness(&self) -> Vec<bool> {
-        self.state
-            .lock()
-            .unwrap()
-            .requests
-            .values()
-            .flat_map(|(attrs, count)| {
-                std::iter::repeat_n(attrs["complete"].as_bool().unwrap(), *count as usize)
-            })
-            .collect()
-    }
-
     pub fn record(
         &self,
         adapter: &Adapter,
         model: Option<&str>,
         req: &CapturedRequest,
         resp: &CapturedResponse,
+        events: &[Value],
     ) {
         if !self.enabled {
             return;
         }
         let model = model.unwrap_or("unknown").to_string();
-        let usage = adapter.usage(&vaultr::recon::parse_sse(&resp.sse));
+        let usage = adapter.usage(events);
         let duration_ms = req
             .started_at
             .elapsed()

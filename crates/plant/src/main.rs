@@ -4,6 +4,7 @@
 
 mod adapter;
 mod capture;
+mod coverage;
 mod herdr;
 mod jobs;
 mod otel;
@@ -93,7 +94,7 @@ async fn subcommand(argv: &[String]) -> Option<i32> {
                 eprintln!("sessions coverage: <session-id> required");
                 return Some(1);
             };
-            match sweep::coverage(&vault_root(), sid) {
+            match coverage::coverage(&vault_root(), sid) {
                 Ok(c) => {
                     let tag = if c.resumed { " (resumed)" } else { "" };
                     println!(

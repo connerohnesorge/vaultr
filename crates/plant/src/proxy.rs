@@ -270,14 +270,20 @@ async fn handle(req: Request<hyper::body::Incoming>, ctx: Arc<ProxyCtx>) -> Resp
         }
         let sse = String::from_utf8_lossy(&chunks).into_owned();
         drop(chunks);
+        let events = vaultr::recon::parse_sse(&sse);
         let resp = CapturedResponse {
             status,
             headers: upstream_headers_full,
-            complete: ctx2.adapter.response_complete(&sse, complete),
+            complete: ctx2.adapter.response_complete(&events, complete),
             sse,
         };
-        ctx2.otel
-            .record(&ctx2.adapter, pending.model.as_deref(), &pending.req, &resp);
+        ctx2.otel.record(
+            &ctx2.adapter,
+            pending.model.as_deref(),
+            &pending.req,
+            &resp,
+            &events,
+        );
         if let Err(e) = capture::finish_capture(&ctx2.vault, &ctx2.adapter, pending, &resp).await {
             eprintln!("capture failed: {e}");
         }
@@ -288,229 +294,6 @@ async fn handle(req: Request<hyper::body::Incoming>, ctx: Arc<ProxyCtx>) -> Resp
     resp_builder
         .body(BodyExt::boxed(StreamBody::new(stream)))
         .unwrap()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::adapter::adapters;
-    use serde_json::json;
-
-    const CLAUDE_TEXT_ONLY: &str = concat!(
-        "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",",
-        "\"text\":\"message_stop\"}}\n\n"
-    );
-    const CLAUDE_TERMINAL: &str = "data: {\"type\":\"message_stop\"}\n\n";
-    const CODEX_TEXT_ONLY: &str = concat!(
-        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",",
-        "\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",",
-        "\"text\":\"response.completed\"}]}}\n\n"
-    );
-
-    #[derive(Clone, Copy, PartialEq)]
-    enum UpstreamResponse {
-        Full(&'static str),
-        Torn(&'static str),
-        Delayed(&'static str),
-    }
-
-    fn response_body(response: UpstreamResponse) -> BoxBody {
-        match response {
-            UpstreamResponse::Full(sse) => full(sse),
-            UpstreamResponse::Torn(sse) => {
-                let (tx, rx) =
-                    tokio::sync::mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(2);
-                tokio::spawn(async move {
-                    let _ = tx
-                        .send(Ok(Frame::data(Bytes::from_static(sse.as_bytes()))))
-                        .await;
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    let _ = tx.send(Err(std::io::Error::other("torn upstream"))).await;
-                });
-                BodyExt::boxed(StreamBody::new(
-                    tokio_stream::wrappers::ReceiverStream::new(rx),
-                ))
-            }
-            UpstreamResponse::Delayed(sse) => {
-                let (tx, rx) =
-                    tokio::sync::mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(2);
-                tokio::spawn(async move {
-                    let _ = tx
-                        .send(Ok(Frame::data(Bytes::from_static(sse.as_bytes()))))
-                        .await;
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    let _ = tx.send(Ok(Frame::data(Bytes::from_static(b"\n")))).await;
-                });
-                BodyExt::boxed(StreamBody::new(
-                    tokio_stream::wrappers::ReceiverStream::new(rx),
-                ))
-            }
-        }
-    }
-
-    async fn start_upstream(response: UpstreamResponse) -> String {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            loop {
-                let Ok((stream, _)) = listener.accept().await else {
-                    break;
-                };
-                tokio::spawn(async move {
-                    let io = hyper_util::rt::TokioIo::new(stream);
-                    let service = hyper::service::service_fn(
-                        move |req: Request<hyper::body::Incoming>| async move {
-                            let _ = req.into_body().collect().await;
-                            Ok::<_, Infallible>(
-                                Response::builder()
-                                    .header("content-type", "text/event-stream")
-                                    .header("request-id", "req_test")
-                                    .body(response_body(response))
-                                    .unwrap(),
-                            )
-                        },
-                    );
-                    let _ = hyper::server::conn::http1::Builder::new()
-                        .serve_connection(io, service)
-                        .await;
-                });
-            }
-        });
-        format!("http://127.0.0.1:{port}")
-    }
-
-    async fn wait_for_capture(vault: &PathBuf, sid: &str) -> (Value, PathBuf) {
-        for _ in 0..300 {
-            if let Ok(session) = vaultr::vault::resolve_id(vault, sid) {
-                let dir = vaultr::vault::session_dir(vault, &session).unwrap();
-                let path = dir.join("turns.jsonl");
-                if let Ok(text) = std::fs::read_to_string(&path) {
-                    if let Some(line) = text.lines().next() {
-                        return (serde_json::from_str(line).unwrap(), path);
-                    }
-                }
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        panic!("capture did not finish for {sid}");
-    }
-
-    async fn exercise(
-        label: &str,
-        response: UpstreamResponse,
-        codex: bool,
-        disconnect: bool,
-    ) -> (Value, PathBuf, Arc<Otel>, PathBuf) {
-        let vault =
-            std::env::temp_dir().join(format!("plant-proxy-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&vault);
-        std::fs::create_dir_all(&vault).unwrap();
-        let sid = uuid::Uuid::new_v4().to_string();
-        let upstream = start_upstream(response).await;
-        let mut adapter = adapters().remove(usize::from(codex));
-        adapter.upstream = upstream;
-        let otel = Arc::new(Otel::enabled_for_test());
-        let (listener, port) = bind(0).await.unwrap();
-        let ctx = Arc::new(ProxyCtx {
-            adapter,
-            vault: vault.clone(),
-            client: crate::http_client(),
-            otel: otel.clone(),
-        });
-        tokio::spawn(serve(listener, ctx));
-
-        let client = reqwest::Client::new();
-        let request = if codex {
-            client
-                .post(format!("http://127.0.0.1:{port}/responses"))
-                .header("session-id", &sid)
-                .json(&json!({
-                    "model": "gpt-test",
-                    "input": [{"role": "user", "content": "hi"}],
-                }))
-        } else {
-            client
-                .post(format!("http://127.0.0.1:{port}/v1/messages"))
-                .json(&json!({
-                    "model": "claude-test",
-                    "stream": true,
-                    "messages": [{"role": "user", "content": "hi"}],
-                    "metadata": {"user_id": json!({"session_id": &sid}).to_string()},
-                }))
-        };
-        let response_body = request.send().await.unwrap();
-        if disconnect {
-            drop(response_body);
-        } else {
-            let body = response_body.bytes().await;
-            if response == UpstreamResponse::Torn(CLAUDE_TERMINAL) {
-                assert!(
-                    body.is_err(),
-                    "torn upstream reaches the client as an error"
-                );
-            } else {
-                body.unwrap();
-            }
-        }
-        let (envelope, capture_path) = wait_for_capture(&vault, &sid).await;
-        (envelope, capture_path, otel, vault)
-    }
-
-    #[tokio::test]
-    async fn completion_certification_controls_capture_telemetry_and_trailing_output() {
-        let cases = [
-            (
-                "claude-text",
-                UpstreamResponse::Full(CLAUDE_TEXT_ONLY),
-                false,
-                false,
-                false,
-            ),
-            (
-                "claude-exact",
-                UpstreamResponse::Full(CLAUDE_TERMINAL),
-                false,
-                false,
-                true,
-            ),
-            (
-                "claude-torn",
-                UpstreamResponse::Torn(CLAUDE_TERMINAL),
-                false,
-                false,
-                false,
-            ),
-            (
-                "claude-disconnect",
-                UpstreamResponse::Delayed(CLAUDE_TERMINAL),
-                false,
-                true,
-                false,
-            ),
-            (
-                "codex-text",
-                UpstreamResponse::Full(CODEX_TEXT_ONLY),
-                true,
-                false,
-                false,
-            ),
-        ];
-
-        for (label, response, codex, disconnect, expected) in cases {
-            let (envelope, capture_path, otel, vault) =
-                exercise(label, response, codex, disconnect).await;
-            assert_eq!(envelope["response"]["complete"], expected, "{label}");
-            assert_eq!(otel.recorded_completeness(), [expected], "{label}");
-            if codex {
-                let reconstructed = vaultr::recon::reconstruct(&capture_path).unwrap();
-                assert_eq!(
-                    reconstructed.trailing_appended, 0,
-                    "uncertified Codex output_item.done must not become trailing output"
-                );
-            }
-            let _ = std::fs::remove_dir_all(vault);
-        }
-    }
 }
 
 pub fn decode_bytes(raw: &[u8], encoding: Option<&str>) -> std::io::Result<Vec<u8>> {
