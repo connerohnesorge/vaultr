@@ -37,7 +37,13 @@ and fsynced before the canonical lock path becomes visible. An incomplete
 canonical lock from the legacy publisher MUST be boundedly reread and then left
 intact while the Door fails closed; it MUST NOT be reclaimed by a running Door.
 Its removal requires an explicit offline migration after verifying no legacy
-Door process exists. Reclaiming a complete lock whose owner is dead MUST open
+Door process exists. Lock acquisition MUST return one root-bound state store
+with the lease, retaining the canonical state-directory descriptor and identity
+through release. Every state, lock, temporary-file, rename, unlink, and
+directory-fsync operation MUST route through that store. Immediately before
+publishing a lock or state replacement, the store MUST revalidate that the
+configured state-directory path still identifies the retained root and fail
+closed otherwise. Reclaiming a complete lock whose owner is dead MUST open
 the canonical complete lock itself beneath the canonical state root with
 no-follow and nonblocking semantics, verify a bounded regular file and stable
 descriptor/path device-inode identity, and retain that descriptor while taking
@@ -109,6 +115,13 @@ its first post-migration launch.
 - THEN no-follow nonblocking descriptor validation fails closed without blocking
 - AND unlink and fsync cannot be redirected through the alias
 - AND the Door does not unlink the replacement, advance state, or launch an agent
+
+#### Scenario: State alias changes during claim publication
+
+- WHEN the configured state-directory alias is retargeted after lock acquisition and before claim publication
+- THEN the held store rejects publication before the claim becomes visible
+- AND no state or lock operation is redirected into the successor root
+- AND a later evaluation of the retained root launches the complete batch at most once
 
 #### Scenario: Files share a timestamp
 

@@ -30,13 +30,17 @@ typed code rather than bash or a bespoke declarative format.
 - The daemon and offline compressor acquire both capture listeners before
   recovery. Startup/offline recovery runs once under those leases; scheduled
   compression only sweeps. On daemon cancellation, each listener supervisor
-  stops accepting, freezes its pre-cancellation connection `JoinSet`, drains
-  only that set to one deadline, aborts and reaps leftovers, and returns its
-  listener descriptor. Both leases remain held until both supervisors join. A
-  failed partial bind is dropped before any mutation.
+  stops accepting, closes its owned capture-task tracker, freezes its
+  pre-cancellation connection and capture-descendant sets, drains both to one
+  deadline, aborts and reaps leftovers, and returns its listener descriptor.
+  A tee selects on client receiver closure as well as upstream data. Both
+  leases remain held until both supervisors join. A failed partial bind is
+  dropped before any mutation.
 - The fragile parts — dedup fencing, watch-root policy, fire-rate breaking,
   agent launch — are written once in a shared TypeScript library, not
-  re-authored per door.
+  re-authored per door. The package is split by those owned concepts:
+  agent-run, root-bound state/locking, ingestion, and a thin Door orchestrator;
+  test fault injection is internal and absent from the package entry point.
 - Door state fails closed, is replaced atomically under a per-door
   cross-process lock, and carries a timestamp frontier with the paths already
   seen at that timestamp plus the exact ordered in-progress batch. The claim
@@ -159,6 +163,11 @@ no-follow regular-file descriptors. Projection retains stable descriptor and
 identity leases for both directories, revalidates their lexical and canonical
 identity around every atomic temp/final publication, and proves each exclusive
 no-follow temp descriptor landed inside the held directory before writing.
+These mechanics live in `safe-loader.ts`: `RootBoundDirectory` retains and
+revalidates the private canonical directory descriptor, exclusively creates
+and fsyncs retained regular entries, publishes them without replacement, and
+atomically replaces+fsyncs state. Door locking/state and mail projection share
+that boundary rather than duplicating path publication logic.
 Hostile same-account substitution within one individual Node path syscall is
 outside the local trust model; static or pre-operation directory replacement
 fails closed without publishing outside the held directory. The first true run snapshots all existing
@@ -200,6 +209,13 @@ serialize; after one unlinks or publishes a successor, a delayed contender
 observes a missing or changed pathname and cannot remove the successor.
 Symlinks, FIFOs, non-regular nodes, oversize metadata, pathname replacement,
 and intermediate state-root alias retargeting fail closed.
+
+Door lock acquisition returns the `RootBoundDirectory` with the lease. The
+retained directory descriptor and identity own every later state, lock, temp,
+rename, unlink, and directory-fsync operation. State and lock publication
+revalidate the configured alias immediately before visibility; an alias
+retarget during claim save therefore fails closed before launch and cannot
+write state into the successor root.
 
 Shipped scalar `hwm` and v1 `(mtime,path)` states migrate under the Door lock
 and the v2 replacement is durable before evaluation. A scalar `hwm` cannot

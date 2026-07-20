@@ -2,13 +2,19 @@ import {
   closeSync,
   constants,
   fstatSync,
+  fsyncSync,
+  linkSync,
   lstatSync,
+  mkdirSync,
   openSync,
   readSync,
   realpathSync,
+  renameSync,
   statSync,
+  unlinkSync,
+  writeSync,
 } from "node:fs";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
 export interface StableFileStat {
   dev: number;
@@ -71,6 +77,43 @@ export function canonicalDirectory(path: string): string {
   return canonical;
 }
 
+function syncDirectory(path: string): void {
+  const fd = openSync(path, "r");
+  try {
+    fsyncSync(fd);
+  } finally {
+    closeSync(fd);
+  }
+}
+
+export function ensureDirectoryDurable(path: string): void {
+  const missing: string[] = [];
+  let cursor = resolve(path);
+  while (true) {
+    try {
+      if (!lstatSync(cursor).isDirectory()) {
+        throw new Error(`${cursor} is not a real directory`);
+      }
+      break;
+    } catch (error: any) {
+      if (error?.code !== "ENOENT") throw error;
+      missing.push(cursor);
+      const parent = dirname(cursor);
+      if (parent === cursor) throw error;
+      cursor = parent;
+    }
+  }
+  for (const directory of missing.reverse()) {
+    try {
+      mkdirSync(directory, { mode: 0o700 });
+    } catch (error: any) {
+      if (error?.code !== "EEXIST" || !lstatSync(directory).isDirectory()) throw error;
+    }
+    syncDirectory(directory);
+    syncDirectory(dirname(directory));
+  }
+}
+
 function descriptorPath(fd: number): string {
   if (process.platform === "darwin") return `/dev/fd/${fd}`;
   if (process.platform === "linux") return `/proc/self/fd/${fd}`;
@@ -96,6 +139,13 @@ function sameStat(a: StableFileStat, b: StableFileStat): boolean {
     && a.size === b.size
     && a.mtimeMs === b.mtimeMs
     && a.ctimeMs === b.ctimeMs;
+}
+
+function sameInode(
+  a: { dev: number; ino: number },
+  b: { dev: number; ino: number },
+): boolean {
+  return a.dev === b.dev && a.ino === b.ino;
 }
 
 function inspectDescriptor(
@@ -291,4 +341,295 @@ export function readStableRegularFile(
       return buffer.subarray(0, stat.size);
     },
   );
+}
+
+function validDirectoryEntry(name: string): boolean {
+  return validRelativeFilePath(name) && !name.includes("/");
+}
+
+/**
+ * Retains one canonical directory descriptor and routes entry publication and
+ * directory fsync through that identity. Each publication revalidates the
+ * configured path immediately before it becomes visible.
+ */
+export class RootBoundDirectory {
+  readonly configuredPath: string;
+  readonly canonicalPath: string;
+  private readonly fd: number;
+  private readonly identity: { dev: number; ino: number };
+  private closed = false;
+
+  constructor(path: string) {
+    this.configuredPath = resolve(path);
+    this.canonicalPath = canonicalDirectory(this.configuredPath);
+    if (typeof constants.O_DIRECTORY !== "number"
+      || typeof constants.O_NOFOLLOW !== "number") {
+      throw new Error("retained no-follow directory opens are unavailable");
+    }
+    this.fd = openSync(
+      this.canonicalPath,
+      constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+    );
+    const stat = fstatSync(this.fd);
+    if (!stat.isDirectory()) {
+      closeSync(this.fd);
+      throw new Error(`${this.canonicalPath} is not a retained directory`);
+    }
+    this.identity = { dev: stat.dev, ino: stat.ino };
+    try {
+      this.verifyConfiguredPath();
+    } catch (error) {
+      closeSync(this.fd);
+      throw error;
+    }
+  }
+
+  displayPath(name: string): string {
+    this.requireEntry(name);
+    return resolve(this.configuredPath, name);
+  }
+
+  verify(): void {
+    if (this.closed) throw new Error("root-bound directory is closed");
+    const retained = fstatSync(this.fd);
+    if (!retained.isDirectory() || !sameInode(this.identity, retained)) {
+      throw new Error("retained canonical directory identity changed");
+    }
+    let lexical: ReturnType<typeof lstatSync>;
+    try {
+      lexical = lstatSync(this.canonicalPath);
+    } catch (error) {
+      throw new Error("retained canonical directory disappeared", {
+        cause: error,
+      });
+    }
+    if (!lexical.isDirectory() || !sameInode(this.identity, lexical)) {
+      throw new Error("retained canonical directory path changed");
+    }
+  }
+
+  verifyConfiguredPath(): void {
+    this.verify();
+    let canonical: string;
+    try {
+      canonical = realpathSync(this.configuredPath);
+    } catch (error) {
+      throw new Error("configured directory changed after acquisition", {
+        cause: error,
+      });
+    }
+    const stat = statSync(canonical);
+    if (canonical !== this.canonicalPath
+      || !stat.isDirectory()
+      || !sameInode(this.identity, stat)) {
+      throw new Error("configured directory changed after acquisition");
+    }
+  }
+
+  readStableFile(
+    name: string,
+    maxSize: number,
+    afterStat?: (path: string) => void,
+  ): Buffer {
+    this.requireEntry(name);
+    this.verify();
+    const value = readStableRegularFile(
+      this.canonicalPath,
+      name,
+      maxSize,
+      afterStat,
+    ).value;
+    this.verify();
+    return value;
+  }
+
+  openStableFile(
+    name: string,
+    writable = false,
+  ): StableRegularFileDescriptor {
+    this.requireEntry(name);
+    this.verify();
+    const handle = openStableRegularFileDescriptor(
+      this.canonicalPath,
+      name,
+      writable,
+    );
+    try {
+      this.verify();
+      return handle;
+    } catch (error) {
+      handle.close();
+      throw error;
+    }
+  }
+
+  /** Exclusively creates, writes, fsyncs, and retains one regular entry. */
+  createDurableFile(
+    name: string,
+    bytes: string | Uint8Array,
+  ): StableRegularFileDescriptor {
+    const path = this.entryPath(name);
+    this.verifyConfiguredPath();
+    if (typeof constants.O_NOFOLLOW !== "number"
+      || typeof constants.O_NONBLOCK !== "number") {
+      throw new Error("nonblocking no-follow file creation is unavailable");
+    }
+    let fd: number | undefined;
+    let retained: StableRegularFileDescriptor | undefined;
+    let created = false;
+    try {
+      fd = openSync(
+        path,
+        constants.O_RDWR
+        | constants.O_CREAT
+        | constants.O_EXCL
+        | constants.O_NOFOLLOW
+        | constants.O_NONBLOCK,
+        0o600,
+      );
+      created = true;
+      const data = Buffer.from(bytes);
+      let offset = 0;
+      while (offset < data.length) {
+        const written = writeSync(
+          fd,
+          data,
+          offset,
+          data.length - offset,
+          offset,
+        );
+        if (written === 0) throw new Error(`short durable write: ${name}`);
+        offset += written;
+      }
+      fsyncSync(fd);
+      retained = this.openStableFile(name, true);
+      if (!sameInode(fstatSync(fd), retained.stat)) {
+        retained.close();
+        throw new StableFileIdentityError(
+          `created file identity changed: ${name}`,
+        );
+      }
+      this.sync();
+      closeSync(fd);
+      fd = undefined;
+      return retained;
+    } catch (error) {
+      if (fd !== undefined) closeSync(fd);
+      retained?.close();
+      if (created) {
+        try {
+          this.cleanup(name);
+        } catch {}
+      }
+      throw error;
+    }
+  }
+
+  /**
+   * Hard-links a retained temp entry without replacement, fsyncs publication,
+   * removes+fsyncs the temp name, and returns a descriptor bound to the final
+   * entry. `undefined` means the final entry already existed.
+   */
+  publishNoReplace(
+    tempName: string,
+    temp: StableRegularFileDescriptor,
+    finalName: string,
+  ): StableRegularFileDescriptor | undefined {
+    temp.verify();
+    const tempPath = this.entryPath(tempName);
+    const finalPath = this.entryPath(finalName);
+    this.verifyConfiguredPath();
+    try {
+      linkSync(tempPath, finalPath);
+    } catch (error: any) {
+      if (error?.code === "EEXIST") return undefined;
+      throw error;
+    }
+    let published: StableRegularFileDescriptor | undefined;
+    try {
+      this.sync();
+      unlinkSync(tempPath);
+      this.sync();
+      published = this.openStableFile(finalName, true);
+      if (!sameInode(fstatSync(temp.fd), published.stat)) {
+        throw new StableFileIdentityError(
+          `published file identity changed: ${finalName}`,
+        );
+      }
+      return published;
+    } catch (error) {
+      published?.close();
+      try {
+        unlinkSync(finalPath);
+        this.sync();
+      } catch {}
+      throw error;
+    }
+  }
+
+  /** Atomically replaces one entry from a retained temp and fsyncs the directory. */
+  replaceAtomically(
+    tempName: string,
+    temp: StableRegularFileDescriptor,
+    finalName: string,
+  ): StableRegularFileDescriptor {
+    temp.verify();
+    const tempPath = this.entryPath(tempName);
+    const finalPath = this.entryPath(finalName);
+    this.verifyConfiguredPath();
+    renameSync(tempPath, finalPath);
+    const published = this.openStableFile(finalName, true);
+    try {
+      if (!sameInode(fstatSync(temp.fd), published.stat)) {
+        throw new StableFileIdentityError(
+          `replacement file identity changed: ${finalName}`,
+        );
+      }
+      this.sync();
+      return published;
+    } catch (error) {
+      published.close();
+      throw error;
+    }
+  }
+
+  removeAndSync(name: string): void {
+    unlinkSync(this.entryPath(name));
+    this.sync();
+  }
+
+  cleanup(name: string): void {
+    try {
+      this.removeAndSync(name);
+    } catch (error: any) {
+      if (error?.code !== "ENOENT") throw error;
+    }
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    closeSync(this.fd);
+  }
+
+  private requireEntry(name: string): void {
+    if (!validDirectoryEntry(name)) {
+      throw new Error(`invalid root-bound directory entry: ${name}`);
+    }
+  }
+
+  private entryPath(name: string): string {
+    this.requireEntry(name);
+    this.verify();
+    return resolve(this.canonicalPath, name);
+  }
+
+  private sync(): void {
+    this.verify();
+    fsyncSync(this.fd);
+  }
+}
+
+export function openRootBoundDirectory(path: string): RootBoundDirectory {
+  return new RootBoundDirectory(path);
 }

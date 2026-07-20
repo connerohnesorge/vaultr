@@ -22,14 +22,17 @@ server-side pieces make restarts actually safe:
    launchd copy and hook-started copies coexist safely: whoever binds first
    wins, the loser exits 0. Logs: `~/.local/state/plant/launchd.log`.
 
-2. **Listeners released before drain** — on SIGTERM/SIGINT, `main.rs` aborts
-   the accept loops (dropping the listeners) *before* the 30s in-flight drain
-   sleep. A replacement can bind immediately instead of hitting AddrInUse and
-   yielding to a dying instance. Per-connection tasks are independent spawns,
-   so in-flight streams still finish.
+2. **Listeners retained through a fixed-set drain** — on SIGTERM/SIGINT, each
+   listener stops accepting, closes its owned capture-task tracker, and
+   boundedly drains only the connections and capture tee/finalizers accepted
+   before cancellation. Client disconnect closes a capture tee even when its
+   upstream is indefinitely stalled. At the deadline, remaining connection
+   and capture tasks are aborted and reaped. Both listener descriptors stay
+   owned until both supervisors join, so a replacement cannot overlap a dying
+   instance's capture writes.
 
 Skipped: SO_REUSEPORT / fd handover for true zero-downtime — SDK retries
-already cover the sub-second gap; add only if retries observably fail during
+cover the bounded handover gap; add only if retries observably fail during
 restarts.
 
 ### macOS setup (one-time, already done 2026-07-15)

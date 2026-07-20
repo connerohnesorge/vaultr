@@ -42,8 +42,10 @@ typed result through exactly one durable final-record transition or one
 retryable-fence transition. Plant MUST retain a nonretryable fence whenever the
 final outcome cannot be proven durable. On daemon cancellation, Plant MUST
 stop both listener supervisors from accepting, freeze and boundedly drain only
-their pre-cancellation connection sets, abort and reap leftovers, and retain
-both listener leases until both supervisors join.
+their pre-cancellation connection sets and owned capture tee/finalizer task
+sets, abort and reap leftovers, and retain both listener leases until both
+supervisors join. A capture tee MUST stop pulling a stalled upstream when its
+client receiver closes.
 
 #### Scenario: State is unavailable before dispatch
 
@@ -111,8 +113,15 @@ both listener leases until both supervisors join.
 
 - WHEN the listener-owning daemon receives cancellation
 - THEN both listener supervisors stop accepting new work
-- AND each supervisor freezes its pre-cancellation connection set, drains only that set to a bounded deadline, then aborts and reaps leftovers
+- AND each supervisor closes its capture-task tracker and drains its fixed connection and capture-descendant sets to one bounded deadline
+- AND it aborts and reaps every leftover connection, tee, and finalizer before returning
 - AND both listener leases remain held until both supervisors have joined
+
+#### Scenario: Client disconnects from an indefinitely stalled captured stream
+
+- WHEN a captured response has started but its upstream stalls indefinitely and the client disconnects
+- THEN the capture tee observes receiver closure and stops pulling the upstream
+- AND cancellation drains or aborts and reaps its finalizer before the listener lease returns
 
 ### Requirement: Idempotent Plant agent runs
 

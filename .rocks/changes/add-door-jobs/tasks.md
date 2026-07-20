@@ -22,3 +22,9 @@
 
 - [x] 3.1 Add a Teamer sync job to `vault/jobs/` landing Teams chats as watchable Vault Content on a 30m cadence
 - [x] 3.2 Add one real email door over machine-local immutable Internet-Message-ID artifacts and one real Teams door as `door-<name>.30m.ts` jobs, and prove an isolated no-send mail fire against a fake Plant durable receipt (JSONL projection → immutable artifact → one durable agent launch)
+
+## 4. Review repair
+
+- [x] 4.1 Put reusable retained-root durable create/no-replace/atomic-replace primitives in `safe-loader.ts`, bind Door state and locking to them from acquisition through release, and add adversarial publication regressions
+- [x] 4.2 Own capture tee/finalizer tasks in the listener shutdown set, cancel stalled upstream reads on client disconnect, and verify bounded shutdown before lease return
+- [x] 4.3 Split the Door library and tests by owned concept while keeping fault injection out of the public package entry point
