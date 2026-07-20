@@ -5,6 +5,7 @@
 mod adapter;
 mod capture;
 mod cli;
+mod coverage;
 mod domain;
 mod fsutil;
 mod herdr;
@@ -91,7 +92,7 @@ async fn dispatch(command: Command) -> i32 {
             );
             0
         }
-        Command::SessionsCoverage(sid) => match sweep::coverage(&vault_root(), &sid) {
+        Command::SessionsCoverage(sid) => match coverage::coverage(&vault_root(), &sid) {
             Ok(c) => {
                 let tag = if c.resumed { " (resumed)" } else { "" };
                 println!(
@@ -106,6 +107,8 @@ async fn dispatch(command: Command) -> i32 {
                     c.window_start, c.carryover
                 );
                 if c.captured > c.in_window_native {
+                    // Captured envelopes with no in-window native match (for
+                    // example a pre-window boundary call) are informational.
                     println!("  captured={} (>= in-window native)", c.captured);
                 }
                 if c.missing.is_empty() {

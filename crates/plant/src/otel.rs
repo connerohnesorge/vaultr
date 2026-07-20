@@ -111,12 +111,13 @@ impl Otel {
         model: Option<&str>,
         req: &CapturedRequest,
         resp: &CapturedResponse,
+        events: &[Value],
     ) {
         if !self.enabled {
             return;
         }
         let model = model.unwrap_or("unknown").to_string();
-        let usage = adapter.usage(&vaultr::recon::parse_sse(&resp.sse));
+        let usage = adapter.usage(events);
         let duration_ms = req
             .started_at
             .elapsed()

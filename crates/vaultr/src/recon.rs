@@ -34,6 +34,26 @@ impl Harness {
             _ => None,
         }
     }
+
+    /// Derive harness identity from one Envelope, preserving prior truth when
+    /// the current Envelope is legacy and carries no identifying field.
+    pub fn from_envelope(env: &Value, current: Option<Harness>) -> Option<Harness> {
+        env.get("harness")
+            .and_then(Value::as_str)
+            .and_then(Harness::from_label)
+            .or_else(|| {
+                if current.is_none()
+                    && env
+                        .pointer("/request/body_delta/history/key")
+                        .and_then(Value::as_str)
+                        == Some("input")
+                {
+                    Some(Harness::Codex)
+                } else {
+                    current
+                }
+            })
+    }
 }
 
 /// Result of reconstructing a capture.
@@ -60,6 +80,18 @@ pub struct Recon {
 /// A resumed capture can have a sealed generation followed by a raw one.
 /// Entering through either canonical sibling reconstructs both in that order.
 pub fn reconstruct(path: &Path) -> Result<Recon> {
+    let mut st = ReconState::new();
+    for_each_envelope(path, |env| st.apply(env))?;
+    Ok(st.finish())
+}
+
+/// Stream every Envelope from a canonical capture path to `visit`.
+///
+/// A sealed generation is visited before its live raw sibling regardless of
+/// which sibling is supplied. Record parsing and tail strictness are identical
+/// to [`reconstruct`], visitor failures retain their record location, and
+/// memory is bounded by the largest physical record.
+pub fn for_each_envelope(path: &Path, mut visit: impl FnMut(&Value) -> Result<()>) -> Result<()> {
     let sibling = match path.file_name().and_then(|name| name.to_str()) {
         Some("turns.jsonl") => Some(path.with_file_name("turns.jsonl.zst")),
         Some("turns.jsonl.zst") => Some(path.with_file_name("turns.jsonl")),
@@ -80,26 +112,21 @@ pub fn reconstruct(path: &Path) -> Result<Recon> {
                 File::open(sealed).with_context(|| format!("open {}", sealed.display()))?;
             let raw = File::open(raw).with_context(|| format!("open {}", raw.display()))?;
             let dec = zstd::Decoder::new(sealed).context("zstd decoder")?;
-            // Sealed generation is strict; the trailing raw generation is the
-            // live tail (one unterminated final fragment tolerated). Shared state
-            // so the raw deltas continue the sealed history.
-            let mut st = ReconState::new();
-            run_segment(BufReader::new(dec), Segment::Sealed, &mut st)?;
-            run_segment(BufReader::new(raw), Segment::LiveRaw, &mut st)?;
-            return Ok(st.finish());
+            run_segment(BufReader::new(dec), Segment::Sealed, &mut visit)?;
+            run_segment(BufReader::new(raw), Segment::LiveRaw, &mut visit)?;
+            return Ok(());
         }
     }
 
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let mut st = ReconState::new();
     if path.extension().and_then(|e| e.to_str()) == Some("zst") {
         // A lone sealed capture is fully terminated: strict.
         let dec = zstd::Decoder::new(file).context("zstd decoder")?;
-        run_segment(BufReader::new(dec), Segment::Sealed, &mut st)?;
+        run_segment(BufReader::new(dec), Segment::Sealed, &mut visit)?;
     } else {
-        run_segment(BufReader::new(file), Segment::LiveRaw, &mut st)?;
+        run_segment(BufReader::new(file), Segment::LiveRaw, &mut visit)?;
     }
-    Ok(st.finish())
+    Ok(())
 }
 
 /// Streaming core over any reader — treated as a single live raw segment (one
@@ -107,7 +134,9 @@ pub fn reconstruct(path: &Path) -> Result<Recon> {
 /// a reader; path-based [`reconstruct`] distinguishes sealed vs raw strictness.
 pub fn reconstruct_reader<R: Read>(reader: R) -> Result<Recon> {
     let mut st = ReconState::new();
-    run_segment(BufReader::new(reader), Segment::LiveRaw, &mut st)?;
+    run_segment(BufReader::new(reader), Segment::LiveRaw, &mut |env| {
+        st.apply(env)
+    })?;
     Ok(st.finish())
 }
 
@@ -242,7 +271,11 @@ impl ReconState {
 /// cannot form complete Envelopes fails with the segment and one-based record
 /// number (never echoing content), except one unterminated final fragment in a
 /// `LiveRaw` segment, which is ignored.
-fn run_segment<R: BufRead>(mut reader: R, segment: Segment, st: &mut ReconState) -> Result<()> {
+fn run_segment<R: BufRead>(
+    mut reader: R,
+    segment: Segment,
+    visit: &mut impl FnMut(&Value) -> Result<()>,
+) -> Result<()> {
     let mut record_no = 0usize;
     let mut buf: Vec<u8> = Vec::new();
     loop {
@@ -271,7 +304,7 @@ fn run_segment<R: BufRead>(mut reader: R, segment: Segment, st: &mut ReconState)
             match stream.next() {
                 Some(Ok(v)) => {
                     consumed = stream.byte_offset();
-                    st.apply(&v).with_context(|| {
+                    visit(&v).with_context(|| {
                         format!("reconstruct: {} record {record_no}", segment.label())
                     })?;
                 }

@@ -7,8 +7,8 @@ use crate::capture::session_dir;
 use crate::proxy::{self, ProxyCtx};
 use crate::sweep;
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::{Frame, Incoming};
 use hyper::{Request, Response};
 use serde_json::{json, Value};
 use std::convert::Infallible;
@@ -20,6 +20,56 @@ const SSE: &str = concat!(
     "data: {\"type\":\"message_stop\"}\n\n",
     "data: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":20,\"output_tokens\":9,\"input_tokens_details\":{\"cached_tokens\":4}}}}\n\n",
 );
+
+const CLAUDE_TERMINAL_WORD: &str = concat!(
+    "data: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",",
+    "\"text\":\"message_stop\"}}\n\n"
+);
+const CODEX_TERMINAL_WORD: &str = concat!(
+    "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",",
+    "\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",",
+    "\"text\":\"response.completed\"}]}}\n\n"
+);
+const CLAUDE_TERMINAL_PREFIX: &str = "data: {\"type\":\"message_stop\"}";
+
+#[derive(Clone, Copy)]
+enum UpstreamFixture {
+    Full,
+    ClaudeTerminalWord,
+    CodexTerminalWord,
+    Torn,
+    Delayed,
+}
+
+fn full_body(data: impl Into<Bytes>) -> proxy::BoxBody {
+    Full::new(data.into())
+        .map_err(|error: Infallible| match error {})
+        .boxed()
+}
+
+fn streamed_body(fixture: UpstreamFixture) -> proxy::BoxBody {
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(2);
+    tokio::spawn(async move {
+        let _ = tx
+            .send(Ok(Frame::data(Bytes::from_static(
+                CLAUDE_TERMINAL_PREFIX.as_bytes(),
+            ))))
+            .await;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        match fixture {
+            UpstreamFixture::Torn => {
+                let _ = tx.send(Err(std::io::Error::other("torn upstream"))).await;
+            }
+            UpstreamFixture::Delayed => {
+                let _ = tx.send(Ok(Frame::data(Bytes::from_static(b"\n\n")))).await;
+            }
+            _ => unreachable!("only streaming fixtures reach streamed_body"),
+        }
+    });
+    BodyExt::boxed(StreamBody::new(
+        tokio_stream::wrappers::ReceiverStream::new(rx),
+    ))
+}
 
 /// fake upstream needs the request body consumed (hyper requires it); collect then respond
 async fn serve_upstream() -> u16 {
@@ -35,18 +85,28 @@ async fn serve_upstream() -> u16 {
             tokio::spawn(async move {
                 let io = hyper_util::rt::TokioIo::new(stream);
                 let svc = hyper::service::service_fn(|req: Request<Incoming>| async move {
+                    let fixture = match req.uri().query() {
+                        Some("fixture=claude-terminal-word") => UpstreamFixture::ClaudeTerminalWord,
+                        Some("fixture=codex-terminal-word") => UpstreamFixture::CodexTerminalWord,
+                        Some("fixture=torn") => UpstreamFixture::Torn,
+                        Some("fixture=delayed") => UpstreamFixture::Delayed,
+                        _ => UpstreamFixture::Full,
+                    };
                     let _ = req.into_body().collect().await;
-                    Ok::<_, Infallible>(
-                        Response::builder()
-                            .header("content-type", "text/event-stream")
-                            .header("content-encoding", "zstd")
-                            .header("request-id", "req_test")
-                            .header("x-secret", "drop-me")
-                            .body(Full::new(Bytes::from(
-                                zstd::encode_all(SSE.as_bytes(), 1).unwrap(),
-                            )))
-                            .unwrap(),
-                    )
+                    let mut response = Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .header("request-id", "req_test")
+                        .header("x-secret", "drop-me");
+                    let body = match fixture {
+                        UpstreamFixture::Full => {
+                            response = response.header("content-encoding", "zstd");
+                            full_body(zstd::encode_all(SSE.as_bytes(), 1).unwrap())
+                        }
+                        UpstreamFixture::ClaudeTerminalWord => full_body(CLAUDE_TERMINAL_WORD),
+                        UpstreamFixture::CodexTerminalWord => full_body(CODEX_TERMINAL_WORD),
+                        UpstreamFixture::Torn | UpstreamFixture::Delayed => streamed_body(fixture),
+                    };
+                    Ok::<_, Infallible>(response.body(body).unwrap())
                 });
                 let _ = hyper::server::conn::http1::Builder::new()
                     .serve_connection(io, svc)
@@ -78,6 +138,20 @@ fn start_proxy(
         proxy::serve(listener, ctx).await;
     });
     rx.recv().unwrap()
+}
+
+async fn wait_for_envelope(vault: &std::path::Path, sid: &str) -> Value {
+    for _ in 0..300 {
+        if let Ok(dir) = session_dir(vault, sid) {
+            if let Ok(turns) = std::fs::read_to_string(dir.join("turns.jsonl")) {
+                if let Some(line) = turns.lines().next() {
+                    return serde_json::from_str(line).unwrap();
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("capture did not finish for {sid}");
 }
 
 pub async fn self_test() {
@@ -309,6 +383,97 @@ pub async fn self_test() {
     );
     assert_eq!(cturns[0]["response"]["complete"], true);
 
+    // -- exact terminal certification controls, through the same upstream,
+    // proxy, persistence, and OTLP paths as the primary self-test requests --
+    let claude_control = |sid: &str, fixture: &str| {
+        client
+            .post(format!(
+                "http://127.0.0.1:{claude_port}/v1/messages?fixture={fixture}"
+            ))
+            .json(&json!({
+                "model": "control",
+                "stream": true,
+                "messages": [{"role": "user", "content": "control"}],
+                "metadata": {"user_id": json!({"session_id": sid}).to_string()},
+            }))
+    };
+
+    let terminal_word_sid = "019f1234-5678-7abc-8def-0123456789ad";
+    claude_control(terminal_word_sid, "claude-terminal-word")
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+
+    let torn_sid = "019f1234-5678-7abc-8def-0123456789ae";
+    let torn = claude_control(torn_sid, "torn")
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await;
+    assert!(
+        torn.is_err(),
+        "torn upstream must reach the client as an error"
+    );
+
+    let delayed_sid = "019f1234-5678-7abc-8def-0123456789af";
+    let delayed = claude_control(delayed_sid, "delayed")
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(delayed, format!("{CLAUDE_TERMINAL_PREFIX}\n\n"));
+
+    let disconnect_sid = "019f1234-5678-7abc-8def-0123456789b0";
+    let disconnected = claude_control(disconnect_sid, "delayed")
+        .send()
+        .await
+        .unwrap();
+    drop(disconnected);
+
+    let codex_terminal_word_sid = "019f1234-5678-7abc-8def-0123456789b1";
+    client
+        .post(format!(
+            "http://127.0.0.1:{codex_port}/responses?fixture=codex-terminal-word"
+        ))
+        .header("session-id", codex_terminal_word_sid)
+        .json(&json!({
+            "model": "control",
+            "input": [{"role": "user", "content": "control"}],
+        }))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+
+    for (control_sid, expected) in [
+        (terminal_word_sid, false),
+        (torn_sid, false),
+        (delayed_sid, true),
+        (disconnect_sid, false),
+        (codex_terminal_word_sid, false),
+    ] {
+        let envelope = wait_for_envelope(&vault, control_sid).await;
+        assert_eq!(
+            envelope["response"]["complete"], expected,
+            "completion mismatch for {control_sid}"
+        );
+    }
+    let codex_terminal_word_dir = session_dir(&vault, codex_terminal_word_sid).unwrap();
+    let reconstructed =
+        vaultr::recon::reconstruct(&codex_terminal_word_dir.join("turns.jsonl")).unwrap();
+    assert_eq!(
+        reconstructed.trailing_appended, 0,
+        "uncertified Codex output must not become trailing output"
+    );
+
     // -- OTLP metrics + logs --
     otel.flush(&client, Some("test-token")).await;
     let exports = exports.lock().unwrap().clone();
@@ -355,13 +520,36 @@ pub async fn self_test() {
         .unwrap();
     assert_eq!(claude_input["asInt"], "33");
     assert_eq!(codex_cache["asInt"], "4");
+    let request_points = metrics
+        .iter()
+        .find(|m| m["name"] == "vaultr.requests")
+        .unwrap()["sum"]["dataPoints"]
+        .as_array()
+        .unwrap();
+    let request_count = |harness: &str, model: &str, complete: bool| -> u64 {
+        request_points
+            .iter()
+            .filter(|point| {
+                let attributes = point_attrs(point);
+                attributes["harness"] == harness
+                    && attributes["model"] == model
+                    && attributes["complete"] == complete
+            })
+            .map(|point| point["asInt"].as_str().unwrap().parse::<u64>().unwrap())
+            .sum()
+    };
+    assert_eq!(request_count("claude-code", "m", true), 3);
+    assert_eq!(request_count("codex", "gpt-test", true), 1);
+    assert_eq!(request_count("claude-code", "control", true), 1);
+    assert_eq!(request_count("claude-code", "control", false), 3);
+    assert_eq!(request_count("codex", "control", false), 1);
     let log_export = exports.iter().find(|e| e["path"] == "/v1/logs").unwrap();
     assert_eq!(
         log_export["body"]["resourceLogs"][0]["scopeLogs"][0]["logRecords"]
             .as_array()
             .unwrap()
             .len(),
-        4
+        9
     );
     assert_eq!(
         point_attrs(&log_export["body"]["resourceLogs"][0]["resource"])["loki.resource.labels"],

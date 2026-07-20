@@ -45,6 +45,37 @@ Deliberately **not** in scope (ponytail): no new daemon, no per-turn coverage
 metric on the hot path, no automatic remediation. One read-only subcommand over
 data already on disk.
 
+## Streaming evidence traversal
+
+Reconstruction owns the canonical capture read order and corruption policy:
+sealed Envelopes first, then the live raw sibling; every complete concatenated
+JSON value is visited; terminated malformed residue fails; and only one final
+unterminated live-raw fragment is tolerated. Expose that path as a closure-based
+Envelope stream and use it for both Reconstruction and coverage. Do not add a
+visitor trait or construct full reconstructed history for an ID-set audit.
+
+Coverage reads the native transcript through `BufRead`, retaining only distinct
+request IDs and their in-window classification. Capture and transcript memory is
+therefore bounded by the largest physical record plus the comparison ID sets,
+not by either file's decoded size. Any capture open, decode, or record error
+fails the audit instead of silently erasing evidence.
+
+Release-CLI acceptance evidence and its reproducible streamed-to-zstd generator
+live in `crates/plant/STRESS.md`. With record size, the two-ID cardinality, and
+the two-line native transcript held constant, scaling decoded capture evidence
+from 128.015 MiB to 919.110 MiB increased median RSS from 13,172,736 to
+13,303,808 bytes (1.00%); the largest measured RSS was 13,320,192 bytes. No
+decoded archive or generated fixture is committed.
+
+## Harness support and denominator
+
+Envelope harness identity is wire truth. Codex has no comparable native
+`assistant.requestId` denominator, so the command fails explicitly instead of
+inventing a proxy. A Claude window with zero in-window native IDs also fails,
+including a nonempty transcript whose IDs are all carryover. The percentage
+function is reached only for a non-zero supported in-window denominator, so
+`0/0` can never print a percentage.
+
 ## ADRs
 
 ### ADR-0001: Coverage denominator is Plant's observation window, not the full transcript

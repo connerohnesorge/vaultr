@@ -59,6 +59,17 @@ fn malformed_lineage_fails_with_location_only() {
 }
 
 #[test]
+fn streaming_visitor_errors_keep_record_location() {
+    let err = recon::for_each_envelope(&fixture("claude_append.jsonl"), |_| {
+        Err(anyhow::anyhow!("visitor rejected envelope"))
+    })
+    .unwrap_err();
+    let message = format!("{err:#}");
+    assert!(message.contains("reconstruct: raw record 1"), "{message}");
+    assert!(message.contains("visitor rejected envelope"), "{message}");
+}
+
+#[test]
 fn compaction_replaces_history() {
     let r = recon::reconstruct(&fixture("compaction.jsonl")).unwrap();
     // prefix_length 0 on the second envelope discards the pre-compaction turns
@@ -215,6 +226,15 @@ fn mixed_generations_reconstruct_from_either_sibling() {
     assert_eq!(from_sealed.messages, expected.messages);
     assert_eq!(from_raw.envelopes, 2);
     assert_eq!(from_sealed.envelopes, 2);
+    for entry in [&raw_path, &sealed_path] {
+        let mut seen = 0;
+        recon::for_each_envelope(entry, |_| {
+            seen += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(seen, 2, "streaming entry failed for {}", entry.display());
+    }
 
     fs::write(&sealed_path, "not zstd").unwrap();
     assert!(recon::reconstruct(&raw_path).is_err());

@@ -75,6 +75,15 @@ impl Adapter {
         }
     }
 
+    /// A response is complete only when the transport ended cleanly and a
+    /// parsed SSE event has the exact terminal type for this harness.
+    pub fn response_complete(&self, events: &[Value], transport_complete: bool) -> bool {
+        transport_complete
+            && events
+                .iter()
+                .any(|event| event.get("type").and_then(Value::as_str) == Some(self.terminal_event))
+    }
+
     pub fn identity(&self, headers: &hyper::HeaderMap, body: &Value) -> Identity {
         match self.harness {
             Harness::ClaudeCode => {
@@ -264,5 +273,33 @@ mod tests {
         let x = codex();
         assert!(x.captures("POST", "/backend-api/codex/responses"));
         assert!(!x.captures("POST", "/backend-api/codex/responses/count_tokens"));
+    }
+
+    #[test]
+    fn completion_requires_an_exact_top_level_terminal_event() {
+        let claude = claude();
+        let events = vaultr::recon::parse_sse(
+            r#"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"message_stop"}}"#,
+        );
+        assert!(!claude.response_complete(&events, true));
+        let events = vaultr::recon::parse_sse(r#"data: {"type":"message_stop"}"#);
+        assert!(claude.response_complete(&events, true));
+
+        let codex = codex();
+        let events = vaultr::recon::parse_sse(
+            r#"data: {"type":"response.output_text.delta","delta":"response.completed"}"#,
+        );
+        assert!(!codex.response_complete(&events, true));
+        let events = vaultr::recon::parse_sse(r#"data: {"type":"response.completed"}"#);
+        assert!(codex.response_complete(&events, true));
+    }
+
+    #[test]
+    fn torn_or_disconnected_transport_cannot_complete() {
+        let claude = claude();
+        let events = vaultr::recon::parse_sse(r#"data: {"type":"message_stop"}"#);
+        for case in ["torn stream", "client disconnect"] {
+            assert!(!claude.response_complete(&events, false), "{case}");
+        }
     }
 }

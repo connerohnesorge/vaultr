@@ -254,7 +254,6 @@ async fn handle(req: Request<hyper::body::Incoming>, ctx: Arc<ProxyCtx>) -> Resp
 
     // tee: forward chunks live, save accumulated SSE at close/error
     let ctx2 = ctx.clone();
-    let terminal = adapter.terminal_event;
     let mut upstream_stream = upstream.bytes_stream();
     let (tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, std::io::Error>>(16);
     tokio::spawn(async move {
@@ -281,14 +280,21 @@ async fn handle(req: Request<hyper::body::Incoming>, ctx: Arc<ProxyCtx>) -> Resp
         }
         let sse = String::from_utf8_lossy(&chunks).into_owned();
         drop(chunks);
+        let events = vaultr::recon::parse_sse(&sse);
         let resp = CapturedResponse {
             status,
             headers: upstream_headers_full,
-            complete: complete && sse.contains(terminal),
+            complete: ctx2.adapter.response_complete(&events, complete),
             sse,
         };
-        ctx2.otel
-            .record(&ctx2.adapter, pending.model.as_deref(), &pending.req, &resp);
+        ctx2.otel.record(
+            &ctx2.adapter,
+            pending.model.as_deref(),
+            &pending.req,
+            &resp,
+            &events,
+        );
+        drop(events);
         if let Err(e) = capture::finish_capture(&ctx2.vault, &ctx2.adapter, pending, &resp).await {
             eprintln!("capture failed: {e}");
         }
