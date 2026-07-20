@@ -14,7 +14,8 @@ mod proxy;
 mod selftest;
 mod sweep;
 
-use cli::{AgentCli, Command};
+use adapter::Harness;
+use cli::Command;
 use proxy::ProxyCtx;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -160,11 +161,11 @@ async fn dispatch(command: Command) -> i32 {
                 return 1;
             }
             let mut launch = jobs::launch_line(
-                args.cli.as_str(),
+                args.cli.cli_label(),
                 args.model.as_deref(),
                 args.args.as_deref(),
             );
-            if args.cli == AgentCli::Claude {
+            if args.cli == Harness::ClaudeCode {
                 let sid = uuid::Uuid::new_v4().to_string();
                 sweep::register_job_sid(&sid);
                 launch.push_str(&format!(" --session-id '{sid}'"));
@@ -179,7 +180,7 @@ async fn dispatch(command: Command) -> i32 {
                 prompt: prompt.trim().to_string(),
                 timeout: args.timeout,
                 cleanup: jobs::cleanup_policy(args.cleanup, &jobs::Cfg::load(&vault)),
-                discover_session_id: args.cli == AgentCli::Codex,
+                discover_session_id: args.cli == Harness::Codex,
             };
             let label = run.label.clone();
             match herdr::run_agent(run).await {
@@ -276,7 +277,8 @@ async fn run_daemon() {
             Ok((listener, port)) => {
                 println!(
                     "vaultr [{}] 127.0.0.1:{port} -> {}",
-                    adapter.harness, adapter.upstream
+                    adapter.harness.capture_label(),
+                    adapter.upstream
                 );
                 servers.push((listener, adapter));
             }

@@ -362,7 +362,7 @@ pub fn update_meta(
         .unwrap_or_default();
     let now = iso_now();
     meta.schema_version = Some(1);
-    meta.harness = Some(adapter.harness.to_string());
+    meta.harness = Some(adapter.harness.capture_label().to_string());
     meta.session_id.clone_from(&ids.session_id);
     if ids.thread_id.is_some() {
         meta.thread_id.clone_from(&ids.thread_id);
@@ -386,11 +386,12 @@ pub async fn prepare_capture(
     req: CapturedRequest,
     body: Value,
 ) -> Result<PendingCapture, String> {
-    let sid = req
-        .ids
-        .session_id
-        .clone()
-        .ok_or_else(|| format!("{} request has no session identity", adapter.harness))?;
+    let sid = req.ids.session_id.clone().ok_or_else(|| {
+        format!(
+            "{} request has no session identity",
+            adapter.harness.capture_label()
+        )
+    })?;
     let dir = session_dir(vault, &sid).map_err(|e| e.to_string())?;
     let root = canonical_root(vault);
 
@@ -412,7 +413,7 @@ pub async fn prepare_capture(
         "schema_version": 1,
         "request_id": uuid::Uuid::new_v4().to_string(),
         "observed_at": iso_now(),
-        "harness": adapter.harness,
+        "harness": adapter.harness.capture_label(),
         "session_id": sid,
         "thread_id": req.ids.thread_id,
         "turn_id": req.ids.turn_id,
@@ -429,7 +430,7 @@ pub async fn prepare_capture(
     let model = body.get("model").and_then(Value::as_str).map(String::from);
     let new_state = json!({
         "schema_version": 1,
-        "harness": adapter.harness,
+        "harness": adapter.harness.capture_label(),
         "session_id": sid,
         "thread_id": req.ids.thread_id,
         "request_body": body,
@@ -509,7 +510,10 @@ pub async fn finish_capture(
     // reclassify an accepted stage as lost.
     crate::herdr::maybe_snapshot(vault);
     if let Err(e) = update_meta(vault, adapter, &pending.req.ids, pending.model.as_deref()) {
-        eprintln!("[{}] meta update failed: {e}", adapter.harness);
+        eprintln!(
+            "[{}] meta update failed: {e}",
+            adapter.harness.capture_label()
+        );
     }
 
     drain(&pending.dir, &pending.root, &sid)

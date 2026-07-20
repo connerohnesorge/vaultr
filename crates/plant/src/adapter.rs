@@ -1,6 +1,8 @@
 //! Harness adapters — mirrors ADAPTERS in wireproxy.ts.
 
 use serde_json::Value;
+use std::fmt;
+use std::str::FromStr;
 
 #[derive(Debug, Default, Clone)]
 pub struct Identity {
@@ -17,15 +19,51 @@ pub struct TokenUsage {
     pub cache_creation: u64,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Harness {
     ClaudeCode,
     Codex,
 }
 
+impl Harness {
+    pub fn capture_label(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude-code",
+            Self::Codex => "codex",
+        }
+    }
+
+    pub fn cli_label(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude",
+            Self::Codex => "codex",
+        }
+    }
+
+    pub fn ledger_label(self) -> &'static str {
+        self.cli_label()
+    }
+}
+
+impl fmt::Display for Harness {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.ledger_label())
+    }
+}
+
+impl FromStr for Harness {
+    type Err = ();
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        [Self::ClaudeCode, Self::Codex]
+            .into_iter()
+            .find(|harness| harness.cli_label() == value)
+            .ok_or(())
+    }
+}
+
 pub struct Adapter {
-    pub harness: &'static str,
-    pub kind: Harness,
+    pub harness: Harness,
     pub port: u16,
     pub upstream: String,
     pub history_key: &'static str,
@@ -47,8 +85,7 @@ fn env_or(var: &str, default: &str) -> String {
 pub fn adapters() -> Vec<Adapter> {
     vec![
         Adapter {
-            harness: "claude-code",
-            kind: Harness::ClaudeCode,
+            harness: Harness::ClaudeCode,
             port: env_port("VAULTR_ANTHROPIC_PORT", 18923),
             upstream: env_or("VAULTR_ANTHROPIC_UPSTREAM", "https://api.anthropic.com"),
             history_key: "messages",
@@ -56,8 +93,7 @@ pub fn adapters() -> Vec<Adapter> {
             terminal_event: "message_stop",
         },
         Adapter {
-            harness: "codex",
-            kind: Harness::Codex,
+            harness: Harness::Codex,
             port: env_port("VAULTR_CODEX_PORT", 18924),
             upstream: env_or(
                 "VAULTR_CODEX_UPSTREAM",
@@ -72,7 +108,7 @@ pub fn adapters() -> Vec<Adapter> {
 
 impl Adapter {
     pub fn captures(&self, method: &str, path: &str) -> bool {
-        match self.kind {
+        match self.harness {
             // Exact match, not a prefix: /v1/messages/count_tokens carries no
             // metadata.user_id, so a prefix match parsed its (full-history) body
             // only to fail identity extraction and drop it — spamming
@@ -84,7 +120,7 @@ impl Adapter {
     }
 
     pub fn identity(&self, headers: &hyper::HeaderMap, body: &Value) -> Identity {
-        match self.kind {
+        match self.harness {
             Harness::ClaudeCode => {
                 let sid = body
                     .pointer("/metadata/user_id")
@@ -129,7 +165,7 @@ impl Adapter {
     }
 
     pub fn usage(&self, events: &[Value]) -> TokenUsage {
-        match self.kind {
+        match self.harness {
             Harness::ClaudeCode => {
                 let start = events
                     .iter()
@@ -255,6 +291,16 @@ mod tests {
     }
     fn codex() -> Adapter {
         adapters().remove(1)
+    }
+
+    #[test]
+    fn harness_preserves_capture_and_cli_ledger_labels() {
+        assert_eq!(Harness::ClaudeCode.capture_label(), "claude-code");
+        assert_eq!(Harness::ClaudeCode.cli_label(), "claude");
+        assert_eq!(Harness::ClaudeCode.ledger_label(), "claude");
+        assert_eq!("claude".parse(), Ok(Harness::ClaudeCode));
+        assert_eq!("codex".parse(), Ok(Harness::Codex));
+        assert!("claude-code".parse::<Harness>().is_err());
     }
 
     #[test]

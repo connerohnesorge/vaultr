@@ -1,6 +1,6 @@
+use crate::adapter::Harness;
 use crate::herdr::WorkspaceCleanup;
 use crate::jobs;
-use crate::sweep::Learner;
 use std::collections::HashSet;
 use std::time::Duration;
 
@@ -18,30 +18,15 @@ pub enum Command {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct EligibleArgs {
-    pub learner: Learner,
+    pub learner: Harness,
     pub idle: Duration,
     pub max: usize,
     pub claim: Option<Duration>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AgentCli {
-    Claude,
-    Codex,
-}
-
-impl AgentCli {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Claude => "claude",
-            Self::Codex => "codex",
-        }
-    }
-}
-
 #[derive(Debug, PartialEq, Eq)]
 pub struct AgentRunArgs {
-    pub cli: AgentCli,
+    pub cli: Harness,
     pub model: Option<String>,
     pub args: Option<String>,
     pub label: Option<String>,
@@ -93,7 +78,7 @@ pub fn parse_command(argv: &[String]) -> Result<Command, String> {
 
 fn parse_eligible(args: &[String]) -> Result<EligibleArgs, String> {
     let mut parsed = EligibleArgs {
-        learner: Learner::Claude,
+        learner: Harness::ClaudeCode,
         idle: Duration::from_secs(3600),
         max: 10,
         claim: None,
@@ -171,11 +156,11 @@ fn parse_agent(args: &[String]) -> Result<AgentRunArgs, String> {
             .ok_or_else(|| format!("agent run: {flag} requires a value"))?;
         match flag {
             "--cli" => {
-                cli = Some(match value.as_str() {
-                    "claude" => AgentCli::Claude,
-                    "codex" => AgentCli::Codex,
-                    _ => return Err("agent run: --cli requires claude|codex".to_string()),
-                });
+                cli = Some(
+                    value
+                        .parse()
+                        .map_err(|_| "agent run: --cli requires claude|codex")?,
+                );
             }
             "--model" => model = Some(value.clone()),
             "--args" => extra_args = Some(value.clone()),
@@ -240,7 +225,7 @@ mod tests {
                 "10m",
             ])),
             Ok(Command::SessionsEligible(EligibleArgs {
-                learner: Learner::Codex,
+                learner: Harness::Codex,
                 idle: Duration::from_secs(2 * 3600),
                 max: 3,
                 claim: Some(Duration::from_secs(10 * 60)),
@@ -249,7 +234,7 @@ mod tests {
         assert_eq!(
             parse_command(&argv(&["sessions", "eligible", "--claim"])),
             Ok(Command::SessionsEligible(EligibleArgs {
-                learner: Learner::Claude,
+                learner: Harness::ClaudeCode,
                 idle: Duration::from_secs(3600),
                 max: 10,
                 claim: Some(Duration::from_secs(50 * 60)),
@@ -271,7 +256,7 @@ mod tests {
                 "10m",
             ])),
             Ok(Command::AgentRun(AgentRunArgs {
-                cli: AgentCli::Codex,
+                cli: Harness::Codex,
                 model: None,
                 args: None,
                 label: None,

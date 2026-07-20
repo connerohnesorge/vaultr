@@ -3,50 +3,17 @@
 //! eligible` / `plant compress once` subcommands and called directly by the built-in Rust jobs.
 //! Every failure path non-fatal: capture uptime is sacred. All heavy work shells out.
 
+use crate::adapter::Harness;
 use crate::process::{run, run30, which};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::time::{Duration, SystemTime};
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Learner {
-    Claude,
-    Codex,
-}
-
-impl Learner {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Claude => "claude",
-            Self::Codex => "codex",
-        }
-    }
-}
-
-impl fmt::Display for Learner {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-impl FromStr for Learner {
-    type Err = ();
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "claude" => Ok(Self::Claude),
-            "codex" => Ok(Self::Codex),
-            _ => Err(()),
-        }
-    }
-}
 
 /// sid -> latest `processed_at` (epoch secs; 0 when the entry has none) for `learner`.
 /// Entries without a `learner` key are the legacy Claude pass.
-fn ledger_latest(vault: &Path, learner: Learner) -> HashMap<String, u64> {
+fn ledger_latest(vault: &Path, learner: Harness) -> HashMap<String, u64> {
     let mut processed = HashMap::new();
     let Ok(root) = vaultr::validate::content_root(vault) else {
         return processed; // rootless sessions path => nothing ledgered; non-fatal
@@ -55,8 +22,8 @@ fn ledger_latest(vault: &Path, learner: Learner) -> HashMap<String, u64> {
         for line in text.lines() {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
                 let recorded = v.get("learner").and_then(|s| s.as_str());
-                if recorded == Some(learner.as_str())
-                    || (recorded.is_none() && learner == Learner::Claude)
+                if recorded == Some(learner.ledger_label())
+                    || (recorded.is_none() && learner == Harness::ClaudeCode)
                 {
                     if let Some(sid) = v.get("session_id").and_then(|s| s.as_str()) {
                         let ts = v
@@ -129,7 +96,7 @@ fn epoch_now() -> u64 {
         .unwrap_or(0)
 }
 
-fn inflight_path(vault: &Path, learner: Learner) -> Result<PathBuf, String> {
+fn inflight_path(vault: &Path, learner: Harness) -> Result<PathBuf, String> {
     let root = vaultr::validate::content_root(vault).map_err(|e| e.to_string())?;
     Ok(root
         .join("learnings")
@@ -164,7 +131,7 @@ fn read_inflight(path: &Path) -> Result<Option<InflightLease>, String> {
 /// scheduler tick re-selects the same not-yet-ledgered batch and double-learns it (the
 /// duplicate-prompt bug). ponytail: one file per learner, expiry self-heals a crashed or
 /// timed-out pass — no explicit release path to leak.
-fn inflight_sessions(vault: &Path, learner: Learner) -> HashSet<String> {
+fn inflight_sessions(vault: &Path, learner: Harness) -> HashSet<String> {
     let Ok(path) = inflight_path(vault, learner) else {
         return HashSet::new();
     };
@@ -233,7 +200,7 @@ fn substantive(path: &Path) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StuckState {
     SealBlocked,
-    HalfLearned(Learner),
+    HalfLearned(Harness),
     Unlearned,
     SubThreshold,
     JobCapture,
@@ -242,8 +209,8 @@ pub enum StuckState {
 impl StuckState {
     const REPORT_ORDER: [Self; 6] = [
         Self::SealBlocked,
-        Self::HalfLearned(Learner::Claude),
-        Self::HalfLearned(Learner::Codex),
+        Self::HalfLearned(Harness::ClaudeCode),
+        Self::HalfLearned(Harness::Codex),
         Self::Unlearned,
         Self::SubThreshold,
         Self::JobCapture,
@@ -297,8 +264,8 @@ pub fn stuck_summary(stuck: &[StuckCapture]) -> String {
 /// under current rules (learn skips them, sealing needs both ledgers) — reported so the
 /// gap stays visible, but callers treat them as informational, not actionable.
 pub fn stuck_captures(vault: &Path, age: Duration) -> Vec<StuckCapture> {
-    let claude = ledger_latest(vault, Learner::Claude);
-    let codex = ledger_latest(vault, Learner::Codex);
+    let claude = ledger_latest(vault, Harness::ClaudeCode);
+    let codex = ledger_latest(vault, Harness::Codex);
     let mut out = vec![];
     let jobs = job_sids();
     for (sid, path) in turns_files(vault, false) {
@@ -316,8 +283,8 @@ pub fn stuck_captures(vault: &Path, age: Duration) -> Vec<StuckCapture> {
                 learned_current(&codex, &sid, &path),
             ) {
                 (true, true) => StuckState::SealBlocked,
-                (true, false) => StuckState::HalfLearned(Learner::Codex),
-                (false, true) => StuckState::HalfLearned(Learner::Claude),
+                (true, false) => StuckState::HalfLearned(Harness::Codex),
+                (false, true) => StuckState::HalfLearned(Harness::ClaudeCode),
                 (false, false) if substantive(&path) => StuckState::Unlearned,
                 (false, false) => StuckState::SubThreshold,
             }
@@ -375,7 +342,7 @@ fn eligible_candidates(
     vault: &Path,
     idle: Duration,
     max: usize,
-    learner: Learner,
+    learner: Harness,
 ) -> Vec<(String, PathBuf)> {
     let processed = ledger_latest(vault, learner);
     let inflight = inflight_sessions(vault, learner);
@@ -403,7 +370,7 @@ pub fn eligible_sessions(
     vault: &Path,
     idle: Duration,
     max: usize,
-    learner: Learner,
+    learner: Harness,
 ) -> Vec<PathBuf> {
     eligible_candidates(vault, idle, max, learner)
         .into_iter()
@@ -417,7 +384,7 @@ pub fn eligible_and_claim(
     vault: &Path,
     idle: Duration,
     max: usize,
-    learner: Learner,
+    learner: Harness,
     duration: Duration,
 ) -> Result<Vec<PathBuf>, String> {
     let path = inflight_path(vault, learner)?;
@@ -450,7 +417,7 @@ pub fn eligible_and_claim(
 
 /// Diagnostics for the `sessions eligible` subcommand's stderr — stdout must stay
 /// clean (it is substituted into an agent prompt by the learn job).
-pub fn eligibility_stats(vault: &Path, learner: Learner) -> (usize, usize) {
+pub fn eligibility_stats(vault: &Path, learner: Harness) -> (usize, usize) {
     (
         capture_files(vault).len(),
         ledger_latest(vault, learner).len(),
@@ -666,8 +633,8 @@ pub async fn compress_sweep(vault: &Path, idle: Duration) -> bool {
         eprintln!("[compress] zstd not on PATH");
         return false;
     }
-    let claude = ledger_latest(vault, Learner::Claude);
-    let codex = ledger_latest(vault, Learner::Codex);
+    let claude = ledger_latest(vault, Harness::ClaudeCode);
+    let codex = ledger_latest(vault, Harness::Codex);
     let jobs = job_sids();
     let mut sealed = 0u32;
     for (sid, path) in turns_files(vault, false) {
@@ -1004,8 +971,8 @@ mod tests {
         )
         .unwrap();
 
-        let claude = eligible_sessions(&sessions, Duration::ZERO, 10, Learner::Claude);
-        let codex = eligible_sessions(&sessions, Duration::ZERO, 10, Learner::Codex);
+        let claude = eligible_sessions(&sessions, Duration::ZERO, 10, Harness::ClaudeCode);
+        let codex = eligible_sessions(&sessions, Duration::ZERO, 10, Harness::Codex);
         assert!(claude.iter().any(|p| p.ends_with(codex_id)));
         assert!(!claude.iter().any(|p| p.ends_with(claude_id)));
         assert!(codex.iter().any(|p| p.ends_with(claude_id)));
@@ -1101,11 +1068,11 @@ mod tests {
         assert_eq!(state("both-ledgered"), StuckState::SealBlocked);
         assert_eq!(
             state("claude-only"),
-            StuckState::HalfLearned(Learner::Codex)
+            StuckState::HalfLearned(Harness::Codex)
         );
         assert_eq!(
             state("codex-only"),
-            StuckState::HalfLearned(Learner::Claude)
+            StuckState::HalfLearned(Harness::ClaudeCode)
         );
         assert_eq!(state("nobody-big"), StuckState::Unlearned);
         assert_eq!(state("nobody-small"), StuckState::SubThreshold);
@@ -1135,7 +1102,7 @@ mod tests {
             &sessions,
             Duration::ZERO,
             10,
-            Learner::Claude,
+            Harness::ClaudeCode,
             Duration::from_secs(3600),
         )
         .unwrap();
@@ -1149,7 +1116,7 @@ mod tests {
             &sessions,
             Duration::ZERO,
             10,
-            Learner::Claude,
+            Harness::ClaudeCode,
             Duration::from_secs(3600),
         )
         .unwrap();
@@ -1160,7 +1127,7 @@ mod tests {
 
         // an expired lease (crashed/zombie pass) must self-heal, not wedge forever
         publish_inflight(
-            &inflight_path(&sessions, Learner::Claude).unwrap(),
+            &inflight_path(&sessions, Harness::ClaudeCode).unwrap(),
             &InflightLease {
                 sids: vec![sid.to_string()],
                 expires_at: epoch_now().saturating_sub(1),
@@ -1171,7 +1138,7 @@ mod tests {
             &sessions,
             Duration::ZERO,
             10,
-            Learner::Claude,
+            Harness::ClaudeCode,
             Duration::from_secs(3600),
         );
         assert!(
@@ -1230,17 +1197,17 @@ mod tests {
         // watchdog: codex covered the resumed generation, claude did not
         let stuck = stuck_captures(&sessions, Duration::ZERO);
         let entry = stuck.iter().find(|s| s.sid == sid).expect("reported stuck");
-        assert_eq!(entry.state, StuckState::HalfLearned(Learner::Claude));
+        assert_eq!(entry.state, StuckState::HalfLearned(Harness::ClaudeCode));
 
         // eligibility mirrors that: claude re-learns, codex does not
-        let claude = eligible_sessions(&sessions, Duration::ZERO, 10, Learner::Claude);
-        let codex = eligible_sessions(&sessions, Duration::ZERO, 10, Learner::Codex);
+        let claude = eligible_sessions(&sessions, Duration::ZERO, 10, Harness::ClaudeCode);
+        let codex = eligible_sessions(&sessions, Duration::ZERO, 10, Harness::Codex);
         assert!(claude.iter().any(|p| p.ends_with(sid)));
         assert!(!codex.iter().any(|p| p.ends_with(sid)));
 
         // a sealed-only capture (no raw) keeps historic semantics: entry counts as-is
         assert!(learned_current(
-            &ledger_latest(&sessions, Learner::Claude),
+            &ledger_latest(&sessions, Harness::ClaudeCode),
             sid,
             &dir.join("turns.jsonl.zst")
         ));
