@@ -32,6 +32,12 @@ fn vault_root() -> PathBuf {
     })
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AgentCli {
+    Claude,
+    Codex,
+}
+
 /// `plant sessions eligible [--learner claude|codex] [--idle 60m] [--max 10] [--claim [50m]]`
 /// (--claim leases the printed batch in-flight so a concurrent call can't re-dispatch it),
 /// `plant sessions stuck [--age 24h]` (stuck-capture report; exit 1 on actionable
@@ -42,58 +48,117 @@ fn vault_root() -> PathBuf {
 /// (Herdr pane orchestration; never `claude -p`). Exit: 0 succeeded, 75 herdr
 /// unavailable (retry later), 1 failed. Requested --cleanup is honored only when
 /// PLANT_KEEP_PANES=0 opts in — see jobs::cleanup_policy.
-async fn subcommand(argv: &[String]) -> Option<i32> {
-    let flag = |name: &str| {
-        argv.iter()
-            .position(|a| a == name)
-            .and_then(|i| argv.get(i + 1).cloned())
-    };
-    let idle = flag("--idle")
-        .and_then(|v| jobs::parse_duration(&v))
-        .unwrap_or(Duration::from_secs(3600));
-    match (
-        argv.get(1).map(String::as_str),
-        argv.get(2).map(String::as_str),
-    ) {
-        (Some("sessions"), Some("eligible")) => {
-            let max = flag("--max").and_then(|v| v.parse().ok()).unwrap_or(10);
-            let learner = flag("--learner").unwrap_or_else(|| "claude".to_string());
-            let list = sweep::eligible_sessions(&vault_root(), idle, max, &learner);
-            let (total, ledgered) = sweep::eligibility_stats(&vault_root(), &learner);
+fn usage(error: &str) -> i32 {
+    eprintln!("plant: {error}");
+    eprintln!(
+        "usage: plant [--self-test | sessions eligible|coverage|stuck ... | \
+         compress once ... | jobs run <name> | agent run --cli claude|codex ...]"
+    );
+    2
+}
+
+async fn subcommand(argv: &[String]) -> i32 {
+    match argv.get(1).map(String::as_str) {
+        Some("--self-test") if argv.len() == 2 => {
+            selftest::self_test().await;
+            0
+        }
+        Some("sessions") if argv.get(2).map(String::as_str) == Some("eligible") => {
+            let mut learner = "claude";
+            let mut idle = Duration::from_secs(3600);
+            let mut max = 10;
+            let mut claim = None;
+            let mut seen = std::collections::HashSet::new();
+            let mut i = 3;
+            while i < argv.len() {
+                let flag = argv[i].as_str();
+                if !seen.insert(flag) {
+                    return usage(&format!("duplicate sessions eligible flag {flag}"));
+                }
+                match flag {
+                    "--learner" => {
+                        let Some(value) = argv.get(i + 1).map(String::as_str) else {
+                            return usage("sessions eligible: --learner requires claude|codex");
+                        };
+                        learner = match value {
+                            "claude" => "claude",
+                            "codex" => "codex",
+                            _ => {
+                                return usage("sessions eligible: --learner requires claude|codex");
+                            }
+                        };
+                        i += 2;
+                    }
+                    "--idle" => {
+                        let Some(value) = argv.get(i + 1) else {
+                            return usage("sessions eligible: --idle requires a duration");
+                        };
+                        let Some(value) = jobs::parse_duration(value) else {
+                            return usage("sessions eligible: invalid --idle duration");
+                        };
+                        idle = value;
+                        i += 2;
+                    }
+                    "--max" => {
+                        let Some(value) = argv.get(i + 1) else {
+                            return usage("sessions eligible: --max requires an integer");
+                        };
+                        let Ok(value) = value.parse() else {
+                            return usage("sessions eligible: invalid --max");
+                        };
+                        max = value;
+                        i += 2;
+                    }
+                    "--claim" => {
+                        claim = match argv.get(i + 1).map(String::as_str) {
+                            Some(value) if !value.starts_with("--") => {
+                                let Some(duration) = jobs::parse_duration(value) else {
+                                    return usage("sessions eligible: invalid --claim duration");
+                                };
+                                i += 2;
+                                Some(duration)
+                            }
+                            _ => {
+                                i += 1;
+                                Some(Duration::from_secs(50 * 60))
+                            }
+                        };
+                    }
+                    _ => return usage(&format!("unknown sessions eligible flag {flag}")),
+                }
+            }
+            let vault = vault_root();
+            let list = match claim {
+                Some(lease) => {
+                    let expires_at = jobs::epoch_now()
+                        .saturating_add(lease.as_secs())
+                        .saturating_add(300);
+                    match sweep::eligible_and_claim(&vault, idle, max, learner, expires_at) {
+                        Ok(list) => list,
+                        Err(e) => {
+                            eprintln!("sessions eligible: claim failed: {e}");
+                            return 1;
+                        }
+                    }
+                }
+                None => sweep::eligible_sessions(&vault, idle, max, learner),
+            };
+            let (total, ledgered) = sweep::eligibility_stats(&vault, learner);
             eprintln!(
                 "[eligible:{learner}] {} of {total} sessions ({ledgered} ledgered)",
                 list.len()
             );
             if list.is_empty() {
-                return Some(1);
-            }
-            if let Some(i) = argv.iter().position(|a| a == "--claim") {
-                let lease = argv
-                    .get(i + 1)
-                    .and_then(|v| jobs::parse_duration(v))
-                    .unwrap_or(Duration::from_secs(50 * 60));
-                let sids: Vec<String> = list
-                    .iter()
-                    .filter_map(|d| {
-                        PathBuf::from(d)
-                            .file_name()
-                            .and_then(|s| s.to_str())
-                            .map(String::from)
-                    })
-                    .collect();
-                // same slack the old in-Rust scheduler added past the job timeout
-                let expires_at = jobs::epoch_now() + lease.as_secs() + 300;
-                sweep::claim_inflight(&vault_root(), &learner, &sids, expires_at);
+                return 1;
             }
             println!("{}", list.join(" "));
-            Some(0)
+            0
         }
-        (Some("sessions"), Some("coverage")) => {
-            let Some(sid) = argv.get(3) else {
-                eprintln!("sessions coverage: <session-id> required");
-                return Some(1);
-            };
-            match sweep::coverage(&vault_root(), sid) {
+        Some("sessions") if argv.get(2).map(String::as_str) == Some("coverage") => {
+            if argv.len() != 4 {
+                return usage("sessions coverage: exactly one session id is required");
+            }
+            match sweep::coverage(&vault_root(), &argv[3]) {
                 Ok(c) => {
                     let tag = if c.resumed { " (resumed)" } else { "" };
                     println!(
@@ -114,52 +179,71 @@ async fn subcommand(argv: &[String]) -> Option<i32> {
                     }
                     if c.missing.is_empty() {
                         println!("  no in-window gap");
-                        Some(0)
+                        0
                     } else {
                         println!("  missing {} in-window request-id(s):", c.missing.len());
                         for rid in &c.missing {
                             println!("    {rid}");
                         }
-                        Some(1)
+                        1
                     }
                 }
                 Err(e) => {
                     eprintln!("sessions coverage: {e}");
-                    Some(1)
+                    1
                 }
             }
         }
-        (Some("sessions"), Some("stuck")) => {
-            let age = flag("--age")
-                .and_then(|v| jobs::parse_duration(&v))
-                .unwrap_or(Duration::from_secs(24 * 3600));
+        Some("sessions") if argv.get(2).map(String::as_str) == Some("stuck") => {
+            let age = match argv.get(3..).unwrap_or_default() {
+                [] => Duration::from_secs(24 * 3600),
+                [flag, value] if flag == "--age" => {
+                    let Some(age) = jobs::parse_duration(value) else {
+                        return usage("sessions stuck: invalid --age duration");
+                    };
+                    age
+                }
+                _ => return usage("sessions stuck: expected [--age <duration>]"),
+            };
             let stuck = sweep::stuck_captures(&vault_root(), age);
             for s in &stuck {
                 println!("{} {} idle={}h", s.state, s.sid, s.idle_secs / 3600);
             }
+            println!("{}", sweep::stuck_summary(&stuck));
             // sub-threshold can never seal by design; job-capture is plant's own pane
-            Some(
-                if stuck
-                    .iter()
-                    .any(|s| s.state != "sub-threshold" && s.state != "job-capture")
-                {
-                    1
-                } else {
-                    0
-                },
-            )
+            if stuck
+                .iter()
+                .any(|s| s.state != "sub-threshold" && s.state != "job-capture")
+            {
+                1
+            } else {
+                0
+            }
         }
-        (Some("compress"), Some("once")) => {
-            Some(if sweep::compress_sweep(&vault_root(), idle).await {
+        Some("compress") if argv.get(2).map(String::as_str) == Some("once") => {
+            let idle = match argv.get(3..).unwrap_or_default() {
+                [] => Duration::from_secs(3600),
+                [flag, value] if flag == "--idle" => {
+                    let Some(idle) = jobs::parse_duration(value) else {
+                        return usage("compress once: invalid --idle duration");
+                    };
+                    idle
+                }
+                _ => return usage("compress once: expected [--idle <duration>]"),
+            };
+            if sweep::compress_sweep(&vault_root(), idle).await {
                 0
             } else {
                 1
-            })
+            }
         }
-        (Some("jobs"), Some("run")) => {
-            let name = argv.get(3).cloned().unwrap_or_default();
-            match jobs::load_jobs().into_iter().find(|j| j.name == name) {
-                Some(job) => Some(jobs::run_job(&job).await),
+        Some("jobs") if argv.get(2).map(String::as_str) == Some("run") => {
+            if argv.len() != 4 || argv[3].is_empty() {
+                return usage("jobs run: exactly one job name is required");
+            }
+            let name = &argv[3];
+            match jobs::load_jobs().into_iter().find(|j| j.name == *name) {
+                Some(job) => jobs::run_job(&job).await,
                 None => {
                     eprintln!(
                         "unknown job '{name}' (scripts: {})",
@@ -169,68 +253,115 @@ async fn subcommand(argv: &[String]) -> Option<i32> {
                             .collect::<Vec<_>>()
                             .join(", ")
                     );
-                    Some(1)
+                    1
                 }
             }
         }
-        (Some("agent"), Some("run")) => {
-            let Some(cli) = flag("--cli") else {
-                eprintln!("agent run: --cli claude|codex is required");
-                return Some(1);
+        Some("agent") if argv.get(2).map(String::as_str) == Some("run") => {
+            let mut cli = None;
+            let mut model = None;
+            let mut args = None;
+            let mut label = None;
+            let mut cwd = None;
+            let mut timeout = Duration::from_secs(45 * 60);
+            let mut requested = herdr::WorkspaceCleanup::Never;
+            let mut seen = std::collections::HashSet::new();
+            let mut i = 3;
+            while i < argv.len() {
+                let flag = argv[i].as_str();
+                if !seen.insert(flag) {
+                    return usage(&format!("duplicate agent run flag {flag}"));
+                }
+                let Some(value) = argv.get(i + 1).map(String::as_str) else {
+                    return usage(&format!("agent run: {flag} requires a value"));
+                };
+                match flag {
+                    "--cli" => {
+                        cli = Some(match value {
+                            "claude" => AgentCli::Claude,
+                            "codex" => AgentCli::Codex,
+                            _ => return usage("agent run: --cli requires claude|codex"),
+                        });
+                    }
+                    "--model" => model = Some(value),
+                    "--args" => args = Some(value),
+                    "--label" => label = Some(value),
+                    "--cwd" => cwd = Some(value),
+                    "--timeout" => {
+                        let Some(value) = jobs::parse_duration(value) else {
+                            return usage("agent run: invalid --timeout duration");
+                        };
+                        timeout = value;
+                    }
+                    "--cleanup" => {
+                        requested = match value {
+                            "always" => herdr::WorkspaceCleanup::Always,
+                            "on-success" => herdr::WorkspaceCleanup::OnSuccess,
+                            "never" => herdr::WorkspaceCleanup::Never,
+                            _ => {
+                                return usage(
+                                    "agent run: --cleanup requires always|on-success|never",
+                                );
+                            }
+                        };
+                    }
+                    _ => return usage(&format!("unknown agent run flag {flag}")),
+                }
+                i += 2;
+            }
+            let Some(cli) = cli else {
+                return usage("agent run: --cli claude|codex is required");
             };
             let mut prompt = String::new();
             use std::io::Read;
             if std::io::stdin().read_to_string(&mut prompt).is_err() || prompt.trim().is_empty() {
                 eprintln!("agent run: prompt expected on stdin");
-                return Some(1);
+                return 1;
             }
-            let requested = match flag("--cleanup").as_deref() {
-                Some("always") => herdr::WorkspaceCleanup::Always,
-                Some("on-success") => herdr::WorkspaceCleanup::OnSuccess,
-                _ => herdr::WorkspaceCleanup::Never,
+            let (cli_name, discover_session_id) = match cli {
+                AgentCli::Claude => ("claude", false),
+                AgentCli::Codex => ("codex", true),
             };
             // Keep learn passes from dispatching on this pane's own capture (a
             // learn-over-learn run per learner, per capture). Claude sids are ours to
             // mint, so preset + register before launch. Codex assigns conversation ids
             // server-side, so run_agent discovers and registers the id herdr reports for
             // the pane once the run finishes (discover_session_id below).
-            let mut launch =
-                jobs::launch_line(&cli, flag("--model").as_deref(), flag("--args").as_deref());
-            if cli == "claude" {
+            let mut launch = jobs::launch_line(cli_name, model, args);
+            if cli == AgentCli::Claude {
                 let sid = uuid::Uuid::new_v4().to_string();
                 sweep::register_job_sid(&sid);
                 launch.push_str(&format!(" --session-id '{sid}'"));
             }
+            let vault = vault_root();
             let run = herdr::AgentRun {
-                label: flag("--label").unwrap_or_else(|| "agent".to_string()),
-                cwd: flag("--cwd").unwrap_or_else(|| {
+                label: label.unwrap_or("agent").to_string(),
+                cwd: cwd.map(String::from).unwrap_or_else(|| {
                     format!("{}/.dotfiles", std::env::var("HOME").unwrap_or_default())
                 }),
                 launch,
                 prompt: prompt.trim().to_string(),
-                timeout: flag("--timeout")
-                    .and_then(|v| jobs::parse_duration(&v))
-                    .unwrap_or(Duration::from_secs(45 * 60)),
-                cleanup: jobs::cleanup_policy(requested, &jobs::Cfg::load(&vault_root())),
-                discover_session_id: cli == "codex",
+                timeout,
+                cleanup: jobs::cleanup_policy(requested, &jobs::Cfg::load(&vault)),
+                discover_session_id,
             };
             let label = run.label.clone();
             match herdr::run_agent(run).await {
                 herdr::AgentRunOutcome::Succeeded(detail) => {
                     println!("[agent:{label}] succeeded: {detail}");
-                    Some(0)
+                    0
                 }
                 herdr::AgentRunOutcome::Unavailable => {
                     println!("[agent:{label}] herdr unavailable");
-                    Some(75)
+                    75
                 }
                 herdr::AgentRunOutcome::Failed(detail) => {
                     println!("[agent:{label}] failed: {detail}");
-                    Some(1)
+                    1
                 }
             }
         }
-        _ => None,
+        _ => usage("unrecognized command"),
     }
 }
 
@@ -273,13 +404,9 @@ pub fn http_client() -> reqwest::Client {
 
 #[tokio::main]
 async fn main() {
-    if std::env::args().any(|a| a == "--self-test") {
-        selftest::self_test().await;
-        return;
-    }
     let argv: Vec<String> = std::env::args().collect();
-    if let Some(code) = subcommand(&argv).await {
-        std::process::exit(code);
+    if argv.len() > 1 {
+        std::process::exit(subcommand(&argv).await);
     }
 
     let started = SystemTime::now();
