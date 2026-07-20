@@ -323,18 +323,20 @@ fn visible_user_text(content: &Value) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
-/// Recursively remove request-time `cache_control` markers: the harness adds
-/// them per request, so replaying them from records would break the
-/// byte-identity of a resumed messages array.
+/// Remove request-time `cache_control` markers from immediate content blocks.
 pub fn strip_cache_control(v: Value) -> Value {
     match v {
-        Value::Object(map) => Value::Object(
-            map.into_iter()
-                .filter(|(k, _)| k != "cache_control")
-                .map(|(k, v)| (k, strip_cache_control(v)))
+        Value::Array(blocks) => Value::Array(
+            blocks
+                .into_iter()
+                .map(|mut block| {
+                    if let Some(block) = block.as_object_mut() {
+                        block.remove("cache_control");
+                    }
+                    block
+                })
                 .collect(),
         ),
-        Value::Array(a) => Value::Array(a.into_iter().map(strip_cache_control).collect()),
         other => other,
     }
 }

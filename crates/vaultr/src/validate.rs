@@ -370,21 +370,44 @@ pub fn scan(content_root: &Path) -> Result<Report> {
         let mut in_sources = false;
         for line in &raw {
             if !line.starts_with([' ', '\t', '-']) {
-                in_sources = line.split(':').next().map(str::trim) == Some("sources");
+                let Some((key, value)) = line.split_once(':') else {
+                    in_sources = false;
+                    continue;
+                };
+                in_sources = key.trim() == "sources";
+                if in_sources {
+                    for token in value
+                        .split(|c: char| c.is_ascii_whitespace() || matches!(c, '[' | ']' | ','))
+                    {
+                        if let Some(item) = source_session_id(token) {
+                            if !meta_dir.join(format!("{item}.json")).is_file() {
+                                report.findings.push(Finding {
+                                    severity: Severity::Warning,
+                                    kind: "sources",
+                                    file: rel.clone(),
+                                    line: 0,
+                                    detail: format!("source session {item} not in sessions/.meta"),
+                                });
+                            }
+                        }
+                    }
+                }
                 continue;
             }
             if !in_sources {
                 continue;
             }
             let item = line.trim().trim_start_matches('-').trim();
-            if looks_like_uuid(item) && !meta_dir.join(format!("{item}.json")).is_file() {
-                report.findings.push(Finding {
-                    severity: Severity::Warning,
-                    kind: "sources",
-                    file: rel.clone(),
-                    line: 0,
-                    detail: format!("source session {item} not in sessions/.meta"),
-                });
+            if let Some(item) = source_session_id(item) {
+                if !meta_dir.join(format!("{item}.json")).is_file() {
+                    report.findings.push(Finding {
+                        severity: Severity::Warning,
+                        kind: "sources",
+                        file: rel.clone(),
+                        line: 0,
+                        detail: format!("source session {item} not in sessions/.meta"),
+                    });
+                }
             }
         }
     }
@@ -405,6 +428,31 @@ fn looks_like_uuid(s: &str) -> bool {
             8 | 13 | 18 | 23 => c == '-',
             _ => c.is_ascii_hexdigit(),
         })
+}
+
+fn source_session_id(token: &str) -> Option<&str> {
+    let token = token.trim_matches(['"', '\'']);
+    if looks_like_uuid(token) {
+        return Some(token);
+    }
+    let mut parts = token.split('/');
+    let (Some("sessions"), Some(year), Some(month), Some(day), Some(id), None) = (
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+        parts.next(),
+    ) else {
+        return None;
+    };
+    let valid_year = year.len() == 4 && year.bytes().all(|c| c.is_ascii_digit());
+    let valid_month = month.len() == 2
+        && month
+            .parse::<u8>()
+            .is_ok_and(|month| (1..=12).contains(&month));
+    let valid_day = day.len() == 2 && day.parse::<u8>().is_ok_and(|day| (1..=31).contains(&day));
+    (valid_year && valid_month && valid_day && looks_like_uuid(id)).then_some(id)
 }
 
 /// CLI entry: print report, return process exit code.

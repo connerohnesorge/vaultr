@@ -11,6 +11,11 @@ fn write(root: &std::path::Path, rel: &str, text: &str) {
 fn validate_fixture_vault() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
+    let present = "11111111-1111-1111-1111-111111111111";
+    let inline_missing = "22222222-2222-2222-2222-222222222222";
+    let bare_missing = "33333333-3333-3333-3333-333333333333";
+    let outside_sources = "44444444-4444-4444-4444-444444444444";
+    write(root, &format!("sessions/.meta/{present}.json"), "{}");
     write(
         root,
         "learnings/good-note.md",
@@ -44,6 +49,24 @@ fn validate_fixture_vault() {
         root,
         "incidents/good-note.md",
         "---\ntype: Incident\ntitle: collides\n---\nbody\n",
+    );
+    write(
+        root,
+        "learnings/inline-sources.md",
+        &format!(
+            "---\nname: inline-sources\ndescription: fine\ntype: knowledge\n\
+             sources: [sessions/2026/07/20/{present}, \"sessions/2026/07/20/{inline_missing}\", \
+             sessions/2026/7/20/{outside_sources}, sessions/2026/07/20/{outside_sources}/extra]\n\
+             unrelated: sessions/2026/07/20/{outside_sources}\n---\nbody\n"
+        ),
+    );
+    write(
+        root,
+        "learnings/bare-sources.md",
+        &format!(
+            "---\nname: bare-sources\ndescription: fine\ntype: knowledge\nsources:\n\
+             - {present}\n  - {bare_missing}\n---\nbody\n"
+        ),
     );
     // corrupt ledger line = error
     write(
@@ -80,6 +103,21 @@ fn validate_fixture_vault() {
         .findings
         .iter()
         .any(|f| f.kind == "frontmatter" && f.file == "runbooks/no-fm.md"));
+    let source_warnings: Vec<_> = report
+        .findings
+        .iter()
+        .filter(|f| f.kind == "sources")
+        .collect();
+    assert_eq!(source_warnings.len(), 2, "{source_warnings:#?}");
+    assert!(source_warnings
+        .iter()
+        .any(|f| f.detail.contains(inline_missing)));
+    assert!(source_warnings
+        .iter()
+        .any(|f| f.detail.contains(bare_missing)));
+    assert!(!source_warnings
+        .iter()
+        .any(|f| f.detail.contains(present) || f.detail.contains(outside_sources)));
     assert!(report.links >= 4);
 }
 
