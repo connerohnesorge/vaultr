@@ -12,6 +12,7 @@ use hyper::body::{Frame, Incoming};
 use hyper::{Request, Response};
 use serde_json::{json, Value};
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 const SSE: &str = concat!(
@@ -154,6 +155,31 @@ async fn wait_for_envelope(vault: &std::path::Path, sid: &str) -> Value {
     panic!("capture did not finish for {sid}");
 }
 
+fn record_test_request(otel: &crate::otel::Otel, model: &str) {
+    let adapter = adapters().remove(0);
+    let req = crate::capture::CapturedRequest {
+        method: "POST".into(),
+        path: "/v1/messages".into(),
+        content_encoding: None,
+        body_sha256: String::new(),
+        ids: crate::adapter::Identity::default(),
+        started_at: std::time::SystemTime::now(),
+    };
+    let resp = crate::capture::CapturedResponse {
+        status: 200,
+        headers: hyper::HeaderMap::new(),
+        sse: SSE.into(),
+        complete: true,
+    };
+    otel.record(
+        &adapter,
+        Some(model),
+        &req,
+        &resp,
+        &vaultr::recon::parse_sse(SSE),
+    );
+}
+
 pub async fn self_test() {
     let vault_dir = std::env::temp_dir().join(format!("plant-selftest-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&vault_dir);
@@ -170,6 +196,8 @@ pub async fn self_test() {
 
     let upstream_port = serve_upstream().await;
     let exports: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(vec![]));
+    let log_failures = Arc::new(AtomicUsize::new(0));
+    let log_delay_ms = Arc::new(AtomicU64::new(0));
 
     // fake OTLP — record path/auth/body (body read requires async; do it inline)
     let otlp_listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
@@ -178,16 +206,22 @@ pub async fn self_test() {
     let otlp_port = otlp_listener.local_addr().unwrap().port();
     {
         let exports = exports.clone();
+        let log_failures = log_failures.clone();
+        let log_delay_ms = log_delay_ms.clone();
         tokio::spawn(async move {
             loop {
                 let Ok((stream, _)) = otlp_listener.accept().await else {
                     break;
                 };
                 let exports = exports.clone();
+                let log_failures = log_failures.clone();
+                let log_delay_ms = log_delay_ms.clone();
                 tokio::spawn(async move {
                     let io = hyper_util::rt::TokioIo::new(stream);
                     let svc = hyper::service::service_fn(move |req: Request<Incoming>| {
                         let exports = exports.clone();
+                        let log_failures = log_failures.clone();
+                        let log_delay_ms = log_delay_ms.clone();
                         async move {
                             let path = req.uri().path().to_string();
                             let auth = req
@@ -201,7 +235,24 @@ pub async fn self_test() {
                                 .lock()
                                 .unwrap()
                                 .push(json!({ "path": path, "authorization": auth, "body": body }));
-                            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"{}"))))
+                            let fail = path == "/v1/logs"
+                                && log_failures
+                                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                                        left.checked_sub(1)
+                                    })
+                                    .is_ok();
+                            if path == "/v1/logs" {
+                                tokio::time::sleep(std::time::Duration::from_millis(
+                                    log_delay_ms.load(Ordering::SeqCst),
+                                ))
+                                .await;
+                            }
+                            Ok::<_, Infallible>(
+                                Response::builder()
+                                    .status(if fail { 500 } else { 200 })
+                                    .body(Full::new(Bytes::from_static(b"{}")))
+                                    .unwrap(),
+                            )
                         }
                     });
                     let _ = hyper::server::conn::http1::Builder::new()
@@ -213,6 +264,7 @@ pub async fn self_test() {
     }
 
     std::env::set_var("VAULTR_OTEL", "1");
+    std::env::set_var("VAULTR_OTEL_TIMEOUT_MS", "100");
     std::env::set_var(
         "VAULTR_OTEL_ENDPOINT",
         format!("http://127.0.0.1:{otlp_port}"),
@@ -476,9 +528,9 @@ pub async fn self_test() {
 
     // -- OTLP metrics + logs --
     otel.flush(&client, Some("test-token")).await;
-    let exports = exports.lock().unwrap().clone();
-    assert_eq!(exports.len(), 2);
-    assert!(exports
+    let initial_exports = exports.lock().unwrap().clone();
+    assert_eq!(initial_exports.len(), 2);
+    assert!(initial_exports
         .iter()
         .all(|e| e["authorization"] == "Bearer test-token"));
     let point_attrs = |point: &Value| -> Value {
@@ -494,7 +546,10 @@ pub async fn self_test() {
         }
         Value::Object(m)
     };
-    let metric_export = exports.iter().find(|e| e["path"] == "/v1/metrics").unwrap();
+    let metric_export = initial_exports
+        .iter()
+        .find(|e| e["path"] == "/v1/metrics")
+        .unwrap();
     let metrics = metric_export["body"]["resourceMetrics"][0]["scopeMetrics"][0]["metrics"]
         .as_array()
         .unwrap();
@@ -543,7 +598,10 @@ pub async fn self_test() {
     assert_eq!(request_count("claude-code", "control", true), 1);
     assert_eq!(request_count("claude-code", "control", false), 3);
     assert_eq!(request_count("codex", "control", false), 1);
-    let log_export = exports.iter().find(|e| e["path"] == "/v1/logs").unwrap();
+    let log_export = initial_exports
+        .iter()
+        .find(|e| e["path"] == "/v1/logs")
+        .unwrap();
     assert_eq!(
         log_export["body"]["resourceLogs"][0]["scopeLogs"][0]["logRecords"]
             .as_array()
@@ -555,6 +613,74 @@ pub async fn self_test() {
         point_attrs(&log_export["body"]["resourceLogs"][0]["resource"])["loki.resource.labels"],
         "service.namespace"
     );
+    assert_eq!(otel.pending_logs(), 0);
+
+    // Failed log exports retry without blocking metrics and remain queued.
+    record_test_request(&otel, "retry-proof");
+    log_failures.store(2, Ordering::SeqCst);
+    let before = exports.lock().unwrap().len();
+    otel.flush(&client, Some("test-token")).await;
+    let failed_exports = exports.lock().unwrap()[before..].to_vec();
+    assert_eq!(
+        failed_exports
+            .iter()
+            .filter(|export| export["path"] == "/v1/metrics")
+            .count(),
+        1
+    );
+    assert_eq!(
+        failed_exports
+            .iter()
+            .filter(|export| export["path"] == "/v1/logs")
+            .count(),
+        2
+    );
+    assert_eq!(otel.pending_logs(), 1);
+    otel.flush(&client, Some("test-token")).await;
+    assert_eq!(otel.pending_logs(), 0);
+    let recovered = exports
+        .lock()
+        .unwrap()
+        .iter()
+        .rev()
+        .find(|export| export["path"] == "/v1/logs")
+        .unwrap()
+        .clone();
+    assert_eq!(
+        recovered["body"]["resourceLogs"][0]["scopeLogs"][0]["logRecords"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // A stalled endpoint is bounded, retried once, and retained for recovery.
+    record_test_request(&otel, "timeout-proof");
+    log_delay_ms.store(250, Ordering::SeqCst);
+    let started = std::time::Instant::now();
+    otel.flush(&client, Some("test-token")).await;
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    assert_eq!(otel.pending_logs(), 1);
+    log_delay_ms.store(0, Ordering::SeqCst);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    otel.flush(&client, Some("test-token")).await;
+    assert_eq!(otel.pending_logs(), 0);
+
+    // Acknowledging one snapshot must not remove a record added in flight.
+    record_test_request(&otel, "snapshot-proof");
+    log_delay_ms.store(50, Ordering::SeqCst);
+    let flushing = {
+        let otel = otel.clone();
+        let client = client.clone();
+        tokio::spawn(async move { otel.flush(&client, Some("test-token")).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    record_test_request(&otel, "newer-proof");
+    flushing.await.unwrap();
+    assert_eq!(otel.pending_logs(), 1);
+    log_delay_ms.store(0, Ordering::SeqCst);
+    otel.flush(&client, Some("test-token")).await;
+    assert_eq!(otel.pending_logs(), 0);
 
     // -- 502 path --
     let broken_port = start_proxy(
