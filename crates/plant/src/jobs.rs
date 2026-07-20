@@ -20,7 +20,7 @@ use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -146,10 +146,19 @@ pub fn cleanup_policy(requested: WorkspaceCleanup, cfg: &Cfg) -> WorkspaceCleanu
 /// `command` bypasses the user's interactive-shell aliases (a `codex='codex --yolo'`
 /// alias duplicated our flag, clap refused, and the prompt got typed into bare zsh).
 pub fn launch_line(harness: Harness, model: Option<&str>, args: Option<&str>) -> String {
+    // Stamp PLANT_AGENT=1 into the spawned agent so a nested `plant agent run` (a job-spawned
+    // agent that wanders into a job script and copies its dispatch line) is refused — see the
+    // guard in the AgentRun handler. Claude's Bash tool inherits the pane env, so a var prefix
+    // reaches it. Codex's shell tool uses inherit="core" and strips custom vars, so inject the
+    // marker via a set-override (`-c`), which wins last and only applies to this plant launch.
     let mut s = match harness {
-        Harness::ClaudeCode => "command claude --dangerously-skip-permissions".to_string(),
+        Harness::ClaudeCode => {
+            "PLANT_AGENT=1 command claude --dangerously-skip-permissions".to_string()
+        }
         // sandboxed codex blocks on its first approval prompt — background panes can't answer
-        Harness::Codex => "command codex --dangerously-bypass-approvals-and-sandbox".to_string(),
+        Harness::Codex => "command codex --dangerously-bypass-approvals-and-sandbox \
+             -c 'shell_environment_policy.set.PLANT_AGENT=\"1\"'"
+            .to_string(),
     };
     if let Some(m) = model {
         match harness {
@@ -557,9 +566,22 @@ async fn execute_script(job: &Job) -> JobExecution {
 }
 
 async fn execute_script_with_timeout(job: &Job, timeout: Duration) -> JobExecution {
-    // Exec the script directly: the shebang picks the interpreter. A missing
-    // shebang or exec bit fails at spawn (ENOEXEC/EACCES).
-    let mut cmd = tokio::process::Command::new(&job.path);
+    // Exec directly so the shebang picks the interpreter. Linux does not provide
+    // macOS's ENOEXEC shell fallback, so preserve that contract explicitly for
+    // executable legacy scripts without a shebang; a missing exec bit still fails.
+    let executable = std::fs::metadata(&job.path)
+        .map(|meta| meta.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false);
+    let has_shebang = std::fs::read(&job.path)
+        .map(|body| body.starts_with(b"#!"))
+        .unwrap_or(true);
+    let mut cmd = if executable && !has_shebang {
+        let mut shell = tokio::process::Command::new("/bin/sh");
+        shell.arg(&job.path);
+        shell
+    } else {
+        tokio::process::Command::new(&job.path)
+    };
     cmd.current_dir(script_working_dir())
         .env("PATH", script_path_env())
         .env(
@@ -911,12 +933,13 @@ mod tests {
                 Some("gpt-5.6-sol"),
                 Some("-c model_reasoning_effort=xhigh")
             ),
-            "command codex --dangerously-bypass-approvals-and-sandbox -m 'gpt-5.6-sol' \
+            "command codex --dangerously-bypass-approvals-and-sandbox \
+             -c 'shell_environment_policy.set.PLANT_AGENT=\"1\"' -m 'gpt-5.6-sol' \
              -c model_reasoning_effort=xhigh"
         );
         assert_eq!(
             launch_line(Harness::ClaudeCode, Some("opus[1m]"), None),
-            "command claude --dangerously-skip-permissions --model='opus[1m]'"
+            "PLANT_AGENT=1 command claude --dangerously-skip-permissions --model='opus[1m]'"
         );
     }
 
