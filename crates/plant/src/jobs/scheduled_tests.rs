@@ -154,3 +154,55 @@ async fn dispatch_holds_one_guard_across_capacity_and_typed_execution() {
     }
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn scheduled_record_failure_blocks_the_next_dispatch() {
+    let root = std::env::temp_dir().join(format!(
+        "plant-scheduled-record-failure-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let sessions = root.join("vault/sessions");
+    let state = root.join("state");
+    let calls = root.join("calls");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let _state = crate::state::use_test_dir(state.clone());
+    let _cwd = use_test_script_cwd(root.clone());
+    let script = root.join("record-fails.1m.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho called >> '{}'\nrmdir '{}'\necho unavailable > '{}'\n",
+            calls.display(),
+            state.join("jobs").display(),
+            state.join("jobs").display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let job = Job {
+        name: "record-fails".to_string(),
+        path: script,
+        every: Duration::from_secs(60),
+        action: JobAction::Script,
+    };
+    let semaphore = tokio::sync::Semaphore::new(1);
+
+    assert_eq!(
+        dispatch_scheduled(&job, &sessions, &semaphore, SCRIPT_BACKSTOP).await,
+        ScheduledDispatch::Finished(1)
+    );
+    std::fs::remove_file(state.join("jobs")).unwrap();
+    std::fs::create_dir_all(state.join("jobs")).unwrap();
+    assert_eq!(
+        dispatch_scheduled(&job, &sessions, &semaphore, SCRIPT_BACKSTOP).await,
+        ScheduledDispatch::Blocked
+    );
+    assert_eq!(
+        std::fs::read_to_string(&calls).unwrap().lines().count(),
+        1,
+        "the failed final record remains fenced across scheduler cycles"
+    );
+    assert!(state.join("job-attempts/record-fails.json").exists());
+
+    std::fs::remove_dir_all(root).unwrap();
+}
