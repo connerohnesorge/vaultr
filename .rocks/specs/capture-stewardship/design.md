@@ -21,3 +21,13 @@ compression runs inside the process retaining both capture listeners; manual
 compression must first retain both listeners and recover before it sweeps.
 The scheduler's attempt fence is owned by `plant-agent-jobs/design.md`
 ADR-0002; this decision owns only capture persistence and generation state.
+
+### ADR-0002: Normalize WebSocket turns into existing capture envelopes
+
+A transport-specific WebSocket envelope would permanently split
+reconstruction, telemetry, scrubbing, and coverage semantics. Plant instead
+represents each Codex WebSocket `response.create` turn as the existing request
+JSON and SSE response body, records semantic response status 200, and expands
+validated response-id deltas into complete logical history. This loses durable
+frame-boundary metadata but preserves every response event as JSON and keeps
+all downstream consumers transport-independent.

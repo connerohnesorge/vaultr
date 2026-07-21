@@ -1,6 +1,8 @@
 //! Reverse proxy — hyper server, reqwest streaming upstream, capture tee.
 //! Ports startProxy/capturedStream (wireproxy.ts:437-525).
 
+mod websocket;
+
 use crate::adapter::Adapter;
 use crate::capture::{self, CapturedRequest, CapturedResponse};
 use crate::otel::Otel;
@@ -194,6 +196,7 @@ async fn serve_with_shutdown(
             // no idle timeout: long thinking pauses are normal
             if let Err(e) = hyper::server::conn::http1::Builder::new()
                 .serve_connection(io, service)
+                .with_upgrades()
                 .await
             {
                 let msg = e.to_string();
@@ -237,7 +240,7 @@ async fn serve_with_shutdown(
 }
 
 async fn handle(
-    req: Request<hyper::body::Incoming>,
+    mut req: Request<hyper::body::Incoming>,
     ctx: Arc<ProxyCtx>,
     capture_tasks: CaptureTasks,
 ) -> Response<BoxBody> {
@@ -258,17 +261,17 @@ async fn handle(
             .body(full(body.to_string()))
             .unwrap();
     }
-    if req
-        .headers()
-        .get("upgrade")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.eq_ignore_ascii_case("websocket"))
-        .unwrap_or(false)
-    {
-        return Response::builder()
-            .status(426)
-            .body(full("HTTP fallback required\n"))
-            .unwrap();
+    if websocket::is_upgrade(&req) {
+        if req.method() != hyper::Method::GET
+            || !adapter.captures("POST", &path)
+            || adapter.harness != crate::domain::Harness::Codex
+        {
+            return Response::builder()
+                .status(426)
+                .body(full("HTTP fallback required\n"))
+                .unwrap();
+        }
+        return websocket::upgrade(&mut req, ctx, capture_tasks).await;
     }
 
     let method = req.method().as_str().to_string();
