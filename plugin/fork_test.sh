@@ -37,7 +37,7 @@ case "$1 $2" in
   "pane run")
     printf '%s' "$4" >"$PANE_COMMAND"
     if [ "${RUN_PANE_COMMAND:-0}" = 1 ]; then
-      printf '2\n' | /bin/bash -c "$4"
+      printf '%s\n' "${PANE_CHOICE-2}" | /bin/bash -c "$4"
     fi
     ;;
   "notification show")
@@ -90,9 +90,18 @@ sid="11111111-1111-1111-1111-111111111111"
 assert_nul_fields "$tmp/pane-session" "$sid" claude "$hostile"
 
 export RUN_PANE_COMMAND=1
+export PANE_CHOICE=2
 "$(dirname "$0")/fork.sh" >/dev/null
 assert_nul_fields "$CAPTURED_ARGV" \
   session fork "$sid" --into codex --cwd "$hostile"
+test ! -e "$marker"
+
+export PANE_CHOICE=
+"$(dirname "$0")/fork.sh" >"$tmp/fork-prompt"
+assert_nul_fields "$CAPTURED_ARGV" \
+  session fork "$sid" --into claude --cwd "$hostile"
+printf 'Fork %s into [1] claude or [2] codex? ' "$sid" >"$tmp/expected-prompt"
+cmp "$tmp/expected-prompt" "$tmp/fork-prompt"
 test ! -e "$marker"
 
 export RUN_PANE_COMMAND=0
