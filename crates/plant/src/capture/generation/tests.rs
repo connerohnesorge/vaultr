@@ -485,8 +485,7 @@ async fn herdr_append_waits_behind_capture_owned_compression_detachment() {
     let root = std::env::temp_dir().join(format!("plant-seal-herdr-lock-{}", uuid::Uuid::new_v4()));
     let vault = root.join("sessions");
     let sid = uuid::Uuid::new_v4().to_string();
-    let directory = vault.join("2026/07/20").join(&sid);
-    std::fs::create_dir_all(&directory).unwrap();
+    let directory = super::super::session_dir(&vault, &sid).unwrap();
     std::fs::write(directory.join("turns.jsonl"), b"capture generation\n").unwrap();
     std::fs::write(
         directory.join("herdr.jsonl"),
