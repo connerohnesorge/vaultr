@@ -13,8 +13,11 @@ fn validate_fixture_vault() {
     let root = tmp.path();
     let present = "11111111-1111-1111-1111-111111111111";
     let inline_missing = "22222222-2222-2222-2222-222222222222";
-    let bare_missing = "33333333-3333-3333-3333-333333333333";
-    let outside_sources = "44444444-4444-4444-4444-444444444444";
+    let inline_unquoted_missing = "33333333-3333-3333-3333-333333333333";
+    let bare_missing = "44444444-4444-4444-4444-444444444444";
+    let outside_sources = "55555555-5555-5555-5555-555555555555";
+    let invalid_month = "66666666-6666-6666-6666-666666666666";
+    let invalid_day = "77777777-7777-7777-7777-777777777777";
     write(root, &format!("sessions/.meta/{present}.json"), "{}");
     write(
         root,
@@ -56,7 +59,9 @@ fn validate_fixture_vault() {
         &format!(
             "---\nname: inline-sources\ndescription: fine\ntype: knowledge\n\
              sources: [sessions/2026/07/20/{present}, \"sessions/2026/07/20/{inline_missing}\", \
-             sessions/2026/7/20/{outside_sources}, sessions/2026/07/20/{outside_sources}/extra]\n\
+             sessions/2026/07/20/{inline_unquoted_missing}, \
+             sessions/2026/7/20/{outside_sources}, sessions/2026/07/20/{outside_sources}/extra, \
+             sessions/2026/13/20/{invalid_month}, sessions/2026/07/00/{invalid_day}]\n\
              unrelated: sessions/2026/07/20/{outside_sources}\n---\nbody\n"
         ),
     );
@@ -108,16 +113,22 @@ fn validate_fixture_vault() {
         .iter()
         .filter(|f| f.kind == "sources")
         .collect();
-    assert_eq!(source_warnings.len(), 2, "{source_warnings:#?}");
+    assert_eq!(source_warnings.len(), 3, "{source_warnings:#?}");
     assert!(source_warnings
         .iter()
         .any(|f| f.detail.contains(inline_missing)));
     assert!(source_warnings
         .iter()
-        .any(|f| f.detail.contains(bare_missing)));
-    assert!(!source_warnings
+        .any(|f| f.detail.contains(inline_unquoted_missing)));
+    assert!(source_warnings
         .iter()
-        .any(|f| f.detail.contains(present) || f.detail.contains(outside_sources)));
+        .any(|f| f.detail.contains(bare_missing)));
+    assert!(!source_warnings.iter().any(|f| {
+        f.detail.contains(present)
+            || f.detail.contains(outside_sources)
+            || f.detail.contains(invalid_month)
+            || f.detail.contains(invalid_day)
+    }));
     assert!(report.links >= 4);
 }
 
