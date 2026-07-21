@@ -59,41 +59,50 @@ fn malformed_lineage_fails_with_location_only() {
 }
 
 #[test]
-fn show_rejects_impossible_lineage_before_printing() {
-    let root = tempfile::tempdir().unwrap();
-    let id = uuid::Uuid::new_v4().to_string();
-    let meta = root.path().join(".meta");
-    let session = root.path().join("2026/07/20").join(&id);
-    fs::create_dir_all(&meta).unwrap();
-    fs::create_dir_all(&session).unwrap();
-    fs::write(
-        meta.join(format!("{id}.json")),
-        r#"{"original_start":"2026-07-20T00:00:00Z"}"#,
-    )
-    .unwrap();
-    fs::copy(
-        fixture("malformed_prefix.jsonl"),
-        session.join("turns.jsonl"),
-    )
-    .unwrap();
+fn show_rejects_invalid_reconstruction_before_printing() {
+    for (fixture_name, location, cause) in [
+        (
+            "malformed_prefix.jsonl",
+            "reconstruct: raw record 1",
+            "invalid append history lineage",
+        ),
+        (
+            "conflicting_harness.jsonl",
+            "reconstruct: raw record 2",
+            "conflicting explicit harness labels",
+        ),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let meta = root.path().join(".meta");
+        let session = root.path().join("2026/07/20").join(&id);
+        fs::create_dir_all(&meta).unwrap();
+        fs::create_dir_all(&session).unwrap();
+        fs::write(
+            meta.join(format!("{id}.json")),
+            r#"{"original_start":"2026-07-20T00:00:00Z"}"#,
+        )
+        .unwrap();
+        fs::copy(fixture(fixture_name), session.join("turns.jsonl")).unwrap();
 
-    for stats in [false, true] {
-        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_vaultr"));
-        command
-            .arg("--vault")
-            .arg(root.path())
-            .args(["session", "show", &id]);
-        if stats {
-            command.arg("--stats");
+        for stats in [false, true] {
+            let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_vaultr"));
+            command
+                .arg("--vault")
+                .arg(root.path())
+                .args(["session", "show", &id]);
+            if stats {
+                command.arg("--stats");
+            }
+            let output = command.output().unwrap();
+            let error = String::from_utf8_lossy(&output.stderr);
+
+            assert!(!output.status.success());
+            assert!(output.stdout.is_empty(), "show printed partial output");
+            assert!(error.contains(location), "{error}");
+            assert!(error.contains(cause), "{error}");
+            assert!(!error.contains("CAPTURE_SECRET"), "{error}");
         }
-        let output = command.output().unwrap();
-        let error = String::from_utf8_lossy(&output.stderr);
-
-        assert!(!output.status.success());
-        assert!(output.stdout.is_empty(), "show printed partial output");
-        assert!(error.contains("reconstruct: raw record 1"), "{error}");
-        assert!(error.contains("invalid append history lineage"), "{error}");
-        assert!(!error.contains("CAPTURE_SECRET"), "{error}");
     }
 }
 
@@ -196,16 +205,24 @@ fn first_explicit_harness_is_authoritative() {
         Some(recon::Harness::Claude)
     );
 
-    let unknown = format!(
-        "{}\n{}\n",
-        envelope(Some("unknown"), "messages"),
-        envelope(Some("codex"), "input")
-    );
+    let unknown_only = format!("{}\n", envelope(Some("unknown"), "messages"));
     assert_eq!(
-        recon::reconstruct_reader(unknown.as_bytes())
+        recon::reconstruct_reader(unknown_only.as_bytes())
             .unwrap()
             .harness,
-        Some(recon::Harness::Codex)
+        None
+    );
+
+    let unknown_then_explicit = format!(
+        "{}\n{}\n",
+        envelope(Some("unknown"), "messages"),
+        envelope(Some("claude-code"), "messages")
+    );
+    assert_eq!(
+        recon::reconstruct_reader(unknown_then_explicit.as_bytes())
+            .unwrap()
+            .harness,
+        Some(recon::Harness::Claude)
     );
 
     let err = recon::reconstruct(&fixture("conflicting_harness.jsonl")).unwrap_err();
