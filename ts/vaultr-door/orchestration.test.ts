@@ -66,18 +66,22 @@ test("a durable failed outcome advances the frontier without a second launch", a
   expect(stubCalls()).toBe(1);
 });
 
-test("a pre-launch crash resumes the persisted ordered claim and key", async () => {
+test("a pre-launch crash resumes a tied-mtime claim and key in total order", async () => {
+  landFile("mail/z.md", 1000);
   landFile("mail/a.md", 1000);
   const crashed = spawnWorker({ CRASH_IN_PROMPT: "1" });
   expect(await crashed.exited).toBe(86);
   expect(stubCalls()).toBe(0);
   const claimed = JSON.parse(readFileSync(join(tmp, "state", "t.json"), "utf8"));
-  expect(claimed.claim.files[0]).toMatchObject({
-    mtimeMs: claimed.claim.files[0].mtimeMs,
-    path: "mail/a.md",
-    size: Buffer.byteLength("content of mail/a.md"),
-  });
-  expect(claimed.claim.files[0].sha256).toMatch(/^[0-9a-f]{64}$/);
+  expect(claimed.claim.files.map((file: any) => file.path)).toEqual([
+    "mail/a.md",
+    "mail/z.md",
+  ]);
+  for (const file of claimed.claim.files) {
+    expect(file.mtimeMs).toBe(1_000_000);
+    expect(file.size).toBe(Buffer.byteLength(`content of ${file.path}`));
+    expect(file.sha256).toMatch(/^[0-9a-f]{64}$/);
+  }
   expect(claimed.claim.key).toBe(
     createHash("sha256").update(JSON.stringify({
       door: "t",
@@ -86,9 +90,40 @@ test("a pre-launch crash resumes the persisted ordered claim and key", async () 
     })).digest("hex"),
   );
 
-  const retried = spawnWorker();
-  expect(await retried.exited).toBe(0);
+  landFile("mail/m.md", 1000);
+  let retriedPaths: string[] = [];
+  const retried = await door({
+    name: "t",
+    watch: "mail/*.md",
+    prompt: (files) => {
+      retriedPaths = files.map((file) => file.path);
+      return retriedPaths.join("\n");
+    },
+  });
+  expect(retried.code).toBe(0);
+  expect(retriedPaths).toEqual(["mail/a.md", "mail/z.md"]);
   expect(stubCalls()).toBe(1);
+  expect(readFileSync(stubLog, "utf8")).toContain(
+    `--idempotency-key ${claimed.claim.key}`,
+  );
+  const completed = JSON.parse(readFileSync(join(tmp, "state", "t.json"), "utf8"));
+  expect(completed.claim).toBeUndefined();
+  expect(completed.frontier).toEqual({
+    mtimeMs: 1_000_000,
+    seen: ["mail/a.md", "mail/z.md"],
+  });
+
+  let latePaths: string[] = [];
+  expect((await door({
+    name: "t",
+    watch: "mail/*.md",
+    prompt: (files) => {
+      latePaths = files.map((file) => file.path);
+      return latePaths.join("\n");
+    },
+  })).code).toBe(0);
+  expect(latePaths).toEqual(["mail/m.md"]);
+  expect(stubCalls()).toBe(2);
 });
 
 test("a same-path same-mtime regular replacement cannot hydrate a persisted claim", async () => {
