@@ -22,6 +22,21 @@ fn run(home: &Path, sessions: &Path, path: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
+fn assert_inventory_failure(output: Output, command: &str, path: &Path) {
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "{command}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty(), "{command} emitted partial output");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains(command) && stderr.contains(&path.display().to_string()),
+        "{command} did not identify the failed inventory path: {stderr}"
+    );
+}
+
 #[test]
 fn maintenance_commands_propagate_inventory_failures_and_preserve_no_work() {
     let tmp = std::env::temp_dir().join(format!(
@@ -41,18 +56,12 @@ fn maintenance_commands_propagate_inventory_failures_and_preserve_no_work() {
     fs::set_permissions(&zstd, fs::Permissions::from_mode(0o755)).unwrap();
 
     let missing = tmp.join("missing");
-    for args in [
-        &["sessions", "eligible"][..],
-        &["sessions", "stuck"][..],
-        &["compress", "once"][..],
+    for (args, command) in [
+        (&["sessions", "eligible"][..], "sessions eligible"),
+        (&["sessions", "stuck"][..], "sessions stuck"),
+        (&["compress", "once"][..], "compress once"),
     ] {
-        let output = run(&home, &missing, &bin, args);
-        assert_eq!(
-            output.status.code(),
-            Some(2),
-            "{args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        assert_inventory_failure(run(&home, &missing, &bin, args), command, &missing);
     }
 
     let empty = tmp.join("empty");
@@ -75,18 +84,12 @@ fn maintenance_commands_propagate_inventory_failures_and_preserve_no_work() {
     let day = unreadable.join("2026/07/20");
     fs::create_dir_all(&day).unwrap();
     fs::set_permissions(&day, fs::Permissions::from_mode(0o000)).unwrap();
-    for args in [
-        &["sessions", "eligible"][..],
-        &["sessions", "stuck"][..],
-        &["compress", "once"][..],
+    for (args, command) in [
+        (&["sessions", "eligible"][..], "sessions eligible"),
+        (&["sessions", "stuck"][..], "sessions stuck"),
+        (&["compress", "once"][..], "compress once"),
     ] {
-        let output = run(&home, &unreadable, &bin, args);
-        assert_eq!(
-            output.status.code(),
-            Some(2),
-            "{args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        assert_inventory_failure(run(&home, &unreadable, &bin, args), command, &day);
     }
     fs::set_permissions(&day, fs::Permissions::from_mode(0o700)).unwrap();
 
@@ -96,22 +99,21 @@ fn maintenance_commands_propagate_inventory_failures_and_preserve_no_work() {
         let generation = session.join(name);
         fs::write(&generation, "{}\n".repeat(6)).unwrap();
         fs::set_permissions(&generation, fs::Permissions::from_mode(0o000)).unwrap();
-        for args in [
-            &["sessions", "eligible"][..],
-            &["sessions", "stuck"][..],
-            &["compress", "once"][..],
+        for (args, command) in [
+            (&["sessions", "eligible"][..], "sessions eligible"),
+            (&["sessions", "stuck"][..], "sessions stuck"),
+            (&["compress", "once"][..], "compress once"),
         ] {
-            let output = run(&home, &tmp.join("unreadable-generation"), &bin, args);
-            assert_eq!(
-                output.status.code(),
-                Some(2),
-                "{name} {args:?}: {}",
-                String::from_utf8_lossy(&output.stderr)
+            assert_inventory_failure(
+                run(&home, &tmp.join("unreadable-generation"), &bin, args),
+                command,
+                &generation,
             );
         }
         fs::set_permissions(&generation, fs::Permissions::from_mode(0o600)).unwrap();
         fs::remove_file(generation).unwrap();
     }
+
     fs::remove_dir_all(tmp).unwrap();
 }
 
