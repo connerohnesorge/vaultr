@@ -329,6 +329,7 @@ fn codex_passthrough_only_lifts_one_truly_leading_developer_message() {
     };
     let user = json!({"type": "message", "role": "user",
                       "content": [{"type": "input_text", "text": "user"}]});
+    let tools = json!({"type": "additional_tools", "role": "developer"});
 
     let (items, base) = fork::prepare_codex_passthrough(&[developer("first")]);
     assert!(items.is_empty());
@@ -337,6 +338,15 @@ fn codex_passthrough_only_lifts_one_truly_leading_developer_message() {
     let (items, base) = fork::prepare_codex_passthrough(&[user.clone(), developer("later")]);
     assert_eq!(items, vec![user.clone(), developer("later")]);
     assert_eq!(base, None);
+
+    let (items, base) = fork::prepare_codex_passthrough(&[
+        tools.clone(),
+        user.clone(),
+        tools,
+        developer("still conversational"),
+    ]);
+    assert_eq!(items, vec![user, developer("still conversational")]);
+    assert_eq!(base, None, "removed scaffolding must not move the boundary");
 
     let (items, base) = fork::prepare_codex_passthrough(&[developer("first"), developer("second")]);
     assert_eq!(items, vec![developer("second")]);
