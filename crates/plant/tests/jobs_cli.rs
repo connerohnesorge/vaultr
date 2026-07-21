@@ -167,7 +167,9 @@ fn sessions_stuck_summary_is_deterministic_and_becomes_job_ledger_detail() {
     fs::create_dir_all(&jobs).unwrap();
     for (sid, body) in [
         ("seal", "{}\n".repeat(6)),
+        ("half-claude", "{}\n".repeat(6)),
         ("half-codex", "{}\n".repeat(6)),
+        ("unlearned", "{}\n".repeat(6)),
         ("small", "{}\n".to_string()),
         ("job", "{}\n".repeat(6)),
     ] {
@@ -180,14 +182,15 @@ fn sessions_stuck_summary_is_deterministic_and_becomes_job_ledger_detail() {
         concat!(
             "{\"session_id\":\"seal\",\"learner\":\"claude\"}\n",
             "{\"session_id\":\"seal\",\"learner\":\"codex\"}\n",
+            "{\"session_id\":\"half-claude\",\"learner\":\"codex\"}\n",
             "{\"session_id\":\"half-codex\",\"learner\":\"claude\"}\n",
         ),
     )
     .unwrap();
     fs::write(home.join(".local/state/plant/job-sids.txt"), "job\n").unwrap();
 
-    let summary = "sessions-stuck summary: seal-blocked=1 half-learned:claude=0 \
-                   half-learned:codex=1 unlearned=0 sub-threshold=1 job-capture=1";
+    let summary = "sessions-stuck summary: seal-blocked=1 half-learned:claude=1 \
+                   half-learned:codex=1 unlearned=1 sub-threshold=1 job-capture=1";
     let direct = run_args(&home, &sessions, &["sessions", "stuck", "--age", "0s"]);
     assert_eq!(direct.status.code(), Some(1));
     let stdout = String::from_utf8(direct.stdout).unwrap();
@@ -195,7 +198,9 @@ fn sessions_stuck_summary_is_deterministic_and_becomes_job_ledger_detail() {
     assert_eq!(lines.last(), Some(&summary));
     for row in [
         "seal-blocked seal",
+        "half-learned:claude half-claude",
         "half-learned:codex half-codex",
+        "unlearned unlearned",
         "sub-threshold small",
         "job-capture job",
     ] {
@@ -222,7 +227,9 @@ fn sessions_stuck_summary_is_deterministic_and_becomes_job_ledger_detail() {
     assert_eq!(record["detail"], summary);
 
     fs::remove_dir_all(day.join("seal")).unwrap();
+    fs::remove_dir_all(day.join("half-claude")).unwrap();
     fs::remove_dir_all(day.join("half-codex")).unwrap();
+    fs::remove_dir_all(day.join("unlearned")).unwrap();
     let informational = run_args(&home, &sessions, &["sessions", "stuck", "--age", "0s"]);
     assert_eq!(informational.status.code(), Some(0));
     assert_eq!(
