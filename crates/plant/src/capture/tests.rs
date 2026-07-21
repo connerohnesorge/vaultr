@@ -548,15 +548,20 @@ async fn detachment_rechecks_behind_a_finishing_capture() {
     let detach_vault = vault.clone();
     let detach_sid = sid.clone();
     let detach_dir = dir.clone();
-    let detach = tokio::spawn(async move {
-        seal_ready_generation(&detach_vault, &detach_sid, &detach_dir).await
-    });
-    tokio::task::yield_now().await;
+    let mut detach =
+        Box::pin(
+            async move { seal_ready_generation(&detach_vault, &detach_sid, &detach_dir).await },
+        );
+    tokio::select! {
+        biased;
+        _ = &mut detach => panic!("detachment acquired the held session lock"),
+        () = tokio::task::yield_now() => {}
+    }
+    let detach = tokio::spawn(detach);
     let finish_vault = vault.clone();
     let finish = tokio::spawn(async move {
         finish_capture(&finish_vault, &claude_adapter(), pending, &response(true)).await
     });
-    tokio::task::yield_now().await;
     drop(guard);
 
     assert!(
@@ -572,6 +577,53 @@ async fn detachment_rechecks_behind_a_finishing_capture() {
         recon::reconstruct(&generation.path).unwrap().envelopes,
         1,
         "the concurrent completion remains reconstructable"
+    );
+}
+
+#[tokio::test]
+async fn detachment_includes_a_completion_queued_first() {
+    if !crate::process::which("zstd") {
+        return;
+    }
+    let (_guard, vault) = set_home();
+    let adapter = claude_adapter();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let pending = prepare_capture(&vault, &adapter, captured(Some(&sid)), body(&["a"]))
+        .await
+        .unwrap();
+    let dir = pending.dir.clone();
+    let root = pending.root.clone();
+
+    let lock = session_lock(&root, &sid);
+    let guard = lock.lock().await;
+    let finish_vault = vault.clone();
+    let mut finish = Box::pin(async move {
+        finish_capture(&finish_vault, &claude_adapter(), pending, &response(true)).await
+    });
+    tokio::select! {
+        biased;
+        _ = &mut finish => panic!("capture completion acquired the held session lock"),
+        () = tokio::task::yield_now() => {}
+    }
+    let finish = tokio::spawn(finish);
+    let detach_vault = vault.clone();
+    let detach_sid = sid.clone();
+    let detach_dir = dir.clone();
+    let detach = tokio::spawn(async move {
+        seal_ready_generation(&detach_vault, &detach_sid, &detach_dir).await
+    });
+    drop(guard);
+
+    finish.await.unwrap().unwrap();
+    let generation = detach
+        .await
+        .unwrap()
+        .unwrap()
+        .expect("queued completion makes the generation sealable");
+    assert_eq!(
+        recon::reconstruct(&generation.path).unwrap().envelopes,
+        1,
+        "the detached generation includes the completed Envelope"
     );
 }
 
