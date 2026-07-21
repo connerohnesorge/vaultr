@@ -831,27 +831,38 @@ mod tests {
             agent: agent.map(str::to_string),
             agent_session: None,
         };
-        for (agent, status, expected) in [
-            (Some("claude"), "idle", true),
-            (Some("claude"), "done", true),
-            (Some("codex"), "idle", true),
-            (Some("codex"), "done", true),
-            (Some("claude"), "working", false),
-            (Some("codex"), "blocked", false),
-            (Some("codex"), "unknown", false),
-            (Some("unknown"), "idle", false),
-            (None, "idle", false),
-        ] {
-            assert_eq!(
-                pane_accepts_prompt(&[pane(agent, status)], "w1:p1"),
-                expected,
-                "{agent:?}/{status}"
-            );
+        for agent in ["claude", "codex"] {
+            for (status, expected) in [
+                ("idle", true),
+                ("done", true),
+                ("working", false),
+                ("blocked", false),
+                ("unknown", false),
+            ] {
+                assert_eq!(
+                    pane_accepts_prompt(&[pane(Some(agent), status)], "w1:p1"),
+                    expected,
+                    "{agent}/{status}"
+                );
+            }
+        }
+        for agent in [Some("unknown"), None] {
+            for status in ["idle", "done"] {
+                assert!(
+                    !pane_accepts_prompt(&[pane(agent, status)], "w1:p1"),
+                    "{agent:?}/{status}"
+                );
+            }
         }
         assert!(!pane_accepts_prompt(
             &[pane(Some("codex"), "done")],
             "other"
         ));
+
+        let shell = pane(None, "idle");
+        let mut ready_sibling = pane(Some("codex"), "done");
+        ready_sibling.pane_id = "w1:p2".to_string();
+        assert!(!pane_accepts_prompt(&[shell, ready_sibling], "w1:p1"));
 
         let mut original = pane(Some("codex"), "done");
         original.agent_session = Some(AgentSession {
