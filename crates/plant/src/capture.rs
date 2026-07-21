@@ -645,7 +645,7 @@ fn recover_session(vault: &Path, root: &str, sid: &str) -> Result<(), String> {
                     if let Some(o) = env.as_object_mut() {
                         o.insert("response".into(), json!({ "complete": false }));
                     }
-                    append_line(&turns, &env)?;
+                    reconcile_append(&turns, &env)?;
                 }
                 order.next_to_drain = seq + 1;
                 order.pending.remove(&seq);
@@ -1134,6 +1134,41 @@ mod tests {
             !has_open_capture(&vault, &sid),
             "journal drained, staging cleared"
         );
+    }
+
+    #[tokio::test]
+    async fn incomplete_recovery_reconciles_complete_and_prefix_retries() {
+        let (_guard, vault) = set_home();
+        for prefix in [false, true] {
+            let adapter = claude_adapter();
+            let sid = uuid::Uuid::new_v4().to_string();
+            let pending = prepare_capture(&vault, &adapter, captured(Some(&sid)), body(&["a"]))
+                .await
+                .unwrap();
+            let dir = pending.dir.clone();
+            let mut incomplete = pending.request_part.clone();
+            incomplete
+                .as_object_mut()
+                .unwrap()
+                .insert("response".into(), json!({"complete": false}));
+            let line = serde_json::to_string(&incomplete).unwrap();
+            fs::write(
+                dir.join("turns.jsonl"),
+                if prefix {
+                    line[..line.len() / 2].to_string()
+                } else {
+                    format!("{line}\n")
+                },
+            )
+            .unwrap();
+
+            recover_all(&vault).unwrap();
+            assert_eq!(
+                turns_lines(&dir),
+                vec![incomplete],
+                "retry ends with exactly one incomplete envelope"
+            );
+        }
     }
 
     #[tokio::test]
