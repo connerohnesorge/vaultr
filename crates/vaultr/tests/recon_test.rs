@@ -92,6 +92,7 @@ fn show_rejects_impossible_lineage_before_printing() {
         assert!(!output.status.success());
         assert!(output.stdout.is_empty(), "show printed partial output");
         assert!(error.contains("reconstruct: raw record 1"), "{error}");
+        assert!(error.contains("invalid append history lineage"), "{error}");
         assert!(!error.contains("CAPTURE_SECRET"), "{error}");
     }
 }
