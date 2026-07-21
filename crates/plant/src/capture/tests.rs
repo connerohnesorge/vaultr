@@ -739,3 +739,30 @@ async fn incomplete_recovery_reconciles_complete_and_prefix_retries() {
         );
     }
 }
+
+#[tokio::test]
+async fn incomplete_recovery_rejects_conflicting_capture_without_mutation() {
+    let (_guard, vault) = set_home();
+    let adapter = claude_adapter();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let pending = prepare_capture(&vault, &adapter, captured(Some(&sid)), body(&["a"]))
+        .await
+        .unwrap();
+    let turns = pending.dir.join("turns.jsonl");
+    let state = pending.dir.join("state.json");
+    let mut conflicting = pending.request_part.clone();
+    conflicting
+        .as_object_mut()
+        .unwrap()
+        .insert("response".into(), json!({"complete": true}));
+    let capture_before = serde_json::to_vec(&conflicting).unwrap();
+    fs::write(&turns, [&capture_before[..], b"\n"].concat()).unwrap();
+    let journal_before = fs::read(&state).unwrap();
+
+    assert!(recover_all(&vault).is_err());
+    assert_eq!(
+        fs::read(&turns).unwrap(),
+        [&capture_before[..], b"\n"].concat()
+    );
+    assert_eq!(fs::read(&state).unwrap(), journal_before);
+}
