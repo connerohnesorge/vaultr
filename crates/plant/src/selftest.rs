@@ -6,13 +6,18 @@ use crate::adapter::adapters;
 use crate::capture::{scrub, session_dir};
 use crate::proxy::{self, ProxyCtx};
 use bytes::Bytes;
+use futures_util::{SinkExt, StreamExt};
 use http_body_util::{BodyExt, Full, StreamBody};
 use hyper::body::{Frame, Incoming};
-use hyper::{Request, Response};
+use hyper::{Request, Response, StatusCode};
 use serde_json::{json, Value};
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::handshake::server::create_response_with_body;
+use tokio_tungstenite::tungstenite::protocol::{Message, Role};
+use tokio_tungstenite::WebSocketStream;
 
 const SSE: &str = concat!(
     "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":11,\"cache_read_input_tokens\":3,\"cache_creation_input_tokens\":2}}}\n\n",
@@ -72,49 +77,208 @@ fn streamed_body(fixture: UpstreamFixture) -> proxy::BoxBody {
 }
 
 /// fake upstream needs the request body consumed (hyper requires it); collect then respond
-async fn serve_upstream() -> u16 {
+async fn serve_upstream() -> (u16, Arc<Mutex<Vec<Value>>>) {
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
         .await
         .unwrap();
     let port = listener.local_addr().unwrap().port();
+    let websocket_observations = Arc::new(Mutex::new(Vec::new()));
+    let observations = websocket_observations.clone();
     tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 break;
             };
+            let observations = observations.clone();
             tokio::spawn(async move {
                 let io = hyper_util::rt::TokioIo::new(stream);
-                let svc = hyper::service::service_fn(|req: Request<Incoming>| async move {
-                    let fixture = match req.uri().query() {
-                        Some("fixture=claude-terminal-word") => UpstreamFixture::ClaudeTerminalWord,
-                        Some("fixture=codex-terminal-word") => UpstreamFixture::CodexTerminalWord,
-                        Some("fixture=torn") => UpstreamFixture::Torn,
-                        Some("fixture=delayed") => UpstreamFixture::Delayed,
-                        _ => UpstreamFixture::Full,
-                    };
-                    let _ = req.into_body().collect().await;
-                    let mut response = Response::builder()
-                        .header("content-type", "text/event-stream")
-                        .header("request-id", "req_test")
-                        .header("x-secret", "drop-me");
-                    let body = match fixture {
-                        UpstreamFixture::Full => {
-                            response = response.header("content-encoding", "zstd");
-                            full_body(zstd::encode_all(SSE.as_bytes(), 1).unwrap())
+                let svc = hyper::service::service_fn(move |mut req: Request<Incoming>| {
+                    let observations = observations.clone();
+                    async move {
+                        let websocket = req
+                            .headers()
+                            .get(hyper::header::UPGRADE)
+                            .and_then(|value| value.to_str().ok())
+                            .is_some_and(|value| value.eq_ignore_ascii_case("websocket"));
+                        if websocket {
+                            let mut response = create_response_with_body(&req, || full_body(""))
+                                .expect("valid self-test WebSocket request");
+                            for (name, value) in [
+                                ("x-reasoning-included", "true"),
+                                ("x-models-etag", "etag-test"),
+                                ("openai-model", "gpt-ws-server"),
+                                ("x-codex-turn-state", "sticky-test"),
+                            ] {
+                                response.headers_mut().insert(name, value.parse().unwrap());
+                            }
+                            let path = req.uri().path().to_string();
+                            let authorization = req
+                                .headers()
+                                .get(hyper::header::AUTHORIZATION)
+                                .and_then(|value| value.to_str().ok())
+                                .map(String::from);
+                            let session_id = req
+                                .headers()
+                                .get("session-id")
+                                .and_then(|value| value.to_str().ok())
+                                .map(String::from);
+                            let on_upgrade = hyper::upgrade::on(&mut req);
+                            tokio::spawn(async move {
+                                let upgraded = on_upgrade.await.unwrap();
+                                let mut websocket = WebSocketStream::from_raw_socket(
+                                    hyper_util::rt::TokioIo::new(upgraded),
+                                    Role::Server,
+                                    None,
+                                )
+                                .await;
+                                let mut turn = 0_u64;
+                                while let Some(message) = websocket.next().await {
+                                    match message.unwrap() {
+                                        Message::Text(text) => {
+                                            turn += 1;
+                                            let body: Value =
+                                                serde_json::from_str(text.as_str()).unwrap();
+                                            observations.lock().unwrap().push(json!({
+                                                "path": path,
+                                                "authorization": authorization,
+                                                "session_id": session_id,
+                                                "body": body,
+                                            }));
+                                            websocket
+                                                .send(Message::text(
+                                                    json!({"type":"response.created","turn":turn})
+                                                        .to_string(),
+                                                ))
+                                                .await
+                                                .unwrap();
+                                            if body["model"] == "gpt-ws-interrupted" {
+                                                websocket.close(None).await.unwrap();
+                                                break;
+                                            }
+                                            if matches!(
+                                                body["model"].as_str(),
+                                                Some(
+                                                    "gpt-ws-client-drop"
+                                                        | "gpt-ws-overlap"
+                                                        | "gpt-ws-ambiguous"
+                                                        | "gpt-ws-binary"
+                                                )
+                                            ) {
+                                                tokio::time::sleep(
+                                                    std::time::Duration::from_millis(100),
+                                                )
+                                                .await;
+                                            }
+                                            if body["generate"] != false
+                                                && websocket
+                                                    .send(Message::text(
+                                                        json!({
+                                                            "type":"response.output_item.done",
+                                                            "item":{
+                                                                "type":"message",
+                                                                "role":"assistant",
+                                                                "content":[{
+                                                                    "type":"output_text",
+                                                                    "text":format!("answer {turn}")
+                                                                }]
+                                                            }
+                                                        })
+                                                        .to_string(),
+                                                    ))
+                                                    .await
+                                                    .is_err()
+                                            {
+                                                break;
+                                            }
+                                            if websocket
+                                                .send(Message::Ping(Bytes::from_static(
+                                                    b"upstream",
+                                                )))
+                                                .await
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
+                                            if websocket
+                                                .send(Message::text(
+                                                    json!({
+                                                        "type":"response.completed",
+                                                        "turn":turn,
+                                                        "response":{
+                                                            "id":format!("resp-{turn}"),
+                                                            "usage":{
+                                                                "input_tokens":5,
+                                                                "output_tokens":3,
+                                                                "input_tokens_details":{"cached_tokens":2}
+                                                            }
+                                                        }
+                                                    })
+                                                    .to_string(),
+                                                ))
+                                                .await
+                                                .is_err()
+                                            {
+                                                break;
+                                            }
+                                        }
+                                        Message::Pong(payload) => {
+                                            observations.lock().unwrap().push(json!({
+                                                "upstream_pong": String::from_utf8_lossy(&payload),
+                                            }));
+                                        }
+                                        Message::Ping(payload) => {
+                                            websocket.send(Message::Pong(payload)).await.unwrap();
+                                        }
+                                        Message::Close(_) => break,
+                                        Message::Binary(payload) => {
+                                            observations.lock().unwrap().push(json!({
+                                                "upstream_binary": payload.as_ref(),
+                                            }));
+                                        }
+                                        Message::Frame(_) => {}
+                                    }
+                                }
+                            });
+                            return Ok::<_, Infallible>(response);
                         }
-                        UpstreamFixture::ClaudeTerminalWord => full_body(CLAUDE_TERMINAL_WORD),
-                        UpstreamFixture::CodexTerminalWord => full_body(CODEX_TERMINAL_WORD),
-                        UpstreamFixture::Torn | UpstreamFixture::Delayed => streamed_body(fixture),
-                    };
-                    Ok::<_, Infallible>(response.body(body).unwrap())
+                        let fixture = match req.uri().query() {
+                            Some("fixture=claude-terminal-word") => {
+                                UpstreamFixture::ClaudeTerminalWord
+                            }
+                            Some("fixture=codex-terminal-word") => {
+                                UpstreamFixture::CodexTerminalWord
+                            }
+                            Some("fixture=torn") => UpstreamFixture::Torn,
+                            Some("fixture=delayed") => UpstreamFixture::Delayed,
+                            _ => UpstreamFixture::Full,
+                        };
+                        let _ = req.into_body().collect().await;
+                        let mut response = Response::builder()
+                            .header("content-type", "text/event-stream")
+                            .header("request-id", "req_test")
+                            .header("x-secret", "drop-me");
+                        let body = match fixture {
+                            UpstreamFixture::Full => {
+                                response = response.header("content-encoding", "zstd");
+                                full_body(zstd::encode_all(SSE.as_bytes(), 1).unwrap())
+                            }
+                            UpstreamFixture::ClaudeTerminalWord => full_body(CLAUDE_TERMINAL_WORD),
+                            UpstreamFixture::CodexTerminalWord => full_body(CODEX_TERMINAL_WORD),
+                            UpstreamFixture::Torn | UpstreamFixture::Delayed => {
+                                streamed_body(fixture)
+                            }
+                        };
+                        Ok::<_, Infallible>(response.body(body).unwrap())
+                    }
                 });
                 let _ = hyper::server::conn::http1::Builder::new()
                     .serve_connection(io, svc)
+                    .with_upgrades()
                     .await;
             });
         }
     });
-    port
+    (port, websocket_observations)
 }
 
 fn start_proxy(
@@ -141,17 +305,54 @@ fn start_proxy(
 }
 
 async fn wait_for_envelope(vault: &std::path::Path, sid: &str) -> Value {
+    wait_for_envelopes(vault, sid, 1).await.remove(0)
+}
+
+async fn wait_for_envelopes(vault: &std::path::Path, sid: &str, count: usize) -> Vec<Value> {
     for _ in 0..300 {
         if let Ok(dir) = session_dir(vault, sid) {
             if let Ok(turns) = std::fs::read_to_string(dir.join("turns.jsonl")) {
-                if let Some(line) = turns.lines().next() {
-                    return serde_json::from_str(line).unwrap();
+                let envelopes: Vec<Value> = turns
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                if envelopes.len() >= count {
+                    return envelopes;
                 }
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    panic!("capture did not finish for {sid}");
+    panic!("{count} captures did not finish for {sid}");
+}
+
+async fn wait_for_ws_terminal(
+    websocket: &mut WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    expected_turn: u64,
+    client_pong: &mut bool,
+) {
+    loop {
+        let message = tokio::time::timeout(std::time::Duration::from_secs(2), websocket.next())
+            .await
+            .expect("WebSocket response stalled")
+            .expect("WebSocket closed before response.completed")
+            .unwrap();
+        match message {
+            Message::Text(text) => {
+                let event: Value = serde_json::from_str(text.as_str()).unwrap();
+                if event["type"] == "response.completed" {
+                    assert_eq!(event["turn"], expected_turn);
+                    return;
+                }
+            }
+            Message::Pong(payload) => {
+                assert_eq!(payload, Bytes::from_static(b"client"));
+                *client_pong = true;
+            }
+            Message::Ping(payload) => websocket.send(Message::Pong(payload)).await.unwrap(),
+            other => panic!("unexpected WebSocket response: {other:?}"),
+        }
+    }
 }
 
 fn record_test_request(otel: &crate::otel::Otel, model: &str) {
@@ -193,7 +394,7 @@ pub async fn self_test() {
         "absent herdr socket must fail soft"
     );
 
-    let upstream_port = serve_upstream().await;
+    let (upstream_port, websocket_observations) = serve_upstream().await;
     let exports: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(vec![]));
     let log_failures = Arc::new(AtomicUsize::new(0));
     let log_delay_ms = Arc::new(AtomicU64::new(0));
@@ -434,6 +635,399 @@ pub async fn self_test() {
     );
     assert_eq!(cturns[0]["response"]["complete"], true);
 
+    match tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{claude_port}/v1/messages"))
+        .await
+    {
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => {
+            assert_eq!(response.status(), StatusCode::UPGRADE_REQUIRED)
+        }
+        Ok(_) => panic!("non-Codex WebSocket upgrade unexpectedly succeeded"),
+        Err(error) => panic!("non-Codex WebSocket rejection was not HTTP 426: {error}"),
+    }
+
+    // -- codex native WebSocket: credentialed relay, handshake metadata,
+    // ping/pong, prewarm suppression, incremental history expansion, and
+    // interrupted/overlapping turn capture --
+    let ws_sid = "019f1234-5678-7abc-8def-0123456789b2";
+    let stale_ws_turn = "019f1234-5678-7abc-8def-0123456789b6";
+    let warmup_ws_turn = "019f1234-5678-7abc-8def-0123456789b7";
+    let first_ws_turn = "019f1234-5678-7abc-8def-0123456789b8";
+    let second_ws_turn = "019f1234-5678-7abc-8def-0123456789b9";
+    let mut ws_request = format!("ws://127.0.0.1:{codex_port}/responses")
+        .into_client_request()
+        .unwrap();
+    ws_request.headers_mut().insert(
+        hyper::header::AUTHORIZATION,
+        "Bearer ws-test".parse().unwrap(),
+    );
+    ws_request
+        .headers_mut()
+        .insert("session-id", ws_sid.parse().unwrap());
+    ws_request.headers_mut().insert(
+        "x-codex-turn-metadata",
+        json!({"turn_id": stale_ws_turn})
+            .to_string()
+            .parse()
+            .unwrap(),
+    );
+    let (mut websocket, handshake) = tokio_tungstenite::connect_async(ws_request).await.unwrap();
+    assert_eq!(handshake.status(), StatusCode::SWITCHING_PROTOCOLS);
+    assert_eq!(handshake.headers()["x-reasoning-included"], "true");
+    assert_eq!(handshake.headers()["x-models-etag"], "etag-test");
+    assert_eq!(handshake.headers()["openai-model"], "gpt-ws-server");
+    assert_eq!(handshake.headers()["x-codex-turn-state"], "sticky-test");
+    websocket
+        .send(Message::Ping(Bytes::from_static(b"client")))
+        .await
+        .unwrap();
+    let mut client_pong = false;
+    websocket
+        .send(Message::text(
+            json!({
+                "type":"response.create",
+                "model":"gpt-ws",
+                "instructions":"capture websocket",
+                "generate":false,
+                "input":[{"role":"user","content":"turn 1"}],
+                "client_metadata":{"session_id":ws_sid,"turn_id":warmup_ws_turn}
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    wait_for_ws_terminal(&mut websocket, 1, &mut client_pong).await;
+    websocket
+        .send(Message::text(
+            json!({
+                "type":"response.create",
+                "model":"gpt-ws",
+                "instructions":"capture websocket",
+                "previous_response_id":"resp-1",
+                "input":[],
+                "client_metadata":{"session_id":ws_sid,"turn_id":first_ws_turn}
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    wait_for_ws_terminal(&mut websocket, 2, &mut client_pong).await;
+    websocket
+        .send(Message::text(
+            json!({
+                "type":"response.create",
+                "model":"gpt-ws",
+                "instructions":"capture websocket",
+                "previous_response_id":"resp-2",
+                "input":[{"role":"user","content":"turn 2"}],
+                "client_metadata":{"session_id":ws_sid,"turn_id":second_ws_turn}
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    wait_for_ws_terminal(&mut websocket, 3, &mut client_pong).await;
+    websocket.close(None).await.unwrap();
+    assert!(client_pong, "Plant must service the downstream ping");
+
+    let ws_turns = wait_for_envelopes(&vault, ws_sid, 2).await;
+    assert_eq!(ws_turns.len(), 2);
+    for (index, envelope) in ws_turns.iter().enumerate() {
+        assert_eq!(envelope["request"]["method"], "POST");
+        assert_eq!(envelope["request"]["path"], "/responses");
+        assert_eq!(envelope["response"]["status"], 200);
+        assert_eq!(envelope["response"]["complete"], true);
+        assert_eq!(
+            envelope["turn_id"],
+            if index == 0 {
+                first_ws_turn
+            } else {
+                second_ws_turn
+            }
+        );
+        let events = vaultr::recon::parse_sse(envelope["response"]["sse"].as_str().unwrap());
+        assert_eq!(events.last().unwrap()["type"], "response.completed");
+        assert_eq!(events.last().unwrap()["turn"], index + 2);
+    }
+    let ws_state: Value = serde_json::from_str(
+        &std::fs::read_to_string(session_dir(&vault, ws_sid).unwrap().join("state.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(ws_state["request_body"].get("type").is_none());
+    assert!(ws_state["request_body"].get("generate").is_none());
+    assert!(ws_state["request_body"]
+        .get("previous_response_id")
+        .is_none());
+    assert_eq!(
+        ws_state["request_body"]["input"].as_array().unwrap().len(),
+        3
+    );
+    assert_eq!(ws_state["request_body"]["input"][0]["content"], "turn 1");
+    assert_eq!(
+        ws_state["request_body"]["input"][1]["content"][0]["text"],
+        "answer 2"
+    );
+    assert_eq!(
+        ws_state["request_body"]["input"][1]["internal_chat_message_metadata_passthrough"]
+            ["turn_id"],
+        first_ws_turn
+    );
+    assert_eq!(ws_state["request_body"]["input"][2]["content"], "turn 2");
+    let reconstructed =
+        vaultr::recon::reconstruct(&session_dir(&vault, ws_sid).unwrap().join("turns.jsonl"))
+            .unwrap();
+    assert_eq!(reconstructed.history_len, 3);
+    assert_eq!(reconstructed.trailing_appended, 1);
+    assert_eq!(reconstructed.messages[0]["content"], "turn 1");
+    assert_eq!(reconstructed.messages[2]["content"], "turn 2");
+
+    let interrupted_ws_sid = "019f1234-5678-7abc-8def-0123456789b3";
+    let mut interrupted_request = format!("ws://127.0.0.1:{codex_port}/responses")
+        .into_client_request()
+        .unwrap();
+    interrupted_request
+        .headers_mut()
+        .insert("session-id", interrupted_ws_sid.parse().unwrap());
+    let (mut interrupted_ws, _) = tokio_tungstenite::connect_async(interrupted_request)
+        .await
+        .unwrap();
+    interrupted_ws
+        .send(Message::text(
+            json!({
+                "type":"response.create",
+                "model":"gpt-ws-interrupted",
+                "input":[{"role":"user","content":"interrupt"}]
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    while let Some(message) = interrupted_ws.next().await {
+        if matches!(message.unwrap(), Message::Close(_)) {
+            break;
+        }
+    }
+    let interrupted = wait_for_envelope(&vault, interrupted_ws_sid).await;
+    assert_eq!(interrupted["response"]["complete"], false);
+    assert!(interrupted["response"]["sse"]
+        .as_str()
+        .unwrap()
+        .contains("response.created"));
+
+    let client_drop_sid = "019f1234-5678-7abc-8def-0123456789b4";
+    let mut client_drop_request = format!("ws://127.0.0.1:{codex_port}/responses")
+        .into_client_request()
+        .unwrap();
+    client_drop_request
+        .headers_mut()
+        .insert("session-id", client_drop_sid.parse().unwrap());
+    let (mut client_drop_ws, _) = tokio_tungstenite::connect_async(client_drop_request)
+        .await
+        .unwrap();
+    client_drop_ws
+        .send(Message::text(
+            json!({
+                "type":"response.create",
+                "model":"gpt-ws-client-drop",
+                "input":[{"role":"user","content":"drop"}]
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    let created = client_drop_ws.next().await.unwrap().unwrap();
+    assert!(matches!(created, Message::Text(_)));
+    drop(client_drop_ws);
+    let client_dropped = wait_for_envelope(&vault, client_drop_sid).await;
+    assert_eq!(client_dropped["response"]["complete"], false);
+
+    let overlap_sid = "019f1234-5678-7abc-8def-0123456789b5";
+    let mut overlap_request = format!("ws://127.0.0.1:{codex_port}/responses")
+        .into_client_request()
+        .unwrap();
+    overlap_request
+        .headers_mut()
+        .insert("session-id", overlap_sid.parse().unwrap());
+    let (mut overlap_ws, _) = tokio_tungstenite::connect_async(overlap_request)
+        .await
+        .unwrap();
+    overlap_ws
+        .send(Message::text(
+            json!({
+                "type":"response.create",
+                "model":"gpt-ws-overlap",
+                "input":[{"role":"user","content":"first"}]
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        overlap_ws.next().await.unwrap().unwrap(),
+        Message::Text(_)
+    ));
+    overlap_ws
+        .send(Message::text(
+            json!({
+                "type":"response.create",
+                "model":"gpt-ws-overlap",
+                "input":[{"role":"user","content":"second"}]
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    let overlap = wait_for_envelope(&vault, overlap_sid).await;
+    assert_eq!(overlap["response"]["complete"], false);
+    assert!(!overlap["response"]["sse"]
+        .as_str()
+        .unwrap()
+        .contains("response.completed"));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let overlap_turns = std::fs::read_to_string(
+        session_dir(&vault, overlap_sid)
+            .unwrap()
+            .join("turns.jsonl"),
+    )
+    .unwrap();
+    assert_eq!(overlap_turns.lines().count(), 1);
+    let _ = overlap_ws.close(None).await;
+
+    let ambiguous_sid = "019f1234-5678-7abc-8def-0123456789ba";
+    let mut ambiguous_request = format!("ws://127.0.0.1:{codex_port}/responses")
+        .into_client_request()
+        .unwrap();
+    ambiguous_request
+        .headers_mut()
+        .insert("session-id", ambiguous_sid.parse().unwrap());
+    let (mut ambiguous_ws, _) = tokio_tungstenite::connect_async(ambiguous_request)
+        .await
+        .unwrap();
+    ambiguous_ws
+        .send(Message::text(
+            json!({
+                "type":"response.create",
+                "model":"gpt-ws-ambiguous",
+                "input":[{"role":"user","content":"first"}]
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        ambiguous_ws.next().await.unwrap().unwrap(),
+        Message::Text(_)
+    ));
+    ambiguous_ws
+        .send(Message::text(
+            json!({"type":"session.update","unexpected":true}).to_string(),
+        ))
+        .await
+        .unwrap();
+    let ambiguous = wait_for_envelope(&vault, ambiguous_sid).await;
+    assert_eq!(ambiguous["response"]["complete"], false);
+    assert!(!ambiguous["response"]["sse"]
+        .as_str()
+        .unwrap()
+        .contains("response.completed"));
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let ambiguous_turns = std::fs::read_to_string(
+        session_dir(&vault, ambiguous_sid)
+            .unwrap()
+            .join("turns.jsonl"),
+    )
+    .unwrap();
+    assert_eq!(ambiguous_turns.lines().count(), 1);
+    let _ = ambiguous_ws.close(None).await;
+
+    let binary_sid = "019f1234-5678-7abc-8def-0123456789bb";
+    let mut binary_request = format!("ws://127.0.0.1:{codex_port}/responses")
+        .into_client_request()
+        .unwrap();
+    binary_request
+        .headers_mut()
+        .insert("session-id", binary_sid.parse().unwrap());
+    let (mut binary_ws, _) = tokio_tungstenite::connect_async(binary_request)
+        .await
+        .unwrap();
+    binary_ws
+        .send(Message::text(
+            json!({
+                "type":"response.create",
+                "model":"gpt-ws-binary",
+                "input":[{"role":"user","content":"first"}]
+            })
+            .to_string(),
+        ))
+        .await
+        .unwrap();
+    assert!(matches!(
+        binary_ws.next().await.unwrap().unwrap(),
+        Message::Text(_)
+    ));
+    binary_ws
+        .send(Message::Binary(Bytes::from_static(&[0, 255, 7])))
+        .await
+        .unwrap();
+    let binary = wait_for_envelope(&vault, binary_sid).await;
+    assert_eq!(binary["response"]["complete"], false);
+    assert!(!binary["response"]["sse"]
+        .as_str()
+        .unwrap()
+        .contains("response.completed"));
+    for _ in 0..100 {
+        if websocket_observations
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|observation| observation["upstream_binary"] == json!([0, 255, 7]))
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(websocket_observations
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|observation| observation["upstream_binary"] == json!([0, 255, 7])));
+    let binary_turns =
+        std::fs::read_to_string(session_dir(&vault, binary_sid).unwrap().join("turns.jsonl"))
+            .unwrap();
+    assert_eq!(binary_turns.lines().count(), 1);
+    let _ = binary_ws.close(None).await;
+
+    for _ in 0..100 {
+        if websocket_observations
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|observation| observation["upstream_pong"] == "upstream")
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let observations = websocket_observations.lock().unwrap().clone();
+    let relayed: Vec<&Value> = observations
+        .iter()
+        .filter(|observation| observation.get("body").is_some())
+        .collect();
+    assert_eq!(relayed.len(), 10);
+    let warmup = relayed
+        .iter()
+        .find(|observation| observation["body"]["generate"] == false)
+        .unwrap();
+    assert_eq!(warmup["path"], "/responses");
+    assert_eq!(warmup["authorization"], "Bearer ws-test");
+    assert_eq!(warmup["session_id"], ws_sid);
+    assert_eq!(warmup["body"]["type"], "response.create");
+    assert!(
+        observations
+            .iter()
+            .any(|observation| observation["upstream_pong"] == "upstream"),
+        "Plant must service the upstream ping"
+    );
+
     // -- exact terminal certification controls, through the same upstream,
     // proxy, persistence, and OTLP paths as the primary self-test requests --
     let claude_control = |sid: &str, fixture: &str| {
@@ -594,6 +1188,12 @@ pub async fn self_test() {
     };
     assert_eq!(request_count("claude-code", "m", true), 3);
     assert_eq!(request_count("codex", "gpt-test", true), 1);
+    assert_eq!(request_count("codex", "gpt-ws", true), 2);
+    assert_eq!(request_count("codex", "gpt-ws-interrupted", false), 1);
+    assert_eq!(request_count("codex", "gpt-ws-client-drop", false), 1);
+    assert_eq!(request_count("codex", "gpt-ws-overlap", false), 1);
+    assert_eq!(request_count("codex", "gpt-ws-ambiguous", false), 1);
+    assert_eq!(request_count("codex", "gpt-ws-binary", false), 1);
     assert_eq!(request_count("claude-code", "control", true), 1);
     assert_eq!(request_count("claude-code", "control", false), 3);
     assert_eq!(request_count("codex", "control", false), 1);
@@ -606,7 +1206,7 @@ pub async fn self_test() {
             .as_array()
             .unwrap()
             .len(),
-        9
+        16
     );
     assert_eq!(
         point_attrs(&log_export["body"]["resourceLogs"][0]["resource"])["loki.resource.labels"],
