@@ -301,5 +301,11 @@ mod tests {
         for case in ["torn stream", "client disconnect"] {
             assert!(!claude.response_complete(&events, false), "{case}");
         }
+
+        let codex = codex();
+        let events = vaultr::recon::parse_sse(r#"data: {"type":"response.completed"}"#);
+        for case in ["torn stream", "client disconnect"] {
+            assert!(!codex.response_complete(&events, false), "{case}");
+        }
     }
 }
