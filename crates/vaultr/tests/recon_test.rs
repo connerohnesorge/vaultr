@@ -59,6 +59,45 @@ fn malformed_lineage_fails_with_location_only() {
 }
 
 #[test]
+fn show_rejects_impossible_lineage_before_printing() {
+    let root = tempfile::tempdir().unwrap();
+    let id = uuid::Uuid::new_v4().to_string();
+    let meta = root.path().join(".meta");
+    let session = root.path().join("2026/07/20").join(&id);
+    fs::create_dir_all(&meta).unwrap();
+    fs::create_dir_all(&session).unwrap();
+    fs::write(
+        meta.join(format!("{id}.json")),
+        r#"{"original_start":"2026-07-20T00:00:00Z"}"#,
+    )
+    .unwrap();
+    fs::copy(
+        fixture("malformed_prefix.jsonl"),
+        session.join("turns.jsonl"),
+    )
+    .unwrap();
+
+    for stats in [false, true] {
+        let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_vaultr"));
+        command
+            .arg("--vault")
+            .arg(root.path())
+            .args(["session", "show", &id]);
+        if stats {
+            command.arg("--stats");
+        }
+        let output = command.output().unwrap();
+        let error = String::from_utf8_lossy(&output.stderr);
+
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty(), "show printed partial output");
+        assert!(error.contains("reconstruct: raw record 1"), "{error}");
+        assert!(error.contains("invalid append history lineage"), "{error}");
+        assert!(!error.contains("CAPTURE_SECRET"), "{error}");
+    }
+}
+
+#[test]
 fn streaming_visitor_errors_keep_record_location() {
     let err = recon::for_each_envelope(&fixture("claude_append.jsonl"), |_| {
         Err(anyhow::anyhow!("visitor rejected envelope"))
