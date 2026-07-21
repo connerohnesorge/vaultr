@@ -770,6 +770,7 @@ fn fork_envelope_harness_outranks_stale_meta() {
         &history,
         Some(&workdir.path().to_string_lossy()),
     );
+    set_fixture_model(root.path(), &id, "codex-source-model");
     let out = fork::fork(
         root.path(),
         &id,
@@ -783,6 +784,12 @@ fn fork_envelope_harness_outranks_stale_meta() {
     assert_eq!(
         recs[0]["payload"]["base_instructions"]["text"],
         "You are Codex, an agent based on GPT-5. ..."
+    );
+    let turn_context = recs.iter().find(|r| r["type"] == "turn_context").unwrap();
+    assert_eq!(turn_context["payload"]["model"], "codex-source-model");
+    assert_eq!(
+        turn_context["payload"]["collaboration_mode"]["settings"]["model"],
+        "codex-source-model"
     );
     // … and the opaque reasoning item survives verbatim (translate drops it).
     let reasoning: Vec<&Value> = recs
