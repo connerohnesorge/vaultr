@@ -4,7 +4,7 @@ use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 fn temp(name: &str) -> PathBuf {
     std::env::temp_dir().join(format!(
@@ -259,16 +259,17 @@ fn claim(home: &Path, sessions: &Path, learner: &str) -> Output {
         .unwrap()
 }
 
-fn barrier_claim(home: &Path, sessions: &Path, ready: &Path, gate: &Path) -> Child {
+fn barrier_claim(home: &Path, sessions: &Path, learner: &str, ready: &Path, gate: &Path) -> Child {
     Command::new("/bin/sh")
         .args([
             "-c",
             "touch \"$READY\"; while [ ! -e \"$GATE\" ]; do sleep 0.01; done; \
-             exec \"$PLANT\" sessions eligible --learner claude --idle 0s --claim 1h",
+             exec \"$PLANT\" sessions eligible --learner \"$LEARNER\" --idle 0s --claim 1h",
         ])
         .env("READY", ready)
         .env("GATE", gate)
         .env("PLANT", env!("CARGO_BIN_EXE_plant"))
+        .env("LEARNER", learner)
         .env("HOME", home)
         .env("VAULT_SESSIONS", sessions)
         .stdout(Stdio::piped())
@@ -289,8 +290,8 @@ fn learner_claim_is_cross_process_atomic_independent_and_recovers_after_expiry()
     let gate = root.join("gate");
     let ready_a = root.join("ready-a");
     let ready_b = root.join("ready-b");
-    let first = barrier_claim(&home, &sessions, &ready_a, &gate);
-    let second = barrier_claim(&home, &sessions, &ready_b, &gate);
+    let first = barrier_claim(&home, &sessions, "claude", &ready_a, &gate);
+    let second = barrier_claim(&home, &sessions, "claude", &ready_b, &gate);
     for _ in 0..500 {
         if ready_a.exists() && ready_b.exists() {
             break;
@@ -346,6 +347,89 @@ fn learner_claim_is_cross_process_atomic_independent_and_recovers_after_expiry()
     let recovered = claim(&home, &sessions, "claude");
     assert_eq!(recovered.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&recovered.stdout).contains("claimable"));
+
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn learner_claims_are_independent_across_concurrent_learners() {
+    let root = temp("learner-claim-independent");
+    let home = root.join("home");
+    let sessions = root.join("vault/sessions");
+    fs::create_dir_all(&home).unwrap();
+    let learnings = root.join("vault/learnings");
+    fs::create_dir_all(&learnings).unwrap();
+    create_session(&sessions, "claimable");
+
+    let claude_lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(learnings.join(".inflight-claude.json.lock"))
+        .unwrap();
+    claude_lock.lock().unwrap();
+
+    let gate = root.join("gate");
+    let ready_claude = root.join("ready-claude");
+    let mut claude = barrier_claim(&home, &sessions, "claude", &ready_claude, &gate);
+    for _ in 0..500 {
+        if ready_claude.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(ready_claude.exists(), "subprocess barrier was not reached");
+    fs::write(&gate, "").unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        claude.try_wait().unwrap().is_none(),
+        "Claude claim did not wait for its held learner lock"
+    );
+
+    let ready_codex = root.join("ready-codex");
+    let mut codex = barrier_claim(&home, &sessions, "codex", &ready_codex, &gate);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if codex.try_wait().unwrap().is_some() {
+            break;
+        }
+        if Instant::now() >= deadline {
+            codex.kill().unwrap();
+            let output = codex.wait_with_output().unwrap();
+            panic!(
+                "Codex claim waited on Claude's learner lock: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let expected = sessions.join("2026/07/20/claimable");
+    let codex = codex.wait_with_output().unwrap();
+    assert_eq!(codex.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(codex.stdout).unwrap().trim(),
+        expected.to_string_lossy()
+    );
+    assert!(
+        claude.try_wait().unwrap().is_none(),
+        "Codex claim must not release Claude's learner lock"
+    );
+
+    drop(claude_lock);
+    let claude = claude.wait_with_output().unwrap();
+    assert_eq!(claude.status.code(), Some(0));
+    assert_eq!(
+        String::from_utf8(claude.stdout).unwrap().trim(),
+        expected.to_string_lossy()
+    );
+    for learner in ["claude", "codex"] {
+        let lease =
+            fs::read_to_string(learnings.join(format!(".inflight-{learner}.json"))).unwrap();
+        let lease: serde_json::Value = serde_json::from_str(&lease).unwrap();
+        assert_eq!(lease["sids"], serde_json::json!(["claimable"]));
+    }
 
     fs::remove_dir_all(root).unwrap();
 }
