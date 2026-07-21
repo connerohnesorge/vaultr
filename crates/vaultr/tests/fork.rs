@@ -481,19 +481,27 @@ fn fork_canonicalizes_relative_and_symlink_cwds() {
         .unwrap();
     let relative_path = relative.path().strip_prefix(&current).unwrap();
     let (root, id) = fixture_vault("claude-code", &sample_messages(), None);
-    let out = fork::fork(
-        root.path(),
-        &id,
-        Target::Claude,
-        &opts(Some(relative_path.to_path_buf()), cfg.path(), cfg.path()),
-    )
-    .unwrap();
     let canonical = relative.path().canonicalize().unwrap();
-    assert_eq!(out.cwd, canonical);
-    assert_eq!(
-        out.path.parent().unwrap().file_name().unwrap(),
-        claude_writer::encode_project_dir(&canonical.to_string_lossy()).as_str()
-    );
+    for target in [Target::Claude, Target::Codex] {
+        let out = fork::fork(
+            root.path(),
+            &id,
+            target,
+            &opts(Some(relative_path.to_path_buf()), cfg.path(), cfg.path()),
+        )
+        .unwrap();
+        assert_eq!(out.cwd, canonical);
+        match target {
+            Target::Claude => assert_eq!(
+                out.path.parent().unwrap().file_name().unwrap(),
+                claude_writer::encode_project_dir(&canonical.to_string_lossy()).as_str()
+            ),
+            Target::Codex => assert_eq!(
+                read_jsonl(&out.path)[0]["payload"]["cwd"],
+                canonical.to_string_lossy().as_ref()
+            ),
+        }
+    }
 
     #[cfg(unix)]
     {
@@ -502,19 +510,27 @@ fn fork_canonicalizes_relative_and_symlink_cwds() {
         let link = links.path().join("linked-cwd");
         std::os::unix::fs::symlink(real.path(), &link).unwrap();
         let (root, id) = fixture_vault("claude-code", &sample_messages(), None);
-        let out = fork::fork(
-            root.path(),
-            &id,
-            Target::Claude,
-            &opts(Some(link), cfg.path(), cfg.path()),
-        )
-        .unwrap();
         let canonical = real.path().canonicalize().unwrap();
-        assert_eq!(out.cwd, canonical);
-        assert_eq!(
-            out.path.parent().unwrap().file_name().unwrap(),
-            claude_writer::encode_project_dir(&canonical.to_string_lossy()).as_str()
-        );
+        for target in [Target::Claude, Target::Codex] {
+            let out = fork::fork(
+                root.path(),
+                &id,
+                target,
+                &opts(Some(link.clone()), cfg.path(), cfg.path()),
+            )
+            .unwrap();
+            assert_eq!(out.cwd, canonical);
+            match target {
+                Target::Claude => assert_eq!(
+                    out.path.parent().unwrap().file_name().unwrap(),
+                    claude_writer::encode_project_dir(&canonical.to_string_lossy()).as_str()
+                ),
+                Target::Codex => assert_eq!(
+                    read_jsonl(&out.path)[0]["payload"]["cwd"],
+                    canonical.to_string_lossy().as_ref()
+                ),
+            }
+        }
     }
 }
 
