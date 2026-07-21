@@ -49,13 +49,14 @@ fn coverage(root: &Path, sid: &str) -> Output {
 }
 
 #[test]
-fn coverage_cli_rejects_unsupported_empty_and_all_carryover_denominators() {
+fn coverage_cli_rejects_zero_denominators_and_preserves_supported_percentages() {
     let root = std::env::temp_dir().join(format!("plant-coverage-cli-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let codex = "00000000-0000-4000-8000-000000000028";
     let empty = "00000000-0000-4000-8000-000000000029";
     let complete = "00000000-0000-4000-8000-000000000030";
     let carryover = "00000000-0000-4000-8000-000000000031";
+    let partial = "00000000-0000-4000-8000-000000000032";
     add_session(&root, codex, "codex", &["req_codex"]);
     add_session(&root, empty, "claude-code", &["req_captured"]);
     std::fs::write(
@@ -64,6 +65,15 @@ fn coverage_cli_rejects_unsupported_empty_and_all_carryover_denominators() {
     )
     .unwrap();
     add_session(&root, complete, "claude-code", &["req_A", "req_B"]);
+    add_session(&root, partial, "claude-code", &["req_A"]);
+    std::fs::write(
+        root.join(format!("{partial}.transcript.jsonl")),
+        concat!(
+            "{\"type\":\"assistant\",\"requestId\":\"req_A\",\"timestamp\":\"2026-07-17T19:00:00.000Z\"}\n",
+            "{\"type\":\"assistant\",\"requestId\":\"req_B\",\"timestamp\":\"2026-07-17T19:01:00.000Z\"}\n",
+        ),
+    )
+    .unwrap();
     add_session(&root, carryover, "claude-code", &["req_old"]);
     std::fs::write(
         root.join(format!("{carryover}.transcript.jsonl")),
@@ -91,6 +101,13 @@ fn coverage_cli_rejects_unsupported_empty_and_all_carryover_denominators() {
     let output = coverage(&root, complete);
     assert_eq!(output.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&output.stdout).contains("coverage 100.0% (2/2 in-window)"));
+
+    let output = coverage(&root, partial);
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("coverage 50.0% (1/2 in-window)"));
+    assert!(stdout.contains("req_B"));
+    assert!(output.stderr.is_empty());
 
     std::fs::remove_dir_all(root).unwrap();
 }
