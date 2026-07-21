@@ -171,6 +171,7 @@ fn losing_process_does_not_recover_an_incumbents_vault() {
         .unwrap();
     wait_healthy(claude_port, codex_port);
     let evidence = recovery_fixture(&sessions);
+    let state_before = fs::read(evidence.join("state.json")).unwrap();
 
     let loser = command(&home, &sessions, claude_port, codex_port)
         .output()
@@ -188,6 +189,7 @@ fn losing_process_does_not_recover_an_incumbents_vault() {
     let state: serde_json::Value =
         serde_json::from_str(&fs::read_to_string(evidence.join("state.json")).unwrap()).unwrap();
     assert_eq!(state["capture_order"]["next_to_drain"], 0);
+    assert_eq!(fs::read(evidence.join("state.json")).unwrap(), state_before);
 
     stop(&mut incumbent);
     fs::remove_dir_all(root).unwrap();
@@ -206,6 +208,7 @@ fn partial_port_collision_fails_releases_listener_and_preserves_evidence() {
     let codex_port = dummy.local_addr().unwrap().port();
     drop(claude_probe);
     let evidence = recovery_fixture(&sessions);
+    let state_before = fs::read(evidence.join("state.json")).unwrap();
 
     let loser = command(&home, &sessions, claude_port, codex_port)
         .output()
@@ -223,6 +226,7 @@ fn partial_port_collision_fails_releases_listener_and_preserves_evidence() {
         fs::read_to_string(evidence.join("turns.jsonl")).unwrap(),
         ""
     );
+    assert_eq!(fs::read(evidence.join("state.json")).unwrap(), state_before);
 
     drop(dummy);
     fs::remove_dir_all(root).unwrap();
