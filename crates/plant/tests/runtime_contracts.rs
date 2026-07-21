@@ -89,6 +89,35 @@ fn cli_grammar_subprocess_table_keeps_daemon_bare_and_rejects_every_other_miss()
     fs::create_dir_all(home.join(".dotfiles")).unwrap();
     fs::create_dir_all(home.join(".local/bin")).unwrap();
     fs::create_dir_all(&sessions).unwrap();
+    let recovery = sessions.join("2026/07/20/00000000-0000-4000-8000-000000000025");
+    fs::create_dir_all(&recovery).unwrap();
+    let turns = recovery.join("turns.jsonl");
+    fs::write(&turns, "").unwrap();
+    let request = serde_json::json!({
+        "schema_version": 1,
+        "request_id": "00000000-0000-4000-8000-000000000125",
+        "session_id": "00000000-0000-4000-8000-000000000025",
+        "request": {"body_delta": {"history": {
+            "key": "messages", "prefix_length": 0, "append": []
+        }}}
+    });
+    fs::write(
+        recovery.join("state.json"),
+        serde_json::json!({
+            "schema_version": 1,
+            "harness": "claude-code",
+            "session_id": "00000000-0000-4000-8000-000000000025",
+            "request_body": {},
+            "capture_order": {
+                "next_sequence": 1,
+                "next_to_drain": 0,
+                "pending": {"0": request},
+                "root": fs::canonicalize(&sessions).unwrap().display().to_string(),
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
     write_executable(
         &home.join(".local/bin/herdr"),
         "#!/bin/sh\necho called >> \"$HOME/herdr-called\"\nexit 1\n",
@@ -188,6 +217,12 @@ fn cli_grammar_subprocess_table_keeps_daemon_bare_and_rejects_every_other_miss()
             );
             assert!(!home.join("herdr-called").exists());
             assert!(!home.join(".local/state/plant/job-sids.txt").exists());
+            assert_eq!(
+                fs::metadata(&turns).unwrap().len(),
+                0,
+                "{} ran recovery",
+                case.name
+            );
         }
         if case.name == "bare daemon" {
             assert!(String::from_utf8_lossy(&output.stdout)
