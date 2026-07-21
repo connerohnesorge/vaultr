@@ -55,7 +55,7 @@ fn stage(dir: &Path, envelope: Value) -> Stage {
 }
 
 #[test]
-fn strict_loader_accepts_valid_legacy_and_requires_every_order_field() {
+fn strict_loader_accepts_supported_legacy_and_requires_every_order_field() {
     let dir = test_dir("journal-shape");
     let sid = "00000000-0000-4000-8000-000000000041";
     for invalid in [b"{".as_slice(), b"[]".as_slice()] {
@@ -77,6 +77,15 @@ fn strict_loader_accepts_valid_legacy_and_requires_every_order_field() {
 
     let valid_legacy: Value =
         serde_json::from_slice(&fs::read(dir.join("state.json")).unwrap()).unwrap();
+    let mut content_addressed_legacy = valid_legacy.clone();
+    content_addressed_legacy["schema_version"] = json!(2);
+    fs::write(
+        dir.join("state.json"),
+        serde_json::to_vec(&content_addressed_legacy).unwrap(),
+    )
+    .unwrap();
+    assert!(Journal::load(&dir, sid).unwrap().order.is_none());
+
     for missing in ["schema_version", "harness", "session_id", "request_body"] {
         let mut value = valid_legacy.clone();
         value.as_object_mut().unwrap().remove(missing);

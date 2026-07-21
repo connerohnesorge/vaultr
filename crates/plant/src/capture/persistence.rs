@@ -165,8 +165,10 @@ impl Journal {
 }
 
 fn validate_state(state: &Map<String, Value>, path: &Path, sid: &str) -> Result<(), String> {
-    if state.get("schema_version").and_then(Value::as_u64) != Some(1)
-        || state.get("harness").and_then(Value::as_str).is_none()
+    if !matches!(
+        state.get("schema_version").and_then(Value::as_u64),
+        Some(1 | 2)
+    ) || state.get("harness").and_then(Value::as_str).is_none()
         || state.get("session_id").and_then(Value::as_str) != Some(sid)
         || !state.contains_key("request_body")
     {
