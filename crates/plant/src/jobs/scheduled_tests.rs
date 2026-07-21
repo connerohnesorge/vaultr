@@ -193,6 +193,18 @@ async fn scheduled_record_failure_blocks_the_next_dispatch() {
     );
     std::fs::remove_file(state.join("jobs")).unwrap();
     std::fs::create_dir_all(state.join("jobs")).unwrap();
+    let fence: AttemptFence = serde_json::from_slice(
+        &std::fs::read(state.join("job-attempts/record-fails.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(!fence.retryable);
+    match begin_scheduled_attempt(&job).unwrap() {
+        ScheduledAttemptStart::Blocked(detail) => assert_eq!(
+            detail,
+            format!("attempt {} has no durable final outcome", fence.id)
+        ),
+        _ => panic!("retained attempt fence must block the next scheduler cycle"),
+    }
     assert_eq!(
         dispatch_scheduled(&job, &sessions, &semaphore, SCRIPT_BACKSTOP).await,
         ScheduledDispatch::Blocked
