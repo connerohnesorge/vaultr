@@ -741,7 +741,7 @@ async fn incomplete_recovery_reconciles_complete_and_prefix_retries() {
 }
 
 #[tokio::test]
-async fn incomplete_recovery_rejects_conflicting_capture_without_mutation() {
+async fn incomplete_recovery_conflict_preserves_capture_journal_and_stage() {
     let (_guard, vault) = set_home();
     let adapter = claude_adapter();
     let sid = uuid::Uuid::new_v4().to_string();
@@ -758,11 +758,23 @@ async fn incomplete_recovery_rejects_conflicting_capture_without_mutation() {
     let capture_before = serde_json::to_vec(&conflicting).unwrap();
     fs::write(&turns, [&capture_before[..], b"\n"].concat()).unwrap();
     let journal_before = fs::read(&state).unwrap();
+    let stages = staging_dir(&pending.root, &sid);
 
-    assert!(recover_all(&vault).is_err());
+    assert!(!stages.exists());
+    assert_eq!(
+        recover_all(&vault).unwrap_err(),
+        "capture commit: committed envelope conflicts with stage"
+    );
     assert_eq!(
         fs::read(&turns).unwrap(),
         [&capture_before[..], b"\n"].concat()
     );
     assert_eq!(fs::read(&state).unwrap(), journal_before);
+    let staged = fs::read_dir(stages)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(staged.len(), 1, "durable recovery evidence remains");
+    let staged: Value = serde_json::from_slice(&fs::read(&staged[0]).unwrap()).unwrap();
+    assert_eq!(staged["envelope"]["response"]["complete"], false);
 }
