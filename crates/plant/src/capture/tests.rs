@@ -669,7 +669,15 @@ async fn recovery_uses_the_discovered_relocated_session_path() {
 #[tokio::test]
 async fn recovery_requires_stage_root_sequence_and_envelope_identity() {
     let (_guard, vault) = set_home();
-    for case in ["missing-root", "wrong-root", "missing-request-id"] {
+    for case in [
+        "missing-root",
+        "wrong-root",
+        "wrong-sequence",
+        "missing-request-id",
+        "wrong-file-request-id",
+        "wrong-envelope-request-id",
+        "wrong-envelope-session-id",
+    ] {
         let adapter = claude_adapter();
         let sid = uuid::Uuid::new_v4().to_string();
         let pending = prepare_capture(&vault, &adapter, captured(Some(&sid)), body(&["a"]))
@@ -687,21 +695,39 @@ async fn recovery_requires_stage_root_sequence_and_envelope_identity() {
             "request_id": request_id,
             "envelope": envelope,
         });
+        let mut file_request_id = request_id.clone();
         match case {
             "missing-root" => {
                 document.as_object_mut().unwrap().remove("root");
             }
             "wrong-root" => document["root"] = json!("/another/vault"),
+            "wrong-sequence" => document["sequence"] = json!(pending.sequence + 1),
             "missing-request-id" => {
                 document.as_object_mut().unwrap().remove("request_id");
+            }
+            "wrong-file-request-id" => file_request_id = uuid::Uuid::new_v4().to_string(),
+            "wrong-envelope-request-id" => {
+                document["envelope"]["request_id"] = json!(uuid::Uuid::new_v4().to_string());
+            }
+            "wrong-envelope-session-id" => {
+                document["envelope"]["session_id"] = json!(uuid::Uuid::new_v4().to_string());
             }
             _ => unreachable!(),
         }
         let stage = staging_dir(&canonical_root(&vault), &sid)
-            .join(format!("{}-{request_id}.json", pending.sequence));
+            .join(format!("{}-{file_request_id}.json", pending.sequence));
         crate::fsutil::atomic_replace(&stage, document.to_string().as_bytes()).unwrap();
 
-        assert!(recover_all(&vault).is_err(), "{case} must fail closed");
+        let error = recover_all(&vault).unwrap_err();
+        let expected = match case {
+            "missing-root" | "wrong-root" | "wrong-sequence" => "root or sequence mismatch",
+            "missing-request-id" => "missing request identity",
+            "wrong-file-request-id" | "wrong-envelope-request-id" | "wrong-envelope-session-id" => {
+                "envelope identity mismatch"
+            }
+            _ => unreachable!(),
+        };
+        assert!(error.contains(expected), "{case}: {error}");
         assert!(stage.exists(), "{case} evidence must remain");
         assert!(turns_lines(&pending.dir).is_empty());
         fs::remove_dir_all(staging_dir(&canonical_root(&vault), &sid)).unwrap();
