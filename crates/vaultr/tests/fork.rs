@@ -20,9 +20,11 @@ fn sample_messages() -> Vec<Value> {
         ]}),
         json!({"role": "assistant", "content": [
             {"type": "text", "text": "hi", "cache_control": {"type": "ephemeral"}},
-            {"type": "tool_use", "id": "toolu_abc", "name": "Bash", "input": {
+            {"type": "tool_use", "id": "toolu_abc", "name": "Bash",
+             "cache_control": {"type": "ephemeral"}, "input": {
                 "command": "ls",
-                "cache_control": {"opaque": ["nested", 7]}
+                "cache_control": {"opaque": ["nested", 7]},
+                "payload": {"cache_control": {"keep": "deeper"}}
             }}
         ]}),
         json!({"role": "user", "content": [
@@ -135,7 +137,13 @@ fn claude_empty_history_writes_nothing() {
 // user message whose content is a single bare text block collapses to a string.
 fn stored_form(m: &Value) -> Value {
     let mut v = m.clone();
-    v["content"] = claude_writer::strip_cache_control(v["content"].clone());
+    if let Some(blocks) = v["content"].as_array_mut() {
+        for block in blocks {
+            if let Some(block) = block.as_object_mut() {
+                block.remove("cache_control");
+            }
+        }
+    }
     let is_user = v["role"] == "user";
     let content = &v["content"];
     if is_user {
@@ -174,9 +182,12 @@ fn claude_passthrough_strips_cache_control_only() {
     assert!(conv[1]["message"]["content"][0]
         .get("cache_control")
         .is_none());
+    assert!(conv[1]["message"]["content"][1]
+        .get("cache_control")
+        .is_none());
     assert_eq!(
-        conv[1]["message"]["content"][1]["input"]["cache_control"],
-        json!({"opaque": ["nested", 7]})
+        conv[1]["message"]["content"][1]["input"], msgs[1]["content"][1]["input"],
+        "opaque tool input must remain byte-identical"
     );
 }
 
