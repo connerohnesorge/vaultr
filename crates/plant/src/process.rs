@@ -232,6 +232,8 @@ mod tests {
 
         let result = run(&["/bin/sh", "-c", &script], Duration::from_millis(200)).await;
         assert_eq!(result.end, RunEnd::TimedOut);
+        assert!(!result.ok);
+        assert_eq!(result.failure_detail(), "timed out");
         let pid: i32 = std::fs::read_to_string(&pid_path)
             .expect("child published its pid before timeout")
             .trim()
@@ -246,6 +248,39 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(1100)).await;
         assert!(!marker.exists(), "delayed child effect occurred");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn ordinary_outcomes_keep_their_output_and_exit_classification() {
+        let success = run(
+            &["/bin/sh", "-c", "printf success; printf warning >&2"],
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(success.ok);
+        assert_eq!(success.end, RunEnd::Exited(Some(0)));
+        assert_eq!(success.out, "success");
+        assert_eq!(success.stderr, "warning");
+
+        let nonzero = run(
+            &[
+                "/bin/sh",
+                "-c",
+                "printf partial; printf failed >&2; exit 23",
+            ],
+            Duration::from_secs(1),
+        )
+        .await;
+        assert!(!nonzero.ok);
+        assert_eq!(nonzero.end, RunEnd::Exited(Some(23)));
+        assert_eq!(nonzero.out, "partial");
+        assert_eq!(nonzero.failure_detail(), "exit 23: failed");
+
+        let spawn_error = run(&["/definitely/not/a/plant-command"], Duration::from_secs(1)).await;
+        assert!(!spawn_error.ok);
+        assert_eq!(spawn_error.end, RunEnd::SpawnFailed);
+        assert!(spawn_error.out.is_empty());
+        assert!(spawn_error.failure_detail().starts_with("spawn failed:"));
     }
 
     #[tokio::test]
