@@ -230,17 +230,24 @@ mod tests {
     }
 
     #[test]
-    fn streams_mixed_generations_from_either_sibling() {
+    fn streams_every_mixed_generation_from_any_sibling() {
         let raw = format!(
             "{}\n{{\"harness\":\"claude-code\"",
-            envelope("2026-07-17T19:20:00.000Z", "req_C")
+            envelope("2026-07-17T19:20:00.000Z", "req_D")
         );
-        let transcript = ["req_A", "req_B", "req_C", "req_MISSING_1", "req_MISSING_2"]
-            .into_iter()
-            .enumerate()
-            .map(|(i, rid)| assistant(&format!("2026-07-17T19:{i:02}:00.000Z"), rid))
-            .collect::<Vec<_>>()
-            .join("\n")
+        let transcript = [
+            "req_A",
+            "req_B",
+            "req_C",
+            "req_D",
+            "req_MISSING_1",
+            "req_MISSING_2",
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, rid)| assistant(&format!("2026-07-17T19:{i:02}:00.000Z"), rid))
+        .collect::<Vec<_>>()
+        .join("\n")
             + "\n";
         let root = fixture("mixed", true, &raw, &transcript);
         let dir = root.join("2026/07/17/cov00000-0000-4000-8000-000000000000");
@@ -250,13 +257,17 @@ mod tests {
             envelope("2026-07-17T19:00:00.000Z", "req_A"),
             envelope("2026-07-17T19:10:00.000Z", "req_B"),
         );
-        std::fs::write(
-            &sealed,
-            zstd::encode_all(sealed_body.as_bytes(), 1).unwrap(),
-        )
-        .unwrap();
+        let sealed_body = zstd::encode_all(sealed_body.as_bytes(), 1).unwrap();
+        std::fs::write(&sealed, &sealed_body).unwrap();
+        let detached_body = envelope("2026-07-17T19:15:00.000Z", "req_C") + "\n";
+        let detached = dir.join(format!(
+            "turns.jsonl.sealing-{}-{}",
+            sealed_body.len(),
+            vaultr::vault::sha256_hex(detached_body.as_bytes())
+        ));
+        std::fs::write(&detached, detached_body).unwrap();
 
-        for entry in [&dir.join("turns.jsonl"), &sealed] {
+        for entry in [&dir.join("turns.jsonl"), &sealed, &detached] {
             let mut ids = vec![];
             vaultr::recon::for_each_envelope(entry, |env| {
                 if let Some(id) = env
@@ -268,11 +279,11 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-            assert_eq!(ids, ["req_A", "req_B", "req_C"]);
+            assert_eq!(ids, ["req_A", "req_B", "req_C", "req_D"]);
         }
 
         let result = coverage(&root, "cov00000").unwrap();
-        assert_eq!(result.captured, 3);
+        assert_eq!(result.captured, 4);
         assert_eq!(
             result.missing,
             ["req_MISSING_1".to_string(), "req_MISSING_2".to_string()]
