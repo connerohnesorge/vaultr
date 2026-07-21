@@ -159,7 +159,15 @@ function inspectDescriptor(
     throw new Error(`not a regular file beneath canonical root: ${relativePath}`);
   }
   const stat = stableStat(raw);
-  const canonicalPath = realpathSync(descriptorPath(fd));
+  let canonicalPath: string;
+  try {
+    canonicalPath = realpathSync(descriptorPath(fd));
+  } catch (error) {
+    throw new StableFileIdentityError(
+      `opened file identity changed while open: ${relativePath}`,
+      { cause: error },
+    );
+  }
   if (!isBeneath(canonicalRoot, canonicalPath)) {
     throw new Error(`opened file escapes canonical root: ${relativePath}`);
   }
@@ -182,7 +190,15 @@ function inspectDescriptor(
       `lexical file identity changed while open: ${relativePath}`,
     );
   }
-  const lexicalCanonical = realpathSync(lexical);
+  let lexicalCanonical: string;
+  try {
+    lexicalCanonical = realpathSync(lexical);
+  } catch (error) {
+    throw new StableFileIdentityError(
+      `lexical file identity changed while open: ${relativePath}`,
+      { cause: error },
+    );
+  }
   if (!isBeneath(canonicalRoot, lexicalCanonical) || lexicalCanonical !== canonicalPath) {
     throw new StableFileIdentityError(
       `lexical file escapes canonical root: ${relativePath}`,
