@@ -11,6 +11,10 @@ pub const HISTOGRAM_BOUNDS: [u64; 11] = [
     100, 250, 500, 1_000, 2_500, 5_000, 10_000, 30_000, 60_000, 120_000, 300_000,
 ];
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(5);
+// Token acquisition gets a larger, independent deadline: a cold `cnb auth token`
+// OIDC refresh under launchd exceeds the 5s OTLP request budget, and killing it
+// mid-refresh leaves the on-disk credential expired so every later flush restalls.
+const DEFAULT_TOKEN_TIMEOUT: Duration = Duration::from_secs(30);
 const RETRY_DELAY: Duration = Duration::from_millis(100);
 
 struct HistogramPoint {
@@ -33,6 +37,7 @@ pub struct Otel {
     pub endpoint: String,
     start_ns: String,
     timeout: Duration,
+    token_timeout: Duration,
     state: Mutex<State>,
 }
 
@@ -105,6 +110,11 @@ impl Otel {
                 .and_then(|value| value.parse().ok())
                 .map(Duration::from_millis)
                 .unwrap_or(DEFAULT_TIMEOUT),
+            token_timeout: std::env::var("VAULTR_OTEL_TOKEN_TIMEOUT_MS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .map(Duration::from_millis)
+                .unwrap_or(DEFAULT_TOKEN_TIMEOUT),
             state: Mutex::new(State {
                 tokens: HashMap::new(),
                 requests: HashMap::new(),
@@ -313,7 +323,7 @@ impl Otel {
                     .args(["auth", "token"])
                     .env("PATH", crate::process::augmented_path())
                     .kill_on_drop(true);
-                match tokio::time::timeout(self.timeout, command.output()).await {
+                match tokio::time::timeout(self.token_timeout, command.output()).await {
                     Ok(Ok(output)) if output.status.success() => {
                         String::from_utf8_lossy(&output.stdout).trim().to_string()
                     }
@@ -357,5 +367,30 @@ impl Otel {
             .unwrap()
             .logs
             .retain(|(id, _)| *id > through_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // token acquisition deadline is a distinct, larger budget than the OTLP
+    // request deadline, and is env-tunable without a rebuild.
+    #[test]
+    fn token_timeout_is_independent_and_configurable() {
+        assert_ne!(
+            DEFAULT_TOKEN_TIMEOUT, DEFAULT_TIMEOUT,
+            "token deadline must differ from the OTLP request deadline"
+        );
+
+        std::env::remove_var("VAULTR_OTEL_TOKEN_TIMEOUT_MS");
+        assert_eq!(Otel::new().token_timeout, DEFAULT_TOKEN_TIMEOUT);
+
+        std::env::set_var("VAULTR_OTEL_TOKEN_TIMEOUT_MS", "1234");
+        let otel = Otel::new();
+        assert_eq!(otel.token_timeout, Duration::from_millis(1234));
+        // the OTLP request deadline is not affected by the token override
+        assert_ne!(otel.token_timeout, otel.timeout);
+        std::env::remove_var("VAULTR_OTEL_TOKEN_TIMEOUT_MS");
     }
 }
