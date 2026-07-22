@@ -164,11 +164,19 @@ impl Adapter {
                     .and_then(|e| e.pointer("/response/usage"))
                     .cloned()
                     .unwrap_or(Value::Null);
+                // Responses-API usage: input_tokens is the TOTAL input; cached_tokens
+                // and cache_write_tokens are subsets of it (total = input + output).
+                // Subtract them so buckets don't overlap, matching Claude semantics.
+                let input_total = count(usage.get("input_tokens"));
+                let cached = count(usage.pointer("/input_tokens_details/cached_tokens"));
+                let cache_write = count(usage.pointer("/input_tokens_details/cache_write_tokens"));
                 TokenUsage {
-                    input: count(usage.get("input_tokens")),
+                    input: input_total
+                        .saturating_sub(cached)
+                        .saturating_sub(cache_write),
                     output: count(usage.get("output_tokens")),
-                    cache_read: count(usage.pointer("/input_tokens_details/cached_tokens")),
-                    cache_creation: 0,
+                    cache_read: cached,
+                    cache_creation: cache_write,
                 }
             }
         }
@@ -307,5 +315,30 @@ mod tests {
         for case in ["torn stream", "client disconnect"] {
             assert!(!codex.response_complete(&events, false), "{case}");
         }
+    }
+
+    #[test]
+    fn codex_cached_tokens_are_not_double_counted() {
+        // real capture values: cached_tokens is a subset of input_tokens
+        let events = vaultr::recon::parse_sse(
+            r#"data: {"type":"response.completed","response":{"usage":{"input_tokens":25296,"input_tokens_details":{"cache_write_tokens":0,"cached_tokens":24320},"output_tokens":18,"total_tokens":25314}}}"#,
+        );
+        let u = codex().usage(&events);
+        assert_eq!(u.input, 976); // 25296 - 24320 - 0
+        assert_eq!(u.cache_read, 24320);
+        assert_eq!(u.cache_creation, 0);
+        assert_eq!(u.output, 18);
+        // non-overlapping: buckets reconstruct the reported total input side
+        assert_eq!(u.input + u.cache_read + u.cache_creation, 25296);
+
+        // cache_write is captured (not dropped) and also excluded from input
+        let events = vaultr::recon::parse_sse(
+            r#"data: {"type":"response.completed","response":{"usage":{"input_tokens":1000,"input_tokens_details":{"cache_write_tokens":300,"cached_tokens":200},"output_tokens":5}}}"#,
+        );
+        let u = codex().usage(&events);
+        assert_eq!(u.input, 500);
+        assert_eq!(u.cache_read, 200);
+        assert_eq!(u.cache_creation, 300);
+        assert_eq!(u.input + u.cache_read + u.cache_creation, 1000);
     }
 }
