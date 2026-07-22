@@ -693,9 +693,11 @@ async fn dispatch_scheduled(
     semaphore: &tokio::sync::Semaphore,
     script_timeout: Duration,
 ) -> ScheduledDispatch {
-    // Recheck the durable ledger while holding the per-job cross-process
-    // flock, then publish the fence before waiting for capacity. A second
-    // daemon therefore cannot launch the same due period.
+    let Ok(_permit) = semaphore.acquire().await else {
+        return ScheduledDispatch::Blocked;
+    };
+    // Once capacity is admitted, hold the per-job cross-process flock across
+    // the durable cadence recheck, fence, execution, and final transition.
     let attempt = match begin_scheduled_attempt(job) {
         Ok(ScheduledAttemptStart::Ready(attempt)) => attempt,
         Ok(ScheduledAttemptStart::NotDue) => return ScheduledDispatch::NotDue,
@@ -707,9 +709,6 @@ async fn dispatch_scheduled(
             eprintln!("[job:{}] scheduled attempt failed: {error}", job.name);
             return ScheduledDispatch::Blocked;
         }
-    };
-    let Ok(_permit) = semaphore.acquire().await else {
-        return ScheduledDispatch::Blocked;
     };
     let started = SystemTime::now();
     let execution = execute_scheduled(job, vault, script_timeout).await;

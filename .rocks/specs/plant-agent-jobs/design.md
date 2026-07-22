@@ -19,14 +19,15 @@ Unkeyed callers retain the legacy human-output contract. Consumers MUST NOT
 reimplement either lifecycle; Vault Doors' typed client is described by
 `vault-doors/design.md` ADR-0003.
 
-### ADR-0002: Scheduled attempts are fenced before waiting or side effects
+### ADR-0002: Scheduled attempts fence only admitted execution
 
-A scheduled dispatch holds one per-job attempt guard from a locked durable
-cadence recheck, before semaphore waiting or any job side effect, through the
-typed action and exactly one durable final or retryable transition. If the
-guard or its state cannot be loaded or published safely, dispatch fails closed.
-This makes one due period one scheduled attempt even with concurrent schedulers
-or a long capacity wait, while a retryable result deliberately rearms it.
+A scheduled dispatch waits for process-local scheduler capacity without a durable attempt fence.
+Cancellation during capacity waiting therefore leaves no uncertain execution record.
+
+After admission, dispatch acquires the per-job attempt guard.
+The guard covers ledger verification, reconciliation, cadence recheck, fence publication, the scheduled action, and one durable final or retryable transition.
+If the guard or its state cannot be loaded or published safely, dispatch fails closed.
+Competing processes may each obtain local capacity, but the per-job flock serializes their durable cadence checks.
 
 The process deadline covers the direct child and both captured output drains,
 so a descendant retaining an output pipe cannot strand the guard. Capture work

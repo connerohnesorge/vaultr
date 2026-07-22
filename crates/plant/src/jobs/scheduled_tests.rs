@@ -2,6 +2,76 @@ use super::*;
 use std::os::unix::fs::PermissionsExt;
 
 #[tokio::test(flavor = "current_thread")]
+async fn capacity_wait_cancellation_leaves_no_attempt_fence() {
+    let root =
+        std::env::temp_dir().join(format!("plant-scheduled-cancel-{}", uuid::Uuid::new_v4()));
+    let state = root.join("state");
+    let sessions = root.join("vault/sessions");
+    let _state = crate::state::use_test_dir(state.clone());
+    let job = Job {
+        name: "waiting".to_string(),
+        path: root.join("waiting.1m.sh"),
+        every: Duration::from_secs(60),
+        action: JobAction::Script,
+    };
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(0));
+    let scheduled = tokio::spawn({
+        let semaphore = semaphore.clone();
+        async move { dispatch_scheduled(&job, &sessions, &semaphore, SCRIPT_BACKSTOP).await }
+    });
+
+    tokio::task::yield_now().await;
+    assert!(
+        !state.join("job-attempts/waiting.json").exists(),
+        "capacity waiting must remain outside the attempt fence"
+    );
+    scheduled.abort();
+    assert!(scheduled.await.unwrap_err().is_cancelled());
+    assert!(!state.join("job-attempts/waiting.json").exists());
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn concurrent_schedulers_execute_one_due_period() {
+    let root = std::env::temp_dir().join(format!("plant-scheduled-race-{}", uuid::Uuid::new_v4()));
+    let sessions = root.join("vault/sessions");
+    let state = root.join("state");
+    let calls = root.join("calls");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let _state = crate::state::use_test_dir(state.clone());
+    let _cwd = use_test_script_cwd(root.clone());
+    let script = root.join("concurrent.1m.sh");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\necho called >> '{}'\n", calls.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let job = Job {
+        name: "concurrent".to_string(),
+        path: script,
+        every: Duration::from_secs(60),
+        action: JobAction::Script,
+    };
+    let first_capacity = tokio::sync::Semaphore::new(1);
+    let second_capacity = tokio::sync::Semaphore::new(1);
+
+    let _ = tokio::join!(
+        dispatch_scheduled(&job, &sessions, &first_capacity, SCRIPT_BACKSTOP),
+        dispatch_scheduled(&job, &sessions, &second_capacity, SCRIPT_BACKSTOP),
+    );
+
+    assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 1);
+    assert_eq!(
+        std::fs::read_to_string(state.join("jobs/concurrent.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn dispatch_holds_one_guard_across_capacity_and_typed_execution() {
     let root = std::env::temp_dir().join(format!("plant-scheduled-{}", uuid::Uuid::new_v4()));
     let sessions = root.join("vault/sessions");
@@ -33,17 +103,11 @@ async fn dispatch_holds_one_guard_across_capacity_and_typed_execution() {
         async move { dispatch_scheduled(&job, &sessions, &semaphore, SCRIPT_BACKSTOP).await }
     });
     let fence_path = state.join("job-attempts/compress.json");
-    tokio::time::timeout(Duration::from_secs(2), async {
-        while !fence_path.exists() {
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("fence is published before the capacity wait");
-    assert!(matches!(
-        begin_scheduled_attempt(&job).unwrap(),
-        ScheduledAttemptStart::Blocked(_)
-    ));
+    tokio::task::yield_now().await;
+    assert!(
+        !fence_path.exists(),
+        "capacity waiting must remain outside the attempt fence"
+    );
 
     semaphore.add_permits(1);
     assert_eq!(scheduled.await.unwrap(), ScheduledDispatch::Finished(0));

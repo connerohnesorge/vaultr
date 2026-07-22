@@ -83,18 +83,16 @@ Plant MUST NOT hardwire or map interpreters per extension.
 
 ### Requirement: Durable scheduled-job attempt fencing
 
-Plant MUST acquire a per-job cross-process flock, reconcile any prior attempt,
-recheck cadence from the durable ledger while still holding that flock, and
-durably publish a unique attempt fence before waiting for scheduler capacity or
-performing any job side effect. Every terminal execution path MUST pass one
-typed result through exactly one durable final-record transition or one
-retryable-fence transition. Plant MUST retain a nonretryable fence whenever the
-final outcome cannot be proven durable. On daemon cancellation, Plant MUST
-stop both listener supervisors from accepting, freeze and boundedly drain only
-their pre-cancellation connection sets and owned capture tee/finalizer task
-sets, abort and reap leftovers, and retain both listener leases until both
-supervisors join. A capture tee MUST stop pulling a stalled upstream when its
-client receiver closes.
+Plant MUST acquire scheduler capacity before it publishes a scheduled attempt fence.
+After capacity admission, Plant MUST acquire the per-job cross-process flock.
+While holding the flock, Plant MUST verify ledger writability, reconcile prior state, and recheck cadence.
+Plant MUST publish the fence immediately before the scheduled action.
+Plant MUST retain the flock through one durable final-record or retryable-fence transition.
+Plant MUST retain a nonretryable fence whenever the final outcome cannot be proven durable.
+On daemon cancellation, Plant MUST stop both listener supervisors from accepting.
+Plant MUST boundedly drain their pre-cancellation connections and owned capture descendants.
+Plant MUST abort and reap leftovers before releasing either listener lease.
+A capture tee MUST stop pulling a stalled upstream when its client receiver closes.
 
 #### Scenario: State is unavailable before dispatch
 
@@ -105,8 +103,16 @@ client receiver closes.
 #### Scenario: Concurrent schedulers observe one due period
 
 - WHEN two scheduler processes evaluate the same due job
+- AND both processes obtain local scheduler capacity
 - THEN only the process holding the per-job flock may reconcile and recheck cadence
 - AND at most one process publishes a fence and dispatches that due period
+
+#### Scenario: Plant stops during capacity waiting
+
+- GIVEN all scheduler capacity is occupied
+- WHEN Plant stops before a due job receives capacity
+- THEN the waiting job has no nonretryable attempt fence
+- AND the next Plant process can evaluate the job on its next scheduler tick
 
 #### Scenario: Retryable exit rearms the attempt
 
