@@ -539,9 +539,10 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
                 "CLI pane was not a ready native Claude/Codex agent after settle".to_string(),
             );
         };
-        // Herdr 0.7.4 pane.run atomically sends the text plus Enter. Arm and
-        // acknowledge one unfiltered status stream first so even a fast
-        // working→done turn is buffered on this same pane/workspace cursor.
+        // Herdr `pane run` only TYPES the prompt into the agent composer; it does
+        // NOT submit (no Enter). Arm and acknowledge one unfiltered status stream
+        // first so even a fast working→done turn is buffered on this same
+        // pane/workspace cursor, type the prompt, then send exactly one Enter.
         let lifecycle = match subscribe_agent_start(pane, workspace).await {
             Ok(subscription) => subscription,
             Err(detail) => {
@@ -550,7 +551,14 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
                 ));
             }
         };
-        let submitted = run30(&["herdr", "pane", "run", pane, &agent_run.prompt]).await;
+        let typed = run30(&["herdr", "pane", "run", pane, &agent_run.prompt]).await;
+        if let Err(detail) = require_command(&typed, "prompt typing") {
+            return AgentRunOutcome::Failed(detail);
+        }
+        // An immediate Enter is swallowed by the slash-command palette (reconcile
+        // sends `/goal ...`); let the composer settle, then submit with one Enter.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let submitted = run30(&["herdr", "pane", "send-keys", pane, "Enter"]).await;
         if let Err(detail) = require_command(&submitted, "prompt submission") {
             return AgentRunOutcome::Failed(detail);
         }
@@ -889,7 +897,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_atomic_pane_run_is_a_terminal_submission_error() {
+    fn failed_enter_send_keys_is_a_terminal_submission_error() {
         let failed = RunResult {
             ok: false,
             out: String::new(),
