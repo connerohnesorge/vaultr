@@ -326,7 +326,7 @@ impl AgentStartSubscription {
                     .await
                     .map_err(|error| format!("agent-start event: {error}"))?;
                 if bytes == 0 && working {
-                    return Err("agent-start subscription closed before done".to_string());
+                    return Err("agent-start subscription closed before completion".to_string());
                 }
                 if bytes == 0 {
                     return Err("agent-start subscription closed before working".to_string());
@@ -347,13 +347,21 @@ impl AgentStartSubscription {
                 }
                 match event.pointer("/data/agent_status").and_then(Value::as_str) {
                     Some("working") => working = true,
-                    Some("done") if working => return Ok(()),
+                    // Claude settles a finished turn to `done`; Codex settles to
+                    // `idle` (only a `/goal` run emits `done`). Either status,
+                    // once `working` has been observed, is the terminal signal
+                    // that the submitted prompt ran to completion. A non-goal
+                    // Codex job (verify) otherwise hangs here until timeout,
+                    // holding the single scheduler permit and starving all jobs.
+                    Some("done" | "idle") if working => return Ok(()),
                     _ => {}
                 }
             }
         })
         .await
-        .map_err(|_| "submitted prompt never completed a working-to-done transition".to_string())?
+        .map_err(|_| {
+            "submitted prompt never reached a terminal state after working".to_string()
+        })?
     }
 }
 
@@ -950,6 +958,20 @@ mod tests {
     async fn acknowledged_working_event_survives_a_fast_turn() {
         let path = PathBuf::from("/tmp").join(format!("ph-{}.sock", uuid::Uuid::new_v4()));
         let server = subscription_server(path.clone(), vec!["working", "done"]).await;
+        let subscription = subscribe_agent_start_at(&path, "w1:p1", "w1")
+            .await
+            .unwrap();
+        subscription.wait(Duration::from_millis(100)).await.unwrap();
+        server.await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn working_then_idle_completes_for_codex() {
+        // Codex settles a finished non-goal turn to `idle`, not `done`; the
+        // observer must treat that as completion or the whole job hangs.
+        let path = PathBuf::from("/tmp").join(format!("ph-{}.sock", uuid::Uuid::new_v4()));
+        let server = subscription_server(path.clone(), vec!["working", "idle"]).await;
         let subscription = subscribe_agent_start_at(&path, "w1:p1", "w1")
             .await
             .unwrap();
