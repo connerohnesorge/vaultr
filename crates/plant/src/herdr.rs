@@ -215,6 +215,12 @@ fn ready_pane_identity(panes: &[Pane], pane: &str) -> Option<PaneIdentity> {
         })
 }
 
+fn pane_is_working(panes: &[Pane], pane: &str) -> bool {
+    panes
+        .iter()
+        .any(|candidate| candidate.pane_id == pane && candidate.agent_status == "working")
+}
+
 fn same_pane_identity(expected: &PaneIdentity, panes: &[Pane], pane: &str) -> bool {
     panes.iter().any(|candidate| {
         candidate.pane_id == pane
@@ -539,10 +545,15 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
                 "CLI pane was not a ready native Claude/Codex agent after settle".to_string(),
             );
         };
-        // Herdr `pane run` only TYPES the prompt into the agent composer; it does
-        // NOT submit (no Enter). Arm and acknowledge one unfiltered status stream
-        // first so even a fast working→done turn is buffered on this same
-        // pane/workspace cursor, type the prompt, then send exactly one Enter.
+        // Arm the status observer BEFORE typing so even a fast working→done turn
+        // is buffered on this pane/workspace cursor. Herdr `pane run` only TYPES
+        // the prompt: a running Claude TUI needs an explicit Enter to submit,
+        // while Codex auto-runs a recognized slash-command prompt (e.g. `/goal`)
+        // the instant it is typed. Send one Enter only if the agent has not
+        // already started, then let the buffered observer arbitrate delivery.
+        // The literal prompt text is NOT a reliable signal: Codex rewrites a
+        // slash-command into its own status line, so it never echoes verbatim —
+        // a working→done transition is the real proof the prompt landed.
         let lifecycle = match subscribe_agent_start(pane, workspace).await {
             Ok(subscription) => subscription,
             Err(detail) => {
@@ -555,32 +566,17 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
         if let Err(detail) = require_command(&typed, "prompt typing") {
             return AgentRunOutcome::Failed(detail);
         }
-        // An immediate Enter is swallowed by the slash-command palette (reconcile
-        // sends `/goal ...`); let the composer settle, then submit with one Enter.
+        // An immediate Enter is swallowed by the slash-command palette; let the
+        // composer settle before deciding whether a submit keystroke is needed.
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let submitted = run30(&["herdr", "pane", "send-keys", pane, "Enter"]).await;
-        if let Err(detail) = require_command(&submitted, "prompt submission") {
-            return AgentRunOutcome::Failed(detail);
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        let read = run30(&[
-            "herdr",
-            "pane",
-            "read",
-            pane,
-            "--source",
-            "recent-unwrapped",
-            "--lines",
-            "80",
-        ])
-        .await;
-        if let Err(detail) = require_command(&read, "prompt verification") {
-            return AgentRunOutcome::Failed(detail);
-        }
-        let needle: String = agent_run.prompt.chars().take(30).collect();
-        // Claude collapses large pastes to this placeholder; it proves delivery.
-        if !read.out.contains(&needle) && !read.out.contains("[Pasted text") {
-            return AgentRunOutcome::Failed("submitted prompt was not visible in pane".to_string());
+        let already_working = pane_list()
+            .await
+            .is_some_and(|panes| pane_is_working(&panes, pane));
+        if !already_working {
+            let submitted = run30(&["herdr", "pane", "send-keys", pane, "Enter"]).await;
+            if let Err(detail) = require_command(&submitted, "prompt submission") {
+                return AgentRunOutcome::Failed(detail);
+            }
         }
         if let Err(detail) = lifecycle
             .wait(agent_run.timeout + Duration::from_secs(60))
@@ -880,6 +876,27 @@ mod tests {
         assert!(same_pane_identity(&identity, &[original.clone()], "w1:p1"));
         original.terminal_id = "replacement".to_string();
         assert!(!same_pane_identity(&identity, &[original], "w1:p1"));
+    }
+
+    #[test]
+    fn pane_is_working_matches_only_the_named_working_pane() {
+        // Codex auto-submits a slash-command prompt; a `working` pane is the
+        // signal to skip the explicit Enter that a typed Claude prompt needs.
+        let at = |pane_id: &str, status: &str| Pane {
+            workspace_id: "w1".to_string(),
+            tab_id: "w1:t1".to_string(),
+            pane_id: pane_id.to_string(),
+            terminal_id: "t1".to_string(),
+            cwd: "/tmp".to_string(),
+            focused: false,
+            agent_status: status.to_string(),
+            agent: Some("codex".to_string()),
+            agent_session: None,
+        };
+        assert!(pane_is_working(&[at("w1:p1", "working")], "w1:p1"));
+        assert!(!pane_is_working(&[at("w1:p1", "idle")], "w1:p1"));
+        assert!(!pane_is_working(&[at("w1:p1", "done")], "w1:p1"));
+        assert!(!pane_is_working(&[at("w1:p2", "working")], "w1:p1"));
     }
 
     #[test]
