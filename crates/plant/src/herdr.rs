@@ -188,6 +188,7 @@ pub(crate) async fn pane_list() -> Option<Vec<Pane>> {
 
 /// Herdr reports `idle` for a bare shell too. Only native Claude/Codex panes in
 /// a prompt-safe state may receive TUI input.
+#[cfg(test)]
 fn pane_accepts_prompt(panes: &[Pane], pane: &str) -> bool {
     ready_pane_identity(panes, pane).is_some()
 }
@@ -238,20 +239,54 @@ fn same_pane_identity(expected: &PaneIdentity, panes: &[Pane], pane: &str) -> bo
     })
 }
 
-async fn wait_for_prompt_ready(pane: &str, timeout: Duration) -> bool {
+fn settled_ready_identity(
+    expected: &PaneIdentity,
+    panes: &[Pane],
+    pane: &str,
+) -> Result<Option<PaneIdentity>, String> {
+    if !same_pane_identity(expected, panes, pane) {
+        return Err("pane terminal/session identity changed during readiness".to_string());
+    }
+    Ok(ready_pane_identity(panes, pane))
+}
+
+fn snapshot_completed(
+    identity: &PaneIdentity,
+    panes: &[Pane],
+    pane: &str,
+    working: &mut bool,
+) -> Result<bool, String> {
+    if !same_pane_identity(identity, panes, pane) {
+        return Err("pane terminal/session identity changed during submitted turn".to_string());
+    }
+    *working |= pane_is_working(panes, pane);
+    Ok(*working && ready_pane_identity(panes, pane).is_some())
+}
+
+async fn wait_for_prompt_ready(pane: &str, timeout: Duration) -> Result<PaneIdentity, String> {
     tokio::time::timeout(timeout, async {
         loop {
-            if pane_list()
-                .await
-                .is_some_and(|panes| pane_accepts_prompt(&panes, pane))
-            {
-                return true;
+            let Some(panes) = pane_list().await else {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            };
+            let Some(identity) = ready_pane_identity(&panes, pane) else {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                continue;
+            };
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            let Some(panes) = pane_list().await else {
+                continue;
+            };
+            match settled_ready_identity(&identity, &panes, pane)? {
+                Some(identity) => return Ok(identity),
+                None => {}
             }
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
     })
     .await
-    .unwrap_or(false)
+    .map_err(|_| "native Claude/Codex pane did not reach idle or done".to_string())?
 }
 
 struct AgentStartSubscription {
@@ -315,46 +350,46 @@ async fn subscribe_agent_start(
 }
 
 impl AgentStartSubscription {
-    async fn wait(self, timeout: Duration) -> Result<(), String> {
+    async fn wait(self, identity: &PaneIdentity, timeout: Duration) -> Result<(), String> {
         tokio::time::timeout(timeout, async {
             let mut reader = self.reader;
             let mut working = false;
+            let mut snapshots = tokio::time::interval(Duration::from_millis(250));
+            snapshots.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
-                let mut line = String::new();
-                let bytes = reader
-                    .read_line(&mut line)
-                    .await
-                    .map_err(|error| format!("agent-start event: {error}"))?;
-                if bytes == 0 && working {
-                    return Err("agent-start subscription closed before completion".to_string());
-                }
-                if bytes == 0 {
-                    return Err("agent-start subscription closed before working".to_string());
-                }
-                let event: Value = serde_json::from_str(&line)
-                    .map_err(|error| format!("agent-start event: {error}"))?;
-                if event.get("event").and_then(Value::as_str) != Some("pane.agent_status_changed")
-                    || event.pointer("/data/pane_id").and_then(Value::as_str)
-                        != Some(self.pane_id.as_str())
-                    || event.pointer("/data/workspace_id").and_then(Value::as_str)
-                        != Some(self.workspace_id.as_str())
-                    || !matches!(
-                        event.pointer("/data/agent").and_then(Value::as_str),
-                        Some("claude" | "codex")
-                    )
-                {
-                    continue;
-                }
-                match event.pointer("/data/agent_status").and_then(Value::as_str) {
-                    Some("working") => working = true,
-                    // Claude settles a finished turn to `done`; Codex settles to
-                    // `idle` (only a `/goal` run emits `done`). Either status,
-                    // once `working` has been observed, is the terminal signal
-                    // that the submitted prompt ran to completion. A non-goal
-                    // Codex job (verify) otherwise hangs here until timeout,
-                    // holding the single scheduler permit and starving all jobs.
-                    Some("done" | "idle") if working => return Ok(()),
-                    _ => {}
+                tokio::select! {
+                    _ = snapshots.tick() => {
+                        let Some(panes) = pane_list().await else { continue };
+                        if snapshot_completed(identity, &panes, &self.pane_id, &mut working)? {
+                            return Ok(());
+                        }
+                    }
+                    line = async {
+                        let mut line = String::new();
+                        let bytes = reader.read_line(&mut line).await?;
+                        Ok::<_, std::io::Error>((bytes, line))
+                    } => {
+                        let (bytes, line) = line.map_err(|error| format!("agent-start event: {error}"))?;
+                        if bytes == 0 && working {
+                            return Err("agent-start subscription closed before completion".to_string());
+                        }
+                        if bytes == 0 {
+                            return Err("agent-start subscription closed before working".to_string());
+                        }
+                        let event: Value = serde_json::from_str(&line)
+                            .map_err(|error| format!("agent-start event: {error}"))?;
+                        if event.get("event").and_then(Value::as_str) != Some("pane.agent_status_changed")
+                            || event.pointer("/data/pane_id").and_then(Value::as_str) != Some(self.pane_id.as_str())
+                            || event.pointer("/data/workspace_id").and_then(Value::as_str) != Some(self.workspace_id.as_str())
+                            || !matches!(event.pointer("/data/agent").and_then(Value::as_str), Some("claude" | "codex")) {
+                            continue;
+                        }
+                        match event.pointer("/data/agent_status").and_then(Value::as_str) {
+                            Some("working") => working = true,
+                            Some("done" | "idle") if working => return Ok(()),
+                            _ => {}
+                        }
+                    }
                 }
             }
         })
@@ -535,23 +570,15 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
                 launched.failure_detail()
             ));
         }
-        if !wait_for_prompt_ready(pane, Duration::from_secs(60)).await {
-            let detail = "native Claude/Codex pane did not reach idle or done";
-            eprintln!(
-                "[herdr:{}] agent did not become ready in pane {pane} ({detail})",
-                agent_run.label
-            );
-            return AgentRunOutcome::Failed(format!("agent never became ready ({detail})"));
-        }
-        // Agent detection precedes TUI input readiness by ~1-2 seconds.
-        tokio::time::sleep(Duration::from_secs(3)).await;
-        let Some(identity) = pane_list()
-            .await
-            .and_then(|panes| ready_pane_identity(&panes, pane))
-        else {
-            return AgentRunOutcome::Failed(
-                "CLI pane was not a ready native Claude/Codex agent after settle".to_string(),
-            );
+        let identity = match wait_for_prompt_ready(pane, Duration::from_secs(60)).await {
+            Ok(identity) => identity,
+            Err(detail) => {
+                eprintln!(
+                    "[herdr:{}] agent did not become ready in pane {pane} ({detail})",
+                    agent_run.label
+                );
+                return AgentRunOutcome::Failed(format!("agent never became ready ({detail})"));
+            }
         };
         // Arm the status observer BEFORE typing so even a fast working→done turn
         // is buffered on this pane/workspace cursor. Herdr `pane run` only TYPES
@@ -587,7 +614,7 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
             }
         }
         if let Err(detail) = lifecycle
-            .wait(agent_run.timeout + Duration::from_secs(60))
+            .wait(&identity, agent_run.timeout + Duration::from_secs(60))
             .await
         {
             return AgentRunOutcome::Failed(format!(
@@ -796,6 +823,20 @@ mod tests {
         })
     }
 
+    fn codex_pane(status: &str) -> Pane {
+        Pane {
+            workspace_id: "w1".to_string(),
+            tab_id: "w1:t1".to_string(),
+            pane_id: "w1:p1".to_string(),
+            terminal_id: "t1".to_string(),
+            cwd: "/tmp".to_string(),
+            focused: false,
+            agent_status: status.to_string(),
+            agent: Some("codex".to_string()),
+            agent_session: None,
+        }
+    }
+
     #[test]
     fn decodes_typed_panes_and_workspaces() {
         let panes: PaneListReply = serde_json::from_str(
@@ -908,6 +949,42 @@ mod tests {
     }
 
     #[test]
+    fn readiness_reconciles_a_transient_non_ready_snapshot() {
+        let identity = ready_pane_identity(&[codex_pane("idle")], "w1:p1").unwrap();
+        assert_eq!(
+            settled_ready_identity(&identity, &[codex_pane("working")], "w1:p1").unwrap(),
+            None
+        );
+        assert!(
+            settled_ready_identity(&identity, &[codex_pane("idle")], "w1:p1")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn snapshot_terminal_completes_after_working_without_terminal_event() {
+        let identity = ready_pane_identity(&[codex_pane("idle")], "w1:p1").unwrap();
+        let mut working = false;
+        assert!(
+            !snapshot_completed(&identity, &[codex_pane("working")], "w1:p1", &mut working)
+                .unwrap()
+        );
+        assert!(
+            snapshot_completed(&identity, &[codex_pane("idle")], "w1:p1", &mut working).unwrap()
+        );
+    }
+
+    #[test]
+    fn snapshot_terminal_without_working_is_not_success() {
+        let identity = ready_pane_identity(&[codex_pane("idle")], "w1:p1").unwrap();
+        let mut working = false;
+        assert!(
+            !snapshot_completed(&identity, &[codex_pane("done")], "w1:p1", &mut working).unwrap()
+        );
+    }
+
+    #[test]
     fn cleanup_follows_policy_and_outcome() {
         let succeeded = AgentRunOutcome::Succeeded("done".into());
         let failed = AgentRunOutcome::Failed("timeout".into());
@@ -937,13 +1014,17 @@ mod tests {
 
     #[tokio::test]
     async fn preexisting_done_without_post_submit_working_is_not_success() {
+        let identity = PaneIdentity {
+            terminal_id: "t1".to_string(),
+            agent_session: None,
+        };
         let path = PathBuf::from("/tmp").join(format!("ph-{}.sock", uuid::Uuid::new_v4()));
         let server = subscription_server(path.clone(), vec!["done"]).await;
         let subscription = subscribe_agent_start_at(&path, "w1:p1", "w1")
             .await
             .unwrap();
         let error = subscription
-            .wait(Duration::from_millis(100))
+            .wait(&identity, Duration::from_millis(100))
             .await
             .unwrap_err();
         assert_eq!(
@@ -956,18 +1037,29 @@ mod tests {
 
     #[tokio::test]
     async fn acknowledged_working_event_survives_a_fast_turn() {
+        let identity = PaneIdentity {
+            terminal_id: "t1".to_string(),
+            agent_session: None,
+        };
         let path = PathBuf::from("/tmp").join(format!("ph-{}.sock", uuid::Uuid::new_v4()));
         let server = subscription_server(path.clone(), vec!["working", "done"]).await;
         let subscription = subscribe_agent_start_at(&path, "w1:p1", "w1")
             .await
             .unwrap();
-        subscription.wait(Duration::from_millis(100)).await.unwrap();
+        subscription
+            .wait(&identity, Duration::from_millis(100))
+            .await
+            .unwrap();
         server.await.unwrap();
         std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]
     async fn working_then_idle_completes_for_codex() {
+        let identity = PaneIdentity {
+            terminal_id: "t1".to_string(),
+            agent_session: None,
+        };
         // Codex settles a finished non-goal turn to `idle`, not `done`; the
         // observer must treat that as completion or the whole job hangs.
         let path = PathBuf::from("/tmp").join(format!("ph-{}.sock", uuid::Uuid::new_v4()));
@@ -975,7 +1067,10 @@ mod tests {
         let subscription = subscribe_agent_start_at(&path, "w1:p1", "w1")
             .await
             .unwrap();
-        subscription.wait(Duration::from_millis(100)).await.unwrap();
+        subscription
+            .wait(&identity, Duration::from_millis(100))
+            .await
+            .unwrap();
         server.await.unwrap();
         std::fs::remove_file(path).unwrap();
     }

@@ -4,7 +4,7 @@
 
 ### Requirement: Deep Herdr agent lifecycle
 
-Plant MUST run each agent-backed Cultivation Job through one high-level Herdr lifecycle interface that owns workspace creation and reclamation, verified agent readiness, prompt delivery, completion waiting, and best-effort cleanup with focus restoration. After the final ready check, it MUST snapshot the selected native Claude/Codex pane's terminal and available agent-session identity, receive a subscription acknowledgment before checked `pane run` prompt typing, and allow the composer to settle. If the pane has not entered `working`, Plant MUST send exactly one checked Enter. Plant MUST observe that same pane/workspace enter `working` after the acknowledgment, observe its later terminal state on the same buffered subscription, and recheck terminal/session identity before returning success. Failed typing, failed submission, a missing transition, pre-existing terminal state, or a pane identity change MUST NOT return `Succeeded`. The scheduler MUST retain job selection, launch construction, prompts, cadence, and outcome recording.
+Plant MUST run each agent-backed Cultivation Job through one high-level Herdr lifecycle interface that owns workspace creation and reclamation, verified agent readiness, prompt delivery, completion waiting, and best-effort cleanup with focus restoration. Plant MUST reconcile readiness snapshots until the selected native Claude/Codex pane remains prompt-ready after the composer settles. Plant MUST snapshot that pane's terminal and available agent-session identity before checked `pane run` prompt typing. Plant MUST receive a subscription acknowledgment before prompt typing. If the pane has not entered `working`, Plant MUST send exactly one checked Enter. Plant MUST reconcile buffered lifecycle events with same-pane snapshots. Plant MUST observe post-submit `working` before accepting a later terminal state. Plant MUST recheck terminal/session identity before returning success. Failed typing, failed submission, a missing transition, pre-existing terminal state, or a pane identity change MUST NOT return `Succeeded`. The scheduler MUST retain job selection, launch construction, prompts, cadence, and outcome recording.
 
 #### Scenario: Herdr is unavailable before an attempt
 
@@ -23,7 +23,7 @@ Plant MUST run each agent-backed Cultivation Job through one high-level Herdr li
 - WHEN a verified native Claude or Codex pane is idle or done
 - AND the lifecycle acknowledges its pane-scoped status subscription before checked `pane run` prompt typing
 - AND the lifecycle sends one checked Enter only if the pane is not already `working`
-- AND that same buffered stream observes `working` followed by a terminal state
+- AND Plant observes `working` followed by a terminal state through its buffered stream or same-pane snapshots
 - AND the terminal and available agent-session identities remain unchanged
 - THEN the lifecycle returns `Succeeded` with a diagnostic detail
 - AND applies the supplied `Never`, `Always`, or `OnSuccess` cleanup policy without changing user focus
@@ -33,6 +33,19 @@ Plant MUST run each agent-backed Cultivation Job through one high-level Herdr li
 - WHEN the selected pane is already `done` before prompt submission but no post-acknowledgment `working` transition is observed
 - THEN the lifecycle returns `Failed`
 - AND Plant MUST NOT durably report the run as succeeded
+
+#### Scenario: Readiness changes while the composer settles
+
+- WHEN a selected native Claude or Codex pane becomes non-ready after initial readiness
+- THEN Plant continues waiting for the same pane identity
+- AND Plant does not type the prompt before readiness returns
+
+#### Scenario: A terminal event is absent
+
+- WHEN Plant observes post-submit `working`
+- AND a same-pane snapshot later reports `idle` or `done`
+- AND the terminal event is absent from the subscription
+- THEN Plant returns success after identity verification
 
 #### Scenario: Pane identity changes during the turn
 
