@@ -4,7 +4,7 @@
 
 ### Requirement: Deep Herdr agent lifecycle
 
-Plant MUST run each agent-backed Cultivation Job through one high-level Herdr lifecycle interface that owns workspace creation and reclamation, verified agent readiness, prompt delivery, completion waiting, and best-effort cleanup with focus restoration. After the final ready check, it MUST snapshot the selected native Claude/Codex pane's terminal and available agent-session identity, receive a subscription acknowledgment before exactly one checked atomic `pane run` prompt submission, observe that same pane/workspace enter `working` after the acknowledgment, observe its later `done` on the same buffered subscription, and recheck terminal/session identity before returning success. A failed submission, missing transition, pre-existing terminal state, or pane identity change MUST NOT return `Succeeded`. The scheduler MUST retain job selection, launch construction, prompts, cadence, and outcome recording.
+Plant MUST run each agent-backed Cultivation Job through one high-level Herdr lifecycle interface that owns workspace creation and reclamation, verified agent readiness, prompt delivery, completion waiting, and best-effort cleanup with focus restoration. After the final ready check, it MUST snapshot the selected native Claude/Codex pane's terminal and available agent-session identity, receive a subscription acknowledgment before checked `pane run` prompt typing, and allow the composer to settle. If the pane has not entered `working`, Plant MUST send exactly one checked Enter. Plant MUST observe that same pane/workspace enter `working` after the acknowledgment, observe its later terminal state on the same buffered subscription, and recheck terminal/session identity before returning success. Failed typing, failed submission, a missing transition, pre-existing terminal state, or a pane identity change MUST NOT return `Succeeded`. The scheduler MUST retain job selection, launch construction, prompts, cadence, and outcome recording.
 
 #### Scenario: Herdr is unavailable before an attempt
 
@@ -14,15 +14,16 @@ Plant MUST run each agent-backed Cultivation Job through one high-level Herdr li
 
 #### Scenario: Startup or prompt delivery fails
 
-- WHEN Herdr is available but workspace creation, CLI startup, subscription acknowledgment, or the single atomic prompt submission fails
+- WHEN Herdr is available but workspace creation, CLI startup, subscription acknowledgment, prompt typing, or required Enter delivery fails
 - THEN the lifecycle returns `Failed` with a diagnostic detail
 - AND Plant records the failed attempt using the existing cadence policy
 
 #### Scenario: Agent run succeeds
 
 - WHEN a verified native Claude or Codex pane is idle or done
-- AND the lifecycle acknowledges its pane-scoped status subscription before exactly one checked `pane run`
-- AND that same buffered stream observes `working` followed by `done`
+- AND the lifecycle acknowledges its pane-scoped status subscription before checked `pane run` prompt typing
+- AND the lifecycle sends one checked Enter only if the pane is not already `working`
+- AND that same buffered stream observes `working` followed by a terminal state
 - AND the terminal and available agent-session identities remain unchanged
 - THEN the lifecycle returns `Succeeded` with a diagnostic detail
 - AND applies the supplied `Never`, `Always`, or `OnSuccess` cleanup policy without changing user focus
