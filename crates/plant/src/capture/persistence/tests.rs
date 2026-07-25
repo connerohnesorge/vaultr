@@ -506,6 +506,23 @@ async fn detached_generation_does_not_bypass_strict_journal_loading() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn recovery_ignores_an_empty_stage_directory_without_a_journal() {
+    let root = test_dir("empty-stage-directory");
+    let sessions = root.join("sessions");
+    let sid = "00000000-0000-4000-8000-000000000059";
+    fs::create_dir_all(sessions.join("2026/07/20").join(sid)).unwrap();
+    let root_identity = canonical_root(&sessions);
+    let empty_stage = staging_dir(&root_identity, sid);
+    fs::create_dir_all(&empty_stage).unwrap();
+
+    recover_all(&sessions).unwrap();
+
+    assert!(empty_stage.exists());
+    fs::remove_dir_all(empty_stage.parent().unwrap()).unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn recovery_rejects_symlink_escapes_without_mutating_evidence() {

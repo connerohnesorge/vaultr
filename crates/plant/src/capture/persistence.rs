@@ -707,6 +707,25 @@ pub(crate) fn recover_all(vault: &Path) -> Result<(), String> {
                     path.display()
                 ));
             }
+            if fs::read_dir(&path)
+                .map_err(|error| {
+                    format!(
+                        "capture recovery: read staged session {}: {error}",
+                        path.display()
+                    )
+                })?
+                .next()
+                .transpose()
+                .map_err(|error| {
+                    format!(
+                        "capture recovery: read staged session {}: {error}",
+                        path.display()
+                    )
+                })?
+                .is_none()
+            {
+                continue;
+            }
             let sid = entry
                 .file_name()
                 .to_str()
