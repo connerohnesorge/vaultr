@@ -24,8 +24,26 @@ use tokio_util::task::TaskTracker;
 
 pub type BoxBody = http_body_util::combinators::BoxBody<Bytes, std::io::Error>;
 
-/// ponytail: gate of 2 bounds peak RSS of concurrent JSON-DOM parses; raise if capture latency ever matters
-static DOM_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+/// Bound peak RSS from concurrent multi-MB JSON DOMs without forcing every local
+/// agent through a two-wide queue. Override when request sizes or RAM differ.
+static DOM_GATE: std::sync::LazyLock<tokio::sync::Semaphore> = std::sync::LazyLock::new(|| {
+    let permits = std::env::var("VAULTR_CAPTURE_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|permits| *permits > 0)
+        .unwrap_or(4);
+    tokio::sync::Semaphore::new(permits)
+});
+
+static CAPTURE_IDLE_TIMEOUT: std::sync::LazyLock<std::time::Duration> =
+    std::sync::LazyLock::new(|| {
+        std::env::var("VAULTR_CAPTURE_IDLE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|seconds| *seconds > 0)
+            .map(std::time::Duration::from_secs)
+            .unwrap_or(std::time::Duration::from_secs(300))
+    });
 
 #[cfg(test)]
 static ACTIVE_CAPTURE_TASKS: std::sync::atomic::AtomicUsize =
@@ -418,6 +436,11 @@ async fn handle(
             let next = tokio::select! {
                 biased;
                 () = tx.closed() => {
+                    complete = false;
+                    break;
+                }
+                () = tokio::time::sleep(*CAPTURE_IDLE_TIMEOUT) => {
+                    eprintln!("capture stream idle for {}s; finalizing incomplete", CAPTURE_IDLE_TIMEOUT.as_secs());
                     complete = false;
                     break;
                 }
