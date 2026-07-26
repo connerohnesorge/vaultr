@@ -335,10 +335,38 @@ where
     if !existing.retryable
         && !ledger_has_attempt_at(ledger_path, ledger_parent, &existing.id, sync)?
     {
-        return Ok(FenceReconcile::Blocked(format!(
-            "attempt {} has no durable final outcome",
-            existing.id
-        )));
+        // No ledger record, but the attempt ID doubles as the Agent Run
+        // idempotency key: a conclusive receipt proves the effect finished even
+        // though the scheduler died before recording it.
+        match crate::agent_run::lookup_receipt(&existing.id) {
+            Ok(crate::agent_run::ReceiptLookup::Conclusive(receipt)) => {
+                let (outcome, detail) = receipt
+                    .ledger_outcome()
+                    .expect("a conclusive receipt has a ledger outcome");
+                append_ledger_record(
+                    ledger_parent,
+                    ledger_path,
+                    &ledger_record(
+                        &existing.id,
+                        outcome,
+                        0,
+                        &format!("reconciled from agent run receipt: {detail}"),
+                    ),
+                )?;
+            }
+            Ok(_) => {
+                return Ok(FenceReconcile::Blocked(format!(
+                    "attempt {} has no durable final outcome",
+                    existing.id
+                )))
+            }
+            Err(error) => {
+                return Ok(FenceReconcile::Blocked(format!(
+                    "attempt {} has an unreadable agent run receipt: {error}",
+                    existing.id
+                )))
+            }
+        }
     }
     std::fs::remove_file(fence_path)?;
     sync_dir(attempt_parent)?;
@@ -446,6 +474,33 @@ impl AttemptGuard {
     }
 }
 
+fn ledger_record(
+    attempt_id: &str,
+    outcome: &str,
+    duration_ms: u64,
+    detail: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "ts": epoch_now(),
+        "iso": crate::capture::iso_now(),
+        "attempt_id": attempt_id,
+        "outcome": outcome,
+        "duration_ms": duration_ms,
+        "detail": detail,
+    })
+}
+
+fn append_ledger_record(dir: &Path, path: &Path, rec: &serde_json::Value) -> io::Result<()> {
+    ensure_dir_durable(dir)?;
+    let mut line =
+        serde_json::to_vec(rec).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    line.push(b'\n');
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    file.write_all(&line)?;
+    file.sync_all()?;
+    sync_dir(dir)
+}
+
 fn record(
     name: &str,
     attempt_id: &str,
@@ -453,26 +508,12 @@ fn record(
     started: SystemTime,
     detail: &str,
 ) -> io::Result<()> {
-    let dir = state_dir().join("jobs");
-    ensure_dir_durable(&dir)?;
-    let rec = serde_json::json!({
-        "ts": epoch_now(),
-        "iso": crate::capture::iso_now(),
-        "attempt_id": attempt_id,
-        "outcome": outcome,
-        "duration_ms": started.elapsed().map(|d| d.as_millis() as u64).unwrap_or(0),
-        "detail": detail,
-    });
-    let mut line =
-        serde_json::to_vec(&rec).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    line.push(b'\n');
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(ledger_path(name))?;
-    file.write_all(&line)?;
-    file.sync_all()?;
-    sync_dir(&dir)?;
+    let duration_ms = started.elapsed().map(|d| d.as_millis() as u64).unwrap_or(0);
+    append_ledger_record(
+        &state_dir().join("jobs"),
+        &ledger_path(name),
+        &ledger_record(attempt_id, outcome, duration_ms, detail),
+    )?;
     println!("[job:{name}] {outcome} ({detail})");
     Ok(())
 }
@@ -561,11 +602,11 @@ enum JobExecution {
     Retryable(String),
 }
 
-async fn execute_script(job: &Job) -> JobExecution {
-    execute_script_with_timeout(job, SCRIPT_BACKSTOP).await
-}
-
-async fn execute_script_with_timeout(job: &Job, timeout: Duration) -> JobExecution {
+async fn execute_script_with_timeout(
+    job: &Job,
+    timeout: Duration,
+    attempt_id: &str,
+) -> JobExecution {
     // Exec directly so the shebang picks the interpreter. Linux does not provide
     // macOS's ENOEXEC shell fallback, so preserve that contract explicitly for
     // executable legacy scripts without a shebang; a missing exec bit still fails.
@@ -584,6 +625,9 @@ async fn execute_script_with_timeout(job: &Job, timeout: Duration) -> JobExecuti
     };
     cmd.current_dir(script_working_dir())
         .env("PATH", script_path_env())
+        // Agent-backed scripts pass this to `plant agent run --idempotency-key`,
+        // so a completed run leaves a receipt this attempt's fence can reconcile.
+        .env("PLANT_ATTEMPT_ID", attempt_id)
         .env(
             "PLANT_LAST_TS",
             last_record_ts(&job.name)
@@ -623,9 +667,14 @@ async fn execute_compression(vault: &Path) -> JobExecution {
     }
 }
 
-async fn execute_scheduled(job: &Job, vault: &Path, script_timeout: Duration) -> JobExecution {
+async fn execute_scheduled(
+    job: &Job,
+    vault: &Path,
+    script_timeout: Duration,
+    attempt_id: &str,
+) -> JobExecution {
     match job.action {
-        JobAction::Script => execute_script_with_timeout(job, script_timeout).await,
+        JobAction::Script => execute_script_with_timeout(job, script_timeout, attempt_id).await,
         JobAction::InProcessCompression => execute_compression(vault).await,
     }
 }
@@ -676,7 +725,7 @@ pub async fn run_job(job: &Job) -> i32 {
     // Manual runs deliberately execute the marker/wrapper script. Only daemon
     // discovery dispatches typed in-process actions.
     let started = SystemTime::now();
-    let execution = execute_script(job).await;
+    let execution = execute_script_with_timeout(job, SCRIPT_BACKSTOP, &attempt.fence.id).await;
     finish_execution(job, attempt, started, execution)
 }
 
@@ -711,7 +760,7 @@ async fn dispatch_scheduled(
         }
     };
     let started = SystemTime::now();
-    let execution = execute_scheduled(job, vault, script_timeout).await;
+    let execution = execute_scheduled(job, vault, script_timeout, &attempt.fence.id).await;
     ScheduledDispatch::Finished(finish_execution(job, attempt, started, execution))
 }
 pub async fn scheduler(cfg: Cfg, vault: PathBuf) {

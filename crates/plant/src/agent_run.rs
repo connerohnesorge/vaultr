@@ -38,6 +38,54 @@ impl AgentRunReceipt {
     fn durable(&self) -> bool {
         matches!(self, Self::Succeeded { .. } | Self::Failed { .. })
     }
+
+    /// Job-ledger outcome name and detail for a conclusive receipt.
+    pub(crate) fn ledger_outcome(&self) -> Option<(&'static str, &str)> {
+        match self {
+            Self::Succeeded { detail } => Some(("success", detail)),
+            Self::Failed { detail } => Some(("failed", detail)),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) enum ReceiptLookup {
+    Absent,
+    Pending,
+    Conclusive(AgentRunReceipt),
+}
+
+/// Read a keyed Agent Run receipt WITHOUT claiming it. Scheduled-fence
+/// reconciliation uses this to accept a run whose scheduler died mid-flight:
+/// the child persisted its receipt even though no ledger record was appended.
+pub(crate) fn lookup_receipt(key: &str) -> io::Result<ReceiptLookup> {
+    let dir = crate::state::dir().join("agent-runs");
+    let path = idempotency_path(&dir, key)?;
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(ReceiptLookup::Absent),
+        Err(error) => return Err(error),
+    };
+    let record: DurableAgentRun =
+        serde_json::from_str(&text).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let (recorded_key, lookup) = match record {
+        DurableAgentRun::InProgress { key } => (key, ReceiptLookup::Pending),
+        DurableAgentRun::Succeeded { key, detail } => (
+            key,
+            ReceiptLookup::Conclusive(AgentRunReceipt::Succeeded { detail }),
+        ),
+        DurableAgentRun::Failed { key, detail } => (
+            key,
+            ReceiptLookup::Conclusive(AgentRunReceipt::Failed { detail }),
+        ),
+    };
+    if recorded_key != key {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "idempotency digest collision",
+        ));
+    }
+    Ok(lookup)
 }
 
 #[derive(Deserialize, Serialize)]
@@ -218,6 +266,46 @@ mod tests {
         assert!(claim_agent_run(&dir, "corrupt").is_err());
 
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn conclusive_receipts_outlive_the_scheduler_that_launched_them() {
+        let root = std::env::temp_dir().join(format!("plant-receipt-lookup-{}", uuid::Uuid::new_v4()));
+        let _state = crate::state::use_test_dir(root.clone());
+        let dir = root.join("agent-runs");
+
+        assert!(matches!(
+            lookup_receipt("attempt-a").unwrap(),
+            ReceiptLookup::Absent
+        ));
+        let path = match claim_agent_run(&dir, "attempt-a") {
+            Ok(IdempotencyClaim::Execute(path)) => path,
+            _ => panic!("first claim should execute"),
+        };
+        // Scheduler supervision ends here; only the Agent Run child remains.
+        assert!(matches!(
+            lookup_receipt("attempt-a").unwrap(),
+            ReceiptLookup::Pending
+        ));
+        persist_agent_outcome(
+            &path,
+            "attempt-a",
+            &AgentRunReceipt::Succeeded {
+                detail: "agent done".to_string(),
+            },
+        )
+        .unwrap();
+        match lookup_receipt("attempt-a").unwrap() {
+            ReceiptLookup::Conclusive(receipt) => {
+                assert_eq!(receipt.ledger_outcome(), Some(("success", "agent done")))
+            }
+            _ => panic!("a persisted receipt is conclusive"),
+        }
+
+        std::fs::write(&path, "{").unwrap();
+        assert!(lookup_receipt("attempt-a").is_err());
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

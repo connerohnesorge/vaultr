@@ -219,6 +219,149 @@ async fn dispatch_holds_one_guard_across_capacity_and_typed_execution() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// Write a keyed Agent Run receipt the way the `plant agent run` child would,
+/// straight to its content-addressed path, so the scheduler side can be tested
+/// without a Herdr lifecycle.
+fn write_receipt(state: &Path, key: &str, body: &str) {
+    use sha2::Digest;
+    let dir = state.join("agent-runs");
+    std::fs::create_dir_all(&dir).unwrap();
+    let name = format!("{:x}.json", sha2::Sha256::digest(key.as_bytes()));
+    std::fs::write(dir.join(name), body).unwrap();
+}
+
+fn strand_fence(state: &Path, name: &str, id: &str) {
+    write_fence(
+        &state.join(format!("job-attempts/{name}.json")),
+        &AttemptFence {
+            id: id.to_string(),
+            started_ts: epoch_now(),
+            retryable: false,
+        },
+    )
+    .unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn conclusive_receipts_reconcile_fences_the_scheduler_never_recorded() {
+    let root = std::env::temp_dir().join(format!("plant-receipt-fence-{}", uuid::Uuid::new_v4()));
+    let sessions = root.join("vault/sessions");
+    let state = root.join("state");
+    let attempt_ids = root.join("attempt-ids");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let _state = crate::state::use_test_dir(state.clone());
+    let _cwd = use_test_script_cwd(root.clone());
+    let script = root.join("audit.1m.sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\necho \"$PLANT_ATTEMPT_ID\" >> '{}'\n",
+            attempt_ids.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let job = Job {
+        name: "audit".to_string(),
+        path: script,
+        every: Duration::from_secs(60),
+        action: JobAction::Script,
+    };
+
+    // The script sees the published attempt ID, so it can key its agent run.
+    let semaphore = tokio::sync::Semaphore::new(1);
+    assert_eq!(
+        dispatch_scheduled(&job, &sessions, &semaphore, SCRIPT_BACKSTOP).await,
+        ScheduledDispatch::Finished(0)
+    );
+    let ledger = std::fs::read_to_string(state.join("jobs/audit.jsonl")).unwrap();
+    let record: serde_json::Value = serde_json::from_str(ledger.lines().next().unwrap()).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(&attempt_ids).unwrap().trim(),
+        record["attempt_id"].as_str().unwrap()
+    );
+
+    // A Plant restart between the completed agent run and its ledger record.
+    for (id, body, outcome) in [
+        (
+            "succeeded-attempt",
+            "{\"state\":\"succeeded\",\"key\":\"succeeded-attempt\",\"detail\":\"agent done\"}",
+            "success",
+        ),
+        (
+            "failed-attempt",
+            "{\"state\":\"failed\",\"key\":\"failed-attempt\",\"detail\":\"agent failed\"}",
+            "failed",
+        ),
+    ] {
+        strand_fence(&state, "audit", id);
+        write_receipt(&state, id, body);
+        assert!(matches!(
+            reconcile_fence("audit").unwrap(),
+            FenceReconcile::Ready
+        ));
+        assert!(!state.join("job-attempts/audit.json").exists());
+        let reconciled: serde_json::Value = serde_json::from_str(
+            std::fs::read_to_string(state.join("jobs/audit.jsonl"))
+                .unwrap()
+                .lines()
+                .next_back()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(reconciled["attempt_id"], id);
+        assert_eq!(reconciled["outcome"], outcome);
+        assert!(reconciled["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("reconciled from agent run receipt:"));
+    }
+    assert_eq!(
+        std::fs::read_to_string(&attempt_ids).unwrap().lines().count(),
+        1,
+        "reconciliation must not launch the agent again"
+    );
+
+    // Nonconclusive receipts keep the fence and keep the job undispatched.
+    for (id, body) in [
+        ("absent-attempt", None),
+        (
+            "pending-attempt",
+            Some("{\"state\":\"in_progress\",\"key\":\"pending-attempt\"}"),
+        ),
+        ("corrupt-attempt", Some("{")),
+        (
+            "mismatched-attempt",
+            Some("{\"state\":\"succeeded\",\"key\":\"other\",\"detail\":\"not mine\"}"),
+        ),
+    ] {
+        strand_fence(&state, "audit", id);
+        if let Some(body) = body {
+            write_receipt(&state, id, body);
+        }
+        let before = std::fs::read_to_string(state.join("jobs/audit.jsonl")).unwrap();
+        match reconcile_fence("audit").unwrap() {
+            FenceReconcile::Blocked(detail) => assert!(detail.contains(id), "{detail}"),
+            FenceReconcile::Ready => panic!("{id} must not clear its fence"),
+        }
+        assert!(state.join("job-attempts/audit.json").exists());
+        assert_eq!(
+            std::fs::read_to_string(state.join("jobs/audit.jsonl")).unwrap(),
+            before
+        );
+        assert_eq!(
+            dispatch_scheduled(&job, &sessions, &semaphore, SCRIPT_BACKSTOP).await,
+            ScheduledDispatch::Blocked
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(&attempt_ids).unwrap().lines().count(),
+        1
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn scheduled_record_failure_blocks_the_next_dispatch() {
     let root = std::env::temp_dir().join(format!(
