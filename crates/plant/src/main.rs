@@ -42,7 +42,7 @@ fn vault_root() -> PathBuf {
 fn usage(error: &str) -> i32 {
     eprintln!("plant: {error}");
     eprintln!(
-        "usage: plant [--self-test | sessions eligible|coverage|stuck ... | \
+        "usage: plant [--self-test | server stop | sessions eligible|coverage|stuck ... | \
          compress once ... | jobs run <name> | agent run --cli claude|codex ...]"
     );
     2
@@ -54,6 +54,7 @@ async fn dispatch(command: Command) -> i32 {
             run_daemon().await;
             0
         }
+        Command::ServerStop => server_stop().await,
         Command::SelfTest => {
             selftest::self_test().await;
             0
@@ -242,6 +243,9 @@ async fn dispatch(command: Command) -> i32 {
                 cleanup: jobs::cleanup_policy(args.cleanup, &jobs::Cfg::load(&vault)),
                 preset_session_id,
                 discover_session_id: args.cli == Harness::Codex,
+                env: std::env::var("VAULT_PROJECT_DIGEST")
+                    .map(|v| vec![("VAULT_PROJECT_DIGEST".to_string(), v)])
+                    .unwrap_or_default(),
             };
             if let Some(key) = args.idempotency_key {
                 let receipt = agent_run::run_idempotent(run, &key).await;
@@ -270,6 +274,35 @@ async fn dispatch(command: Command) -> i32 {
             }
         }
     }
+}
+
+/// launchd job label for the Home Manager–supervised plant daemon.
+// ponytail: fixed on this machine; add a PLANT_LAUNCHD_LABEL env override if plant ever ships wider.
+const LAUNCHD_LABEL: &str = "com.cohnesor.plant";
+
+/// Stop the running server for real. launchd supervises plant with KeepAlive=true,
+/// so a bare SIGTERM just respawns — `bootout` sends SIGTERM (plant drains up to 30s)
+/// *and* removes the job from supervision, so it stays down.
+async fn server_stop() -> i32 {
+    let uid = unsafe { libc::getuid() };
+    let domain = format!("gui/{uid}/{LAUNCHD_LABEL}");
+    let result = process::run30(&["launchctl", "bootout", &domain]).await;
+    if result.ok {
+        println!(
+            "[plant] server stopped ({domain}); re-enable: \
+             launchctl bootstrap gui/{uid} ~/Library/LaunchAgents/{LAUNCHD_LABEL}.plist"
+        );
+        return 0;
+    }
+    // bootout on an unloaded job reports ESRCH (3) — already stopped, not a failure.
+    if matches!(result.end, process::RunEnd::Exited(Some(3)))
+        || result.stderr.contains("No such process")
+    {
+        println!("[plant] server already stopped ({domain})");
+        return 0;
+    }
+    eprintln!("[plant] server stop failed: {}", result.failure_detail());
+    1
 }
 
 fn rss_mb() -> u64 {

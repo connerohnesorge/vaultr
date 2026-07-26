@@ -132,6 +132,12 @@ pub struct AgentRun {
     /// server-assigned, so for codex we read the id herdr reports for this pane once the
     /// run finishes and register it, keeping learn from dispatching on the self-capture.
     pub discover_session_id: bool,
+    /// Forwarded to `herdr workspace create --env KEY=VALUE`. `plant agent run`
+    /// runs as a short-lived client process; herdr's own env does not see
+    /// vars the caller exported (e.g. `VAULT_PROJECT_DIGEST=0 plant agent run
+    /// ...`), so anything the spawned pane's shell must observe has to be
+    /// passed explicitly here.
+    pub env: Vec<(String, String)>,
 }
 
 /// The agent_session id herdr reports for `pane_id`, if any. herdr surfaces the same
@@ -526,7 +532,12 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
             agent_run.label
         );
     }
-    let created = run30(&[
+    let env_flags: Vec<String> = agent_run
+        .env
+        .iter()
+        .flat_map(|(k, v)| ["--env".to_string(), format!("{k}={v}")])
+        .collect();
+    let mut create_cmd: Vec<&str> = vec![
         "herdr",
         "workspace",
         "create",
@@ -535,8 +546,9 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
         "--label",
         &agent_run.label,
         "--no-focus",
-    ])
-    .await;
+    ];
+    create_cmd.extend(env_flags.iter().map(String::as_str));
+    let created = run30(&create_cmd).await;
     let parsed = created
         .ok
         .then(|| serde_json::from_str::<WorkspaceCreateReply>(&created.out).ok())
@@ -1111,6 +1123,7 @@ mod tests {
             cleanup: WorkspaceCleanup::Always,
             preset_session_id: None,
             discover_session_id: false,
+            env: Vec::new(),
         })
         .await;
 
