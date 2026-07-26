@@ -5,6 +5,30 @@ fn temp_root(label: &str) -> PathBuf {
 }
 
 #[test]
+fn health_job_alerts_on_low_headroom_and_on_each_dropped_turn_session() {
+    let vault = temp_root("alerts").join("sessions");
+    let meta = vault.join(".meta");
+    std::fs::create_dir_all(&meta).unwrap();
+    std::fs::write(meta.join("aaa.json"), r#"{"dropped_turns":3}"#).unwrap();
+    std::fs::write(meta.join("bbb.json"), r#"{"dropped_turns":0}"#).unwrap();
+
+    assert_eq!(
+        dropped_turn_alerts(&vault),
+        vec!["dropped-turn alert: aaa dropped=3".to_string()]
+    );
+    // A real temp volume has headroom; the alert fires only under the threshold.
+    let alert = headroom_alert(&vault);
+    let free = crate::fsutil::free_bytes(&vault).unwrap();
+    assert_eq!(
+        alert.is_some(),
+        free < crate::fsutil::headroom_floor() * 2,
+        "alert must track free={free}"
+    );
+    assert!(headroom_alert(&vault.join("no-such-volume")).is_none());
+    std::fs::remove_dir_all(vault.parent().unwrap()).ok();
+}
+
+#[test]
 fn eligibility_is_independent_per_learner() {
     let root = temp_root("sweep");
     let sessions = root.join("sessions");

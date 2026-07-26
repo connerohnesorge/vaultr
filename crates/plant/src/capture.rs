@@ -85,6 +85,12 @@ pub(crate) fn recover_all(vault: &Path) -> Result<(), String> {
     persistence::recover_all(vault)
 }
 
+pub(crate) fn recover_live(vault: &Path, min_age: std::time::Duration) -> Result<(), String> {
+    #[cfg(test)]
+    RECOVERY_CALLS.with(|calls| calls.set(calls.get() + 1));
+    persistence::recover_live(vault, min_age)
+}
+
 #[cfg(test)]
 pub(crate) fn reset_recovery_calls() {
     RECOVERY_CALLS.with(|calls| calls.set(0));
@@ -203,6 +209,46 @@ pub fn update_meta(
     fs::write(&path, to_string_pretty_1(&json!(meta)) + "\n")
 }
 
+/// Drops this process could not even record in `.meta`. Reported on /health.
+static UNRECORDED_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub fn unrecorded_drops() -> u64 {
+    UNRECORDED_DROPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Account for one observed turn that capture failed to persist. The marker is
+/// orders of magnitude smaller than the Envelope, so it survives the storage
+/// pressure that usually causes the drop. When even it fails, count in memory.
+pub fn record_drop(vault: &Path, session_id: &str, reason: &str) {
+    if let Err(error) = write_drop(vault, session_id, reason) {
+        UNRECORDED_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("[capture] dropped turn for {session_id} unrecorded: {error}");
+    }
+}
+
+fn write_drop(vault: &Path, session_id: &str, reason: &str) -> std::io::Result<()> {
+    let meta_dir = vault.join(".meta");
+    fs::create_dir_all(&meta_dir)?;
+    let path = meta_dir.join(format!("{session_id}.json"));
+    let mut meta: Meta = fs::read_to_string(&path)
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default();
+    let now = iso_now();
+    meta.session_id.get_or_insert_with(|| session_id.to_string());
+    meta.dropped_turns += 1;
+    meta.first_drop.get_or_insert_with(|| now.clone());
+    meta.last_drop = Some(now);
+    meta.last_drop_reason = Some(reason.to_string());
+    crate::fsutil::atomic_replace(&path, (to_string_pretty_1(&json!(meta)) + "\n").as_bytes())
+}
+
+/// The preflight decision. An unmeasurable volume is never treated as full.
+fn headroom_shortfall(free: Option<u64>, floor: u64) -> Option<String> {
+    free.filter(|free| *free < floor)
+        .map(|free| format!("storage headroom {free} below floor {floor}"))
+}
+
 /// Request-time half: reserve a preparation sequence, advance the delta base,
 /// and record the request half in the journal — all atomically under the
 /// per-session mutex, which is released before response streaming begins.
@@ -213,11 +259,17 @@ pub async fn prepare_capture(
     body: Value,
 ) -> Result<PendingCapture, String> {
     let label = adapter.harness.capture_label();
-    let sid = req
-        .ids
-        .session_id
-        .clone()
-        .ok_or_else(|| format!("{label} request has no session identity"))?;
+    let sid = req.ids.session_id.clone().ok_or_else(|| {
+        UNRECORDED_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("{label} request has no session identity")
+    })?;
+    // Preflight: a failed multi-MB state.json write consumes the free blocks the
+    // small drop marker needs, so skip it and record the gap while it still fits.
+    let floor = crate::fsutil::headroom_floor();
+    if let Some(reason) = headroom_shortfall(crate::fsutil::free_bytes(vault), floor) {
+        record_drop(vault, &sid, &reason);
+        return Err(reason);
+    }
     let dir = session_dir(vault, &sid).map_err(|error| error.to_string())?;
     let root = canonical_root(vault);
     let model = body.get("model").and_then(Value::as_str).map(String::from);
@@ -251,7 +303,8 @@ pub async fn prepare_capture(
         .expect("capture state is an object");
         (request, state)
     })
-    .await?;
+    .await
+    .inspect_err(|error| record_drop(vault, &sid, error))?;
 
     Ok(PendingCapture {
         dir,
@@ -290,6 +343,7 @@ pub async fn finish_capture(
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_string();
+    let sequence = pending.sequence;
     persistence::commit_completed(
         &pending.dir,
         &pending.root,
@@ -309,6 +363,7 @@ pub async fn finish_capture(
         },
     )
     .await
+    .inspect_err(|error| record_drop(vault, &sid, &format!("sequence {sequence}: {error}")))
 }
 
 /// Return dirty freed pages to the OS — macOS malloc otherwise ratchets RSS

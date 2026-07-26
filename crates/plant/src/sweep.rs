@@ -357,6 +357,30 @@ pub fn stuck_summary(stuck: &[StuckCapture]) -> String {
     )
 }
 
+/// Alert while captures are still complete: warn at twice the floor, so the
+/// operator has room to act before capture writes begin to fail.
+pub fn headroom_alert(vault: &Path) -> Option<String> {
+    let floor = crate::fsutil::headroom_floor();
+    let free = crate::fsutil::free_bytes(vault)?;
+    (free < floor.saturating_mul(2))
+        .then(|| format!("low-headroom alert: free={free} floor={floor}"))
+}
+
+/// One alert per Session Capture that recorded dropped turns.
+pub fn dropped_turn_alerts(vault: &Path) -> Vec<String> {
+    vaultr::vault::list_sessions(vault)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|session| session.meta.dropped_turns > 0)
+        .map(|session| {
+            format!(
+                "dropped-turn alert: {} dropped={}",
+                session.id, session.meta.dropped_turns
+            )
+        })
+        .collect()
+}
+
 pub fn stuck_captures(vault: &Path, age: Duration) -> Result<Vec<StuckCapture>, String> {
     let claude = ledger_latest(vault, Harness::ClaudeCode);
     let codex = ledger_latest(vault, Harness::Codex);

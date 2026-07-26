@@ -32,6 +32,16 @@ pub struct Meta {
     pub original_start: Option<String>,
     #[serde(default)]
     pub last_observation: Option<String>,
+    /// Turns Plant observed and failed to capture. Non-zero means this capture
+    /// is known-incomplete without a native-transcript comparison.
+    #[serde(default)]
+    pub dropped_turns: u64,
+    #[serde(default)]
+    pub first_drop: Option<String>,
+    #[serde(default)]
+    pub last_drop: Option<String>,
+    #[serde(default)]
+    pub last_drop_reason: Option<String>,
 }
 
 /// Derive `<root>/YYYY/MM/DD/<session_id>` from an RFC 3339 timestamp in UTC.

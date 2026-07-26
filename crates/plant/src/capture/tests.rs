@@ -1,5 +1,7 @@
 use super::persistence::{has_open_capture, session_lock, staging_base, staging_dir};
 use super::*;
+use std::os::unix::fs::PermissionsExt;
+use std::time::Duration;
 use vaultr::vault::sha256_hex;
 
 fn temp_vault(label: &str) -> PathBuf {
@@ -26,6 +28,41 @@ fn captured(session_id: Option<&str>) -> CapturedRequest {
 
 fn delta(pending: &PendingCapture) -> &Value {
     &pending.request_part["request"]["body_delta"]
+}
+
+#[test]
+fn preflight_skips_only_a_measured_volume_below_the_floor() {
+    assert!(headroom_shortfall(Some(99), 100).is_some());
+    assert!(headroom_shortfall(Some(100), 100).is_none());
+    assert!(headroom_shortfall(None, 100).is_none(), "unmeasurable != full");
+    assert_eq!(crate::fsutil::headroom_floor(), 2 * 1024 * 1024 * 1024);
+}
+
+#[test]
+fn drop_recording_accounts_in_meta_and_falls_back_to_the_process_counter() {
+    let vault = temp_vault("drop");
+    let sid = uuid::Uuid::new_v4().to_string();
+
+    record_drop(&vault, &sid, "disk full");
+    record_drop(&vault, &sid, "disk still full");
+    let meta: Meta =
+        serde_json::from_str(&fs::read_to_string(vault.join(".meta").join(format!("{sid}.json")))
+            .unwrap())
+            .unwrap();
+    assert_eq!(meta.dropped_turns, 2);
+    assert_eq!(meta.last_drop_reason.as_deref(), Some("disk still full"));
+    assert!(meta.first_drop.unwrap() <= meta.last_drop.unwrap());
+
+    // An unwritable .meta must not lose the drop silently.
+    let meta_dir = vault.join(".meta");
+    let mut perms = fs::metadata(&meta_dir).unwrap().permissions();
+    perms.set_readonly(true);
+    fs::set_permissions(&meta_dir, perms).unwrap();
+    let before = unrecorded_drops();
+    record_drop(&vault, &sid, "disk full");
+    assert_eq!(unrecorded_drops(), before + 1);
+    fs::set_permissions(&meta_dir, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::remove_dir_all(&vault).ok();
 }
 
 #[tokio::test]
@@ -236,8 +273,13 @@ fn update_meta_emits_complete_shape_and_preserves_writer_policy() {
     update_meta(&vault, &adapter, &ids, Some("new")).unwrap();
     let value: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
     let object = value.as_object().unwrap();
-    assert_eq!(object.len(), 11);
+    assert_eq!(object.len(), 15);
+    assert_eq!(value["dropped_turns"], 0, "no drops recorded is explicit");
     for key in [
+        "dropped_turns",
+        "first_drop",
+        "last_drop",
+        "last_drop_reason",
         "schema_version",
         "harness",
         "session_id",
@@ -429,6 +471,109 @@ async fn restart_materializes_abandoned_and_interleaves_completed() {
         !has_open_capture(&vault, &sid),
         "journal drained, staging cleared"
     );
+}
+
+#[tokio::test]
+async fn periodic_sweep_drains_a_stranded_backlog_but_spares_live_reservations() {
+    let (_guard, vault) = set_home();
+    let adapter = claude_adapter();
+    let sid = uuid::Uuid::new_v4().to_string();
+
+    // Seq 0 is the dead head; seq 1 and 2 complete and stage behind it.
+    let _head = prepare_capture(&vault, &adapter, captured(Some(&sid)), body(&["a"]))
+        .await
+        .unwrap();
+    let second = prepare_capture(&vault, &adapter, captured(Some(&sid)), body(&["a", "b"]))
+        .await
+        .unwrap();
+    let third = prepare_capture(
+        &vault,
+        &adapter,
+        captured(Some(&sid)),
+        body(&["a", "b", "c"]),
+    )
+    .await
+    .unwrap();
+    let dir = second.dir.clone();
+    finish_capture(&vault, &adapter, second, &response(true))
+        .await
+        .unwrap();
+    finish_capture(&vault, &adapter, third, &response(true))
+        .await
+        .unwrap();
+    assert!(turns_lines(&dir).is_empty(), "backlog is stranded");
+
+    // Every reservation is younger than the bound: the sweep must not touch it.
+    recover_live(&vault, Duration::from_secs(3600)).unwrap();
+    assert!(
+        turns_lines(&dir).is_empty(),
+        "sweep synthesized a live reservation"
+    );
+    assert!(has_open_capture(&vault, &sid));
+
+    // Past the bound: the dead head is synthesized and the backlog drains.
+    recover_live(&vault, Duration::ZERO).unwrap();
+    let lines = turns_lines(&dir);
+    assert_eq!(lines.len(), 3, "one record per reserved sequence");
+    assert_eq!(lines[0]["response"]["complete"], json!(false), "dead head");
+    assert_eq!(lines[1]["response"]["complete"], json!(true));
+    assert_eq!(lines[2]["response"]["complete"], json!(true));
+    assert!(
+        !has_open_capture(&vault, &sid),
+        "journal drained, staging cleared"
+    );
+}
+
+/// Coverage regression for the observed 35-54% gap: one hung stream mid-run
+/// must cost exactly its own turn, never the turns behind it.
+#[tokio::test]
+async fn one_hung_stream_mid_session_costs_only_its_own_turn() {
+    let (_guard, vault) = set_home();
+    let adapter = claude_adapter();
+    let sid = uuid::Uuid::new_v4().to_string();
+    const TURNS: usize = 20;
+    const HUNG: usize = 5;
+
+    let mut history: Vec<String> = Vec::new();
+    let mut dir = None;
+    for turn in 0..TURNS {
+        history.push(format!("m{turn}"));
+        let refs: Vec<&str> = history.iter().map(String::as_str).collect();
+        let pending = prepare_capture(&vault, &adapter, captured(Some(&sid)), body(&refs))
+            .await
+            .unwrap();
+        dir.get_or_insert_with(|| pending.dir.clone());
+        if turn == HUNG {
+            continue; // zombie tee: reserved, never staged
+        }
+        let mut resp = response(true);
+        resp.headers.insert(
+            "request-id",
+            hyper::header::HeaderValue::from_str(&format!("req_{turn}")).unwrap(),
+        );
+        finish_capture(&vault, &adapter, pending, &resp)
+            .await
+            .unwrap();
+    }
+    let dir = dir.unwrap();
+    assert_eq!(
+        turns_lines(&dir).len(),
+        HUNG,
+        "only turns before the hung head drain on their own"
+    );
+
+    recover_live(&vault, Duration::ZERO).unwrap();
+
+    let lines = turns_lines(&dir);
+    assert_eq!(lines.len(), TURNS, "every reserved turn persisted");
+    let covered: Vec<usize> = (0..TURNS)
+        .filter(|turn| {
+            lines[*turn]["response"]["headers"]["request-id"] == json!(format!("req_{turn}"))
+        })
+        .collect();
+    let expected: Vec<usize> = (0..TURNS).filter(|turn| *turn != HUNG).collect();
+    assert_eq!(covered, expected, "coverage lost more than the hung turn");
+    assert_eq!(lines[HUNG]["response"]["complete"], json!(false));
 }
 
 #[tokio::test]

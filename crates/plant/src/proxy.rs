@@ -46,6 +46,23 @@ static CAPTURE_IDLE_TIMEOUT: std::sync::LazyLock<std::time::Duration> =
     });
 
 #[cfg(test)]
+static CAPTURE_IDLE_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Idle bound a response tee may hold the drain head. Also the minimum age a
+/// reservation must reach before a periodic recovery sweep may synthesize it.
+pub(crate) fn capture_idle_timeout() -> std::time::Duration {
+    #[cfg(test)]
+    {
+        let ms = CAPTURE_IDLE_OVERRIDE_MS.load(std::sync::atomic::Ordering::SeqCst);
+        if ms > 0 {
+            return std::time::Duration::from_millis(ms);
+        }
+    }
+    *CAPTURE_IDLE_TIMEOUT
+}
+
+#[cfg(test)]
 static ACTIVE_CAPTURE_TASKS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 #[cfg(test)]
@@ -439,8 +456,8 @@ async fn handle(
                     complete = false;
                     break;
                 }
-                () = tokio::time::sleep(*CAPTURE_IDLE_TIMEOUT) => {
-                    eprintln!("capture stream idle for {}s; finalizing incomplete", CAPTURE_IDLE_TIMEOUT.as_secs());
+                () = tokio::time::sleep(capture_idle_timeout()) => {
+                    eprintln!("capture stream idle for {:?}; finalizing incomplete", capture_idle_timeout());
                     complete = false;
                     break;
                 }
@@ -504,6 +521,7 @@ pub(crate) fn health_body(adapter: &Adapter) -> serde_json::Value {
         "ok": true,
         "harness": adapter.harness.capture_label(),
         "upstream": adapter.upstream.trim_end_matches('/'),
+        "unrecorded_drops": capture::unrecorded_drops(),
     })
 }
 
@@ -523,12 +541,19 @@ mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-    struct SkipCaptureFinish;
+    /// ACTIVE_CAPTURE_TASKS and SKIP_CAPTURE_FINISH are process-global, so the
+    /// tests that read them must not overlap.
+    static CAPTURE_TEST_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct SkipCaptureFinish(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
 
     impl SkipCaptureFinish {
         fn new() -> Self {
+            let guard = CAPTURE_TEST_GATE
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             SKIP_CAPTURE_FINISH.store(true, std::sync::atomic::Ordering::SeqCst);
-            Self
+            Self(guard)
         }
     }
 
@@ -536,6 +561,16 @@ mod tests {
         fn drop(&mut self) {
             SKIP_CAPTURE_FINISH.store(false, std::sync::atomic::Ordering::SeqCst);
         }
+    }
+
+    async fn await_capture_tasks_drained() {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while ACTIVE_CAPTURE_TASKS.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("capture tasks never drained");
     }
 
     async fn blocking_upstream() -> (
@@ -573,6 +608,156 @@ mod tests {
             }
         });
         (address, started_rx, release_tx, task)
+    }
+
+    struct IdleBound;
+
+    impl IdleBound {
+        fn set(ms: u64) -> Self {
+            CAPTURE_IDLE_OVERRIDE_MS.store(ms, std::sync::atomic::Ordering::SeqCst);
+            Self
+        }
+    }
+
+    impl Drop for IdleBound {
+        fn drop(&mut self) {
+            CAPTURE_IDLE_OVERRIDE_MS.store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// Chunked upstream that emits `count` SSE pings `gap` apart, then hangs.
+    async fn dripping_stream_upstream(
+        count: usize,
+        gap: Duration,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 4096];
+            let _ = stream.read(&mut request).await;
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            for _ in 0..count {
+                tokio::time::sleep(gap).await;
+                if stream.write_all(b"7\r\n: ping\n\r\n").await.is_err() {
+                    return;
+                }
+            }
+            std::future::pending::<()>().await;
+        });
+        (address, task)
+    }
+
+    async fn post_capture_request(address: std::net::SocketAddr, session: &str) {
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        let body = serde_json::json!({
+            "metadata": { "user_id": format!("{{\"session_id\":\"{session}\"}}") },
+            "messages": [],
+            "model": "test"
+        })
+        .to_string();
+        client
+            .write_all(
+                format!(
+                    "POST /v1/messages HTTP/1.1\r\nhost: localhost\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut response = [0_u8; 512];
+        let bytes = tokio::time::timeout(Duration::from_secs(2), client.read(&mut response))
+            .await
+            .expect("captured response headers stalled")
+            .unwrap();
+        assert!(String::from_utf8_lossy(&response[..bytes]).contains("200 OK"));
+        // Hold the client open so only the idle bound can end the tee.
+        std::mem::forget(client);
+    }
+
+    async fn await_capture_task_start() {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while ACTIVE_CAPTURE_TASKS.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("capture finalizer never started");
+    }
+
+    #[tokio::test]
+    async fn idle_upstream_stream_is_reaped_as_an_incomplete_envelope() {
+        let _skip_finish = SkipCaptureFinish::new();
+        let _bound = IdleBound::set(150);
+        let (upstream, upstream_task) = stalled_stream_upstream().await;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let vault = std::env::temp_dir().join(format!("plant-idle-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&vault).unwrap();
+        let mut ctx = test_ctx(upstream);
+        Arc::get_mut(&mut ctx).unwrap().vault.clone_from(&vault);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let supervisor = tokio::spawn(serve_until_shutdown(
+            listener,
+            ctx,
+            shutdown_rx,
+            Duration::from_secs(5),
+        ));
+
+        post_capture_request(address, "00000000-0000-4000-8000-000000000011").await;
+        await_capture_task_start().await;
+        await_capture_tasks_drained().await;
+
+        supervisor.abort();
+        let _ = supervisor.await;
+        upstream_task.abort();
+        let _ = upstream_task.await;
+        std::fs::remove_dir_all(vault).unwrap();
+    }
+
+    #[tokio::test]
+    async fn live_stream_below_the_idle_bound_is_never_reaped() {
+        let _skip_finish = SkipCaptureFinish::new();
+        let _bound = IdleBound::set(400);
+        let (upstream, upstream_task) =
+            dripping_stream_upstream(6, Duration::from_millis(80)).await;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let vault = std::env::temp_dir().join(format!("plant-live-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&vault).unwrap();
+        let mut ctx = test_ctx(upstream);
+        Arc::get_mut(&mut ctx).unwrap().vault.clone_from(&vault);
+        let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let supervisor = tokio::spawn(serve_until_shutdown(
+            listener,
+            ctx,
+            shutdown_rx,
+            Duration::from_secs(5),
+        ));
+
+        post_capture_request(address, "00000000-0000-4000-8000-000000000012").await;
+        await_capture_task_start().await;
+        // Six 80ms gaps span 480ms — past the bound in total, under it per chunk.
+        tokio::time::sleep(Duration::from_millis(560)).await;
+        assert_eq!(
+            ACTIVE_CAPTURE_TASKS.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "a live sub-bound stream was reaped"
+        );
+
+        supervisor.abort();
+        let _ = supervisor.await;
+        upstream_task.abort();
+        let _ = upstream_task.await;
+        await_capture_tasks_drained().await;
+        std::fs::remove_dir_all(vault).unwrap();
     }
 
     async fn stalled_stream_upstream() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {

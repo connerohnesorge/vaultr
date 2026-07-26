@@ -21,6 +21,9 @@ pub struct Coverage {
     pub carryover: usize,
     /// In-window native `requestId`s with no captured Envelope, sorted.
     pub missing: Vec<String>,
+    /// Turns Plant recorded as dropped in `.meta`. Non-zero proves the capture
+    /// is incomplete without any native-transcript comparison.
+    pub recorded_drops: u64,
 }
 
 impl Coverage {
@@ -118,6 +121,7 @@ pub fn coverage(vault: &Path, query: &str) -> Result<Coverage, String> {
     missing.sort();
 
     Ok(Coverage {
+        recorded_drops: session.meta.dropped_turns,
         sid: session.id,
         window_start,
         resumed: session.meta.session_start_source.as_deref() == Some("resume"),

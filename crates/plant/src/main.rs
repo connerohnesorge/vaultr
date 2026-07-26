@@ -121,6 +121,12 @@ async fn dispatch(command: Command) -> i32 {
                     "  window_start={} carryover={}",
                     coverage.window_start, coverage.carryover
                 );
+                if coverage.recorded_drops > 0 {
+                    println!(
+                        "  KNOWN-INCOMPLETE: {} recorded dropped turn(s)",
+                        coverage.recorded_drops
+                    );
+                }
                 if coverage.captured > coverage.in_window_native {
                     println!("  captured={} (>= in-window native)", coverage.captured);
                 }
@@ -143,7 +149,14 @@ async fn dispatch(command: Command) -> i32 {
             }
         },
         Command::SessionsStuck(age) => {
-            let stuck = match sweep::stuck_captures(&vault_root(), age) {
+            let vault = vault_root();
+            if let Some(alert) = sweep::headroom_alert(&vault) {
+                println!("{alert}");
+            }
+            for alert in sweep::dropped_turn_alerts(&vault) {
+                println!("{alert}");
+            }
+            let stuck = match sweep::stuck_captures(&vault, age) {
                 Ok(stuck) => stuck,
                 Err(error) => {
                     eprintln!("sessions stuck: inventory failed: {error}");
@@ -418,6 +431,15 @@ impl RecoveredListenerOwnership {
     }
 }
 
+fn drain_sweep_interval() -> Duration {
+    std::env::var("VAULTR_CAPTURE_DRAIN_SWEEP_SECS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(Duration::from_secs(180))
+}
+
 async fn run_daemon() {
     let started = SystemTime::now();
     std::panic::set_hook(Box::new(move |info| {
@@ -505,6 +527,22 @@ async fn run_daemon() {
         });
     }
 
+    // Drain backlogs stranded behind a dead reservation without waiting for a
+    // restart — a long-lived session never gets one.
+    {
+        let vault = vault.clone();
+        let interval = drain_sweep_interval();
+        let min_age = proxy::capture_idle_timeout();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                if let Err(error) = capture::recover_live(&vault, min_age) {
+                    eprintln!("[plant] drain sweep failed: {error}");
+                }
+            }
+        });
+    }
+
     tokio::spawn(jobs::scheduler(jobs::Cfg::load(&vault), vault.clone()));
     tokio::spawn(async {
         loop {
@@ -574,6 +612,7 @@ mod tests {
                     "ok": true,
                     "harness": adapter.harness.capture_label(),
                     "upstream": adapter.upstream.trim_end_matches('/'),
+                    "unrecorded_drops": capture::unrecorded_drops(),
                 })
             );
             assert!(health_matches(&health, &adapter));

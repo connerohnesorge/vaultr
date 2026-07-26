@@ -578,7 +578,11 @@ struct RecoverySession {
 }
 
 impl RecoverySession {
-    fn apply(mut self) -> Result<(), String> {
+    /// `live_cutoff` is an `observed_at` ISO timestamp (fixed-width UTC, so
+    /// lexicographic order is chronological). When set, a reservation observed
+    /// at or after it is left open instead of synthesized, so a mid-session
+    /// sweep never races a tee that may still complete.
+    fn apply(mut self, live_cutoff: Option<&str>) -> Result<(), String> {
         let next_to_drain = self.journal.require_order()?.next_to_drain;
         let retired: Vec<u64> = self
             .stages
@@ -605,6 +609,16 @@ impl RecoverySession {
                             self.journal.dir.join("state.json").display()
                         )
                     })?;
+                    if let Some(cutoff) = live_cutoff {
+                        let observed = envelope
+                            .get("observed_at")
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        if observed >= cutoff {
+                            // Still inside the tee idle bound: leave it open.
+                            return Ok(());
+                        }
+                    }
                     envelope
                         .as_object_mut()
                         .expect("validated journal request")
@@ -650,6 +664,17 @@ impl RecoverySession {
 }
 
 pub(crate) fn recover_all(vault: &Path) -> Result<(), String> {
+    recover(vault, None)
+}
+
+/// Mid-session sweep: same transaction as startup recovery, except a
+/// reservation younger than `min_age` is left open rather than synthesized.
+pub(crate) fn recover_live(vault: &Path, min_age: std::time::Duration) -> Result<(), String> {
+    let cutoff = super::iso_at(std::time::SystemTime::now() - min_age);
+    recover(vault, Some(cutoff.as_str()))
+}
+
+fn recover(vault: &Path, live_cutoff: Option<&str>) -> Result<(), String> {
     let root = canonical_root(vault);
     let mut directories = BTreeMap::new();
     let mut journals = BTreeMap::new();
@@ -770,7 +795,7 @@ pub(crate) fn recover_all(vault: &Path) -> Result<(), String> {
         });
     }
     for session in inventory {
-        session.apply()?;
+        session.apply(live_cutoff)?;
     }
     Ok(())
 }
