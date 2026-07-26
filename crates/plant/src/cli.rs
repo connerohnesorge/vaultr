@@ -7,6 +7,7 @@ use std::time::Duration;
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     Daemon,
+    ServerStop,
     SelfTest,
     SessionsEligible(EligibleArgs),
     SessionsCoverage(String),
@@ -40,6 +41,7 @@ pub fn parse_command(argv: &[String]) -> Result<Command, String> {
     let args = argv.get(1..).unwrap_or_default();
     match args {
         [] => Ok(Command::Daemon),
+        [group, action] if group == "server" && action == "stop" => Ok(Command::ServerStop),
         [flag] if flag == "--self-test" => Ok(Command::SelfTest),
         [group, action, sid] if group == "sessions" && action == "coverage" && !sid.is_empty() => {
             Ok(Command::SessionsCoverage(sid.clone()))
@@ -214,6 +216,10 @@ mod tests {
     fn parses_bare_and_typed_eligible_forms() {
         assert_eq!(parse_command(&argv(&[])), Ok(Command::Daemon));
         assert_eq!(
+            parse_command(&argv(&["server", "stop"])),
+            Ok(Command::ServerStop)
+        );
+        assert_eq!(
             parse_command(&argv(&[
                 "sessions",
                 "eligible",
@@ -294,6 +300,8 @@ mod tests {
     fn rejects_every_unmatched_or_invalid_nonempty_form() {
         for args in [
             vec!["--help"],
+            vec!["server"],
+            vec!["server", "start"],
             vec!["sessions"],
             vec!["sessions", "stuck", "--age", "bad"],
             vec!["sessions", "eligible", "--learner", "other"],
