@@ -8,6 +8,13 @@ and `~/.dotfiles/.claude/SESSIONS.md` for the behavioral contract.
 - Health: `curl http://127.0.0.1:18923/health`
 - Verify: `target/release/plant --self-test`
 
+## Scheduled jobs
+
+Plant scans `<vault>/jobs/` every minute. A `.hostname` file limits flat jobs
+to that short hostname. If the marker is absent, flat jobs retain their
+original global behavior. Jobs under `<vault>/jobs/shared/` run on every host.
+Manual `plant jobs run <name>` uses the same filtered job set.
+
 ## Capture maintenance ownership
 
 Sweep selects validated generation inventories and policy; the private capture

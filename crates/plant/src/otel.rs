@@ -87,7 +87,7 @@ fn resource(loki_labels: bool) -> Value {
     json!({ "attributes": attributes(&vals) })
 }
 
-fn hostname() -> String {
+pub(crate) fn hostname() -> String {
     std::process::Command::new("hostname")
         .output()
         .ok()

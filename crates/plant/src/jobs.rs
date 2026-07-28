@@ -1,9 +1,11 @@
 //! SwiftBar-style job scheduler: jobs are executable scripts at
-//! <vault content root>/jobs/<name>.<interval>.<ext> (e.g. learn.15m.sh,
-//! door-oncall.30m.ts). The filename carries the cadence; the script is exec'd
-//! directly, so its shebang picks the interpreter (bash, bun, …) — Plant maps no
-//! extensions. The script body does the work itself, composing the plant/vaultr
-//! CLIs (`plant sessions eligible --claim`, `plant agent run`, `vaultr validate`, …).
+//! <vault content root>/jobs/<name>.<interval>.<ext> or jobs/shared/ (e.g.
+//! learn.15m.sh, door-oncall.30m.ts). A jobs/.hostname marker limits flat jobs
+//! to that short hostname; shared jobs always load. The filename carries the
+//! cadence; the script is exec'd directly, so its shebang picks the interpreter
+//! (bash, bun, …) — Plant maps no extensions. The script body does the work
+//! itself, composing the plant/vaultr CLIs (`plant sessions eligible --claim`,
+//! `plant agent run`, `vaultr validate`, …).
 //! Agent-backed jobs MUST go through `plant agent run` (Herdr pane orchestration) —
 //! never `claude -p`.
 //! Outcomes append to ~/.local/state/plant/jobs/<name>.jsonl; the tail line is the
@@ -105,14 +107,11 @@ pub fn jobs_dir() -> Option<PathBuf> {
         .map(|root| root.join("jobs"))
 }
 
-pub fn load_jobs() -> Vec<Job> {
-    let Some(dir) = jobs_dir() else {
-        return Vec::new();
-    };
+fn jobs_in(dir: &Path) -> Vec<Job> {
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };
-    let mut jobs: Vec<Job> = entries
+    entries
         .flatten()
         .filter_map(|e| {
             let path = e.path();
@@ -126,9 +125,29 @@ pub fn load_jobs() -> Vec<Job> {
                 action,
             })
         })
-        .collect();
+        .collect()
+}
+
+fn load_jobs_at(dir: &Path, short_hostname: &str) -> Vec<Job> {
+    let local_jobs_enabled = match std::fs::read_to_string(dir.join(".hostname")) {
+        Ok(hostname) => hostname.trim() == short_hostname,
+        Err(error) => error.kind() == io::ErrorKind::NotFound,
+    };
+    let mut jobs = jobs_in(&dir.join("shared"));
+    if local_jobs_enabled {
+        jobs.extend(jobs_in(dir));
+    }
     jobs.sort_by(|a, b| a.name.cmp(&b.name));
     jobs
+}
+
+pub fn load_jobs() -> Vec<Job> {
+    let Some(dir) = jobs_dir() else {
+        return Vec::new();
+    };
+    let hostname = crate::otel::hostname();
+    let short_hostname = hostname.split('.').next().unwrap_or(&hostname);
+    load_jobs_at(&dir, short_hostname)
 }
 
 /// Panes are kept open by default so failed agent runs stay inspectable; setting
@@ -862,6 +881,29 @@ mod tests {
         ] {
             assert_eq!(parse_job_filename(bad), None, "{bad} should not parse");
         }
+    }
+
+    #[test]
+    fn hostname_marker_scopes_flat_jobs_but_not_shared_jobs() {
+        let root = std::env::temp_dir().join(format!("plant-job-host-{}", uuid::Uuid::new_v4()));
+        let shared = root.join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::write(root.join("local.1h.sh"), "").unwrap();
+        std::fs::write(shared.join("portable.1h.sh"), "").unwrap();
+
+        let names = |host| {
+            load_jobs_at(&root, host)
+                .into_iter()
+                .map(|job| job.name)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(names("other"), ["local", "portable"]);
+
+        std::fs::write(root.join(".hostname"), "CB14957\n").unwrap();
+        assert_eq!(names("CB14957"), ["local", "portable"]);
+        assert_eq!(names("allocator-vm"), ["portable"]);
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
