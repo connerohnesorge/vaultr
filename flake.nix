@@ -49,6 +49,7 @@
           ];
         };
         modulePackages = moduleSystem.config.environment.systemPackages;
+        plantUnit = moduleSystem.config.systemd.units."plant.service".text;
         claudeWrapper =
           nixpkgs.lib.findFirst
           (package: nixpkgs.lib.getName package == "claude")
@@ -80,6 +81,7 @@
           nixos-module =
             assert moduleSystem.config.systemd.services.plant.serviceConfig.User == "vaultr-test";
             assert moduleSystem.config.systemd.services.plant.serviceConfig.TimeoutStopSec == "40s";
+            assert plantUnit != "";
             assert claudeWrapper != null;
             assert codexWrapper != null;
             pkgs.runCommand "vaultr-nixos-module-check" {} ''

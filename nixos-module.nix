@@ -65,7 +65,7 @@ in {
       unitConfig.StartLimitIntervalSec = 0;
       environment = {
         HOME = home;
-        PATH = "/run/current-system/sw/bin:/run/wrappers/bin";
+        PATH = lib.mkForce "/run/current-system/sw/bin:/run/wrappers/bin";
       };
       serviceConfig = {
         User = cfg.user;
