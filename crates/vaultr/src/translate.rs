@@ -86,12 +86,21 @@ pub fn to_anthropic(messages: &[Message]) -> Vec<Value> {
                     name,
                     input,
                     correlation_id,
-                } => match (correlation_id.as_deref(), codex_to_claude(name)) {
-                    (Some(source_id), Some(mapped)) if valid.contains(source_id) => {
+                } => match (
+                    correlation_id.as_deref(),
+                    codex_to_claude(name).map(|m| (m, adapt_input_to_claude(m, input))),
+                ) {
+                    // Anthropic rejects a tool_use whose input is not an object
+                    // (custom tools like apply_patch carry a raw string, and a
+                    // local_shell_call carries no arguments at all) — degrade
+                    // those to text rather than write an unresumable session.
+                    (Some(source_id), Some((mapped, adapted)))
+                        if valid.contains(source_id) && adapted.is_object() =>
+                    {
                         let id = format!("toolu_{}", uuid::Uuid::new_v4().simple());
                         blocks.push(json!({
                             "type": "tool_use", "id": id, "name": mapped,
-                            "input": adapt_input_to_claude(mapped, input),
+                            "input": adapted,
                         }));
                         ids.insert(source_id, id);
                     }
@@ -326,6 +335,38 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("[tool result]"));
+    }
+
+    #[test]
+    fn non_object_tool_input_degrades_to_text() {
+        // apply_patch (custom tool) sends a raw patch string; local_shell_call
+        // sends no arguments at all. Neither is a legal Anthropic tool_use input.
+        for input in [json!("*** Begin Patch\n*** Add File: a.rs"), Value::Null] {
+            let messages = vec![
+                Message {
+                    role: Role::Assistant,
+                    blocks: vec![Block::ToolUse {
+                        name: "apply_patch".into(),
+                        input,
+                        correlation_id: Some("c1".into()),
+                    }],
+                },
+                Message {
+                    role: Role::User,
+                    blocks: vec![Block::ToolResult {
+                        content: "applied".into(),
+                        correlation_id: Some("c1".into()),
+                    }],
+                },
+            ];
+            let out = to_anthropic(&messages);
+            assert_eq!(out[0]["content"][0]["type"], "text");
+            assert_eq!(out[1]["content"][0]["type"], "text");
+            assert!(out
+                .iter()
+                .flat_map(|m| m["content"].as_array().unwrap())
+                .all(|b| b["input"].is_null() || b["input"].is_object()));
+        }
     }
 
     fn tool_use(name: &str, id: Option<&str>) -> Message {
