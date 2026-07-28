@@ -5,6 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use super::session_fs::SessionDirectory;
 use commit::commit_stage;
 
 mod commit;
@@ -477,6 +478,8 @@ pub(super) async fn reserve(
 ) -> Result<(u64, Value), String> {
     let lock = session_lock(root, sid);
     let _guard = lock.lock().await;
+    let directory = SessionDirectory::open(dir)?;
+    directory.lock_exclusive()?;
     let mut journal = Journal::load(dir, sid)?;
     let prior = journal.prior_body();
     let (request, state) = build(&prior);
@@ -496,6 +499,8 @@ pub(super) async fn commit_completed(
 ) -> Result<(), String> {
     let lock = session_lock(root, sid);
     let _guard = lock.lock().await;
+    let directory = SessionDirectory::open(dir)?;
+    directory.lock_exclusive()?;
     let mut journal = Journal::load(dir, sid)?;
     Stage::publish(root, sid, sequence, envelope)?;
     on_staged();
@@ -583,6 +588,11 @@ impl RecoverySession {
     /// at or after it is left open instead of synthesized, so a mid-session
     /// sweep never races a tee that may still complete.
     fn apply(mut self, live_cutoff: Option<&str>) -> Result<(), String> {
+        let directory = SessionDirectory::open(&self.journal.dir)?;
+        directory.lock_exclusive()?;
+        self.journal = Journal::load(&self.journal.dir, &self.sid)?;
+        self.stages = read_stages(&self.root, &self.sid, &self.journal, true)?;
+
         let next_to_drain = self.journal.require_order()?.next_to_drain;
         let retired: Vec<u64> = self
             .stages
@@ -773,12 +783,15 @@ fn recover(vault: &Path, live_cutoff: Option<&str>) -> Result<(), String> {
                 vault.display()
             )
         })?;
-        let journal = journals.remove(&sid).ok_or_else(|| {
+        journals.remove(&sid).ok_or_else(|| {
             format!(
                 "capture recovery: staged session {sid} has no journal at {}",
                 directory.display()
             )
         })?;
+        let directory_lock = SessionDirectory::open(directory)?;
+        directory_lock.lock_exclusive()?;
+        let journal = Journal::load(directory, &sid)?;
         let order = journal.require_order()?;
         if order.root != root {
             return Err(format!(

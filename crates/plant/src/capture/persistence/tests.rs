@@ -523,6 +523,67 @@ fn recovery_ignores_an_empty_stage_directory_without_a_journal() {
     fs::remove_dir_all(root).unwrap();
 }
 
+#[tokio::test]
+async fn recovery_reloads_the_journal_after_a_concurrent_reservation() {
+    let state = test_dir("recovery-reload-state");
+    let _guard = crate::state::use_test_dir(state.clone());
+    let dir = test_dir("recovery-reload-session");
+    let sid = "00000000-0000-4000-8000-000000000060";
+    let root = "/vault";
+    let first = envelope(sid);
+    write_ordered_journal(&dir, sid, root, &first);
+    let journal = Journal::load(&dir, sid).unwrap();
+    let stages = read_stages(root, sid, &journal, false).unwrap();
+    let recovery = RecoverySession {
+        sid: sid.to_string(),
+        root: root.to_string(),
+        journal,
+        stages,
+    };
+
+    let mut second = envelope(sid);
+    second["request_id"] = json!("00000000-0000-4000-8000-000000000061");
+    second.as_object_mut().unwrap().remove("response");
+    let next_state = json!({
+        "schema_version": 1,
+        "harness": "claude-code",
+        "session_id": sid,
+        "request_body": {},
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+    assert_eq!(
+        reserve(&dir, root, sid, |_| (second, next_state))
+            .await
+            .unwrap()
+            .0,
+        1
+    );
+
+    recovery.apply(None).unwrap();
+
+    let request_ids = fs::read_to_string(dir.join("turns.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<Value>(line).unwrap()["request_id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        request_ids,
+        [
+            "00000000-0000-4000-8000-000000000040",
+            "00000000-0000-4000-8000-000000000061",
+        ]
+    );
+    fs::remove_dir_all(dir).unwrap();
+    fs::remove_dir_all(state).unwrap();
+}
+
 #[cfg(unix)]
 #[test]
 fn recovery_rejects_symlink_escapes_without_mutating_evidence() {
