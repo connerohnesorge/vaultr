@@ -230,6 +230,39 @@ fn validate_order(order: &CaptureOrder, path: &Path, sid: &str) -> Result<(), St
 
 static SESSION_LOCKS: Mutex<Option<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     Mutex::new(None);
+static ACTIVE_CAPTURES: Mutex<Option<BTreeSet<String>>> = Mutex::new(None);
+
+pub(super) struct ActiveCapture(String);
+
+impl Drop for ActiveCapture {
+    fn drop(&mut self) {
+        if let Some(captures) = ACTIVE_CAPTURES.lock().unwrap().as_mut() {
+            captures.remove(&self.0);
+        }
+    }
+}
+
+fn active_key(root: &str, sid: &str, sequence: u64) -> String {
+    format!("{root}\0{sid}\0{sequence}")
+}
+
+fn register_active(root: &str, sid: &str, sequence: u64) -> ActiveCapture {
+    let key = active_key(root, sid, sequence);
+    ACTIVE_CAPTURES
+        .lock()
+        .unwrap()
+        .get_or_insert_with(BTreeSet::new)
+        .insert(key.clone());
+    ActiveCapture(key)
+}
+
+fn is_active(root: &str, sid: &str, sequence: u64) -> bool {
+    ACTIVE_CAPTURES
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|captures| captures.contains(&active_key(root, sid, sequence)))
+}
 
 pub(super) fn session_lock(root: &str, sid: &str) -> Arc<tokio::sync::Mutex<()>> {
     let key = format!("{root}\0{sid}");
@@ -475,7 +508,7 @@ pub(super) async fn reserve(
     root: &str,
     sid: &str,
     build: impl FnOnce(&Value) -> (Value, Map<String, Value>),
-) -> Result<(u64, Value), String> {
+) -> Result<(u64, Value, ActiveCapture), String> {
     let lock = session_lock(root, sid);
     let _guard = lock.lock().await;
     let directory = SessionDirectory::open(dir)?;
@@ -486,7 +519,7 @@ pub(super) async fn reserve(
     let sequence = journal.reserve(root, request.clone())?;
     journal.replace_state(state);
     journal.persist()?;
-    Ok((sequence, request))
+    Ok((sequence, request, register_active(root, sid, sequence)))
 }
 
 pub(super) async fn commit_completed(
@@ -619,13 +652,15 @@ impl RecoverySession {
                             self.journal.dir.join("state.json").display()
                         )
                     })?;
+                    if live_cutoff.is_some() && is_active(&self.root, &self.sid, sequence) {
+                        return Ok(());
+                    }
                     if let Some(cutoff) = live_cutoff {
                         let observed = envelope
                             .get("observed_at")
                             .and_then(Value::as_str)
                             .unwrap_or("");
                         if observed >= cutoff {
-                            // Still inside the tee idle bound: leave it open.
                             return Ok(());
                         }
                     }

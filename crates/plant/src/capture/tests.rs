@@ -479,8 +479,8 @@ async fn periodic_sweep_drains_a_stranded_backlog_but_spares_live_reservations()
     let adapter = claude_adapter();
     let sid = uuid::Uuid::new_v4().to_string();
 
-    // Seq 0 is the dead head; seq 1 and 2 complete and stage behind it.
-    let _head = prepare_capture(&vault, &adapter, captured(Some(&sid)), body(&["a"]))
+    // Seq 0 stays active while seq 1 and 2 complete and stage behind it.
+    let head = prepare_capture(&vault, &adapter, captured(Some(&sid)), body(&["a"]))
         .await
         .unwrap();
     let second = prepare_capture(&vault, &adapter, captured(Some(&sid)), body(&["a", "b"]))
@@ -503,15 +503,16 @@ async fn periodic_sweep_drains_a_stranded_backlog_but_spares_live_reservations()
         .unwrap();
     assert!(turns_lines(&dir).is_empty(), "backlog is stranded");
 
-    // Every reservation is younger than the bound: the sweep must not touch it.
-    recover_live(&vault, Duration::from_secs(3600)).unwrap();
+    // Total age is not idleness: even a zero-age sweep must spare a live stream.
+    recover_live(&vault, Duration::ZERO).unwrap();
     assert!(
         turns_lines(&dir).is_empty(),
         "sweep synthesized a live reservation"
     );
     assert!(has_open_capture(&vault, &sid));
 
-    // Past the bound: the dead head is synthesized and the backlog drains.
+    // Once the stream disappears, the dead head is synthesized and the backlog drains.
+    drop(head);
     recover_live(&vault, Duration::ZERO).unwrap();
     let lines = turns_lines(&dir);
     assert_eq!(lines.len(), 3, "one record per reserved sequence");

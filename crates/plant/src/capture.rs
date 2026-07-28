@@ -47,6 +47,7 @@ pub struct PendingCapture {
     pub request_part: Value,
     pub model: Option<String>,
     pub req: CapturedRequest,
+    _active: persistence::ActiveCapture,
 }
 
 pub struct CapturedResponse {
@@ -273,7 +274,7 @@ pub async fn prepare_capture(
     let dir = session_dir(vault, &sid).map_err(|error| error.to_string())?;
     let root = canonical_root(vault);
     let model = body.get("model").and_then(Value::as_str).map(String::from);
-    let (sequence, request_part) = persistence::reserve(&dir, &root, &sid, |prior| {
+    let (sequence, request_part, active) = persistence::reserve(&dir, &root, &sid, |prior| {
         let body_delta = recon::encode_delta(prior, &body, adapter.history_key, adapter.big_fields);
         let request = json!({
             "schema_version": 1,
@@ -313,6 +314,7 @@ pub async fn prepare_capture(
         request_part,
         model,
         req,
+        _active: active,
     })
 }
 
