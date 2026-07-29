@@ -317,7 +317,52 @@ pub fn scan(content_root: &Path) -> Result<Report> {
         }
     }
 
-    // Ledger integrity: every non-empty line parses as JSON with session_id.
+    // Learn-record integrity: each per-pass record names a known learner and
+    // carries a readable outcome and timestamp. Reported against its own path,
+    // since the path is what makes the record attributable at all.
+    if let Ok(sessions) = crate::vault::walk_session_dirs(&content_root.join("sessions")) {
+        for (_, session) in sessions {
+            let Ok(entries) = std::fs::read_dir(&session) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    continue;
+                };
+                let Some(learner) = crate::learn::record_learner(name) else {
+                    continue;
+                };
+                let path = entry.path();
+                let rel = path
+                    .strip_prefix(content_root)
+                    .unwrap_or(&path)
+                    .display()
+                    .to_string();
+                let detail = learner.err().map(|error| error.to_string()).or_else(|| {
+                    match std::fs::read_to_string(&path) {
+                        Err(error) => Some(format!("record is unreadable: {error}")),
+                        Ok(text) => crate::learn::parse_record(&text)
+                            .err()
+                            .map(|error| error.to_string()),
+                    }
+                });
+                if let Some(detail) = detail {
+                    report.findings.push(Finding {
+                        severity: Severity::Error,
+                        kind: "learn-record",
+                        file: rel,
+                        line: 0,
+                        detail,
+                    });
+                }
+            }
+        }
+    }
+
+    // Frozen legacy ledger: history, read-only. Its rows are exempt from the
+    // per-record rules — 138 duplicate keys and 518 learner-less rows predate
+    // them — but every non-empty line must still parse as JSON with session_id.
     let ledger = ledger_path(content_root);
     if let Ok(text) = std::fs::read_to_string(&ledger) {
         for (i, line) in text.lines().enumerate() {

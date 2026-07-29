@@ -10,60 +10,24 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-/// Session id to latest `processed_at` for one learner. Entries without a
-/// learner key are the legacy Claude pass.
-fn ledger_latest(vault: &Path, learner: Harness) -> HashMap<String, u64> {
-    let mut processed = HashMap::new();
-    let Ok(root) = vaultr::validate::content_root(vault) else {
-        return processed;
-    };
-    let Ok(text) = std::fs::read_to_string(vaultr::validate::ledger_path(&root)) else {
-        return processed;
-    };
-    for line in text.lines() {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        let recorded = value.get("learner").and_then(|learner| learner.as_str());
-        if recorded != Some(learner.ledger_label())
-            && (recorded.is_some() || learner != Harness::ClaudeCode)
-        {
-            continue;
-        }
-        let Some(sid) = value.get("session_id").and_then(|sid| sid.as_str()) else {
-            continue;
-        };
-        let timestamp = value
-            .get("processed_at")
-            .and_then(|timestamp| timestamp.as_str())
-            .and_then(iso_to_epoch)
-            .unwrap_or(0);
-        let prior = processed.entry(sid.to_string()).or_insert(0);
-        *prior = (*prior).max(timestamp);
-    }
-    processed
-}
+/// Per-session, per-learner latest pass, folded from the frozen legacy ledger
+/// and from the per-pass learn records found during the session-directory walk.
+#[derive(Debug, Default)]
+struct LearnState(HashMap<String, HashMap<String, vaultr::learn::Pass>>);
 
-/// ISO-8601 seconds (fractional seconds tolerated) to Unix epoch seconds.
-fn iso_to_epoch(value: &str) -> Option<u64> {
-    let bytes = value.as_bytes();
-    if bytes.len() < 19 || bytes[4] != b'-' || bytes[7] != b'-' || bytes[10] != b'T' {
-        return None;
+impl LearnState {
+    /// Session id to latest `processed_at` for one learner — the shape every
+    /// caller consumed from the ledger before records existed.
+    fn latest(&self, learner: Harness) -> HashMap<String, u64> {
+        self.0
+            .iter()
+            .filter_map(|(sid, passes)| {
+                passes
+                    .get(learner.ledger_label())
+                    .map(|pass| (sid.clone(), pass.processed_at))
+            })
+            .collect()
     }
-    let number = |range: std::ops::Range<usize>| value.get(range)?.parse::<i64>().ok();
-    let (year, month, day) = (number(0..4)?, number(5..7)?, number(8..10)?);
-    let (hour, minute, second) = (number(11..13)?, number(14..16)?, number(17..19)?);
-    let (year, month) = if month <= 2 {
-        (year - 1, month + 12)
-    } else {
-        (year, month)
-    };
-    let era = year / 400;
-    let year_of_era = year - era * 400;
-    let day_of_year = (153 * (month - 3) + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    let days = era * 146_097 + day_of_era - 719_468;
-    u64::try_from(days * 86_400 + hour * 3600 + minute * 60 + second).ok()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -215,27 +179,40 @@ impl SessionGeneration {
     }
 }
 
+/// Walks every session directory once, collecting both the capture-generation
+/// inventory and that session's learn records. Learn state seeds from the frozen
+/// legacy ledger first, so the sessions whose capture directory is gone keep
+/// their legacy rows; records found on the walk then supersede them per learner.
 fn session_generations(
     vault: &Path,
     select: fn(String, vaultr::vault::CaptureGenerations) -> Option<SessionGeneration>,
-) -> Result<Vec<SessionGeneration>, String> {
+) -> Result<(Vec<SessionGeneration>, LearnState), String> {
+    let root = vaultr::validate::content_root(vault).map_err(|error| error.to_string())?;
+    let mut learn = LearnState(vaultr::learn::legacy_index(&root).map_err(|e| e.to_string())?);
     let mut generations = Vec::new();
     let sessions = vaultr::vault::walk_session_dirs(vault).map_err(|error| error.to_string())?;
     for (sid, session) in sessions {
         let inventory =
             vaultr::vault::CaptureGenerations::load(&session).map_err(|error| error.to_string())?;
+        let passes = vaultr::learn::session_passes(&session).map_err(|e| format!("{e:#}"))?;
+        if !passes.is_empty() {
+            let folded = learn.0.entry(sid.clone()).or_default();
+            for (learner, pass) in passes {
+                vaultr::learn::fold(folded, &learner, pass);
+            }
+        }
         if let Some(generation) = select(sid, inventory) {
             generations.push(generation);
         }
     }
-    Ok(generations)
+    Ok((generations, learn))
 }
 
-fn current_generations(vault: &Path) -> Result<Vec<SessionGeneration>, String> {
+fn current_generations(vault: &Path) -> Result<(Vec<SessionGeneration>, LearnState), String> {
     session_generations(vault, SessionGeneration::current)
 }
 
-fn pending_generations(vault: &Path) -> Result<Vec<SessionGeneration>, String> {
+fn pending_generations(vault: &Path) -> Result<(Vec<SessionGeneration>, LearnState), String> {
     session_generations(vault, SessionGeneration::pending_seal)
 }
 
@@ -382,11 +359,12 @@ pub fn dropped_turn_alerts(vault: &Path) -> Vec<String> {
 }
 
 pub fn stuck_captures(vault: &Path, age: Duration) -> Result<Vec<StuckCapture>, String> {
-    let claude = ledger_latest(vault, Harness::ClaudeCode);
-    let codex = ledger_latest(vault, Harness::Codex);
+    let (pending, learn) = pending_generations(vault)?;
+    let claude = learn.latest(Harness::ClaudeCode);
+    let codex = learn.latest(Harness::Codex);
     let jobs = job_sids();
     let mut stuck = Vec::new();
-    for generation in pending_generations(vault)? {
+    for generation in pending {
         let Some(idle_secs) = generation.idle_secs()? else {
             continue;
         };
@@ -461,11 +439,12 @@ fn eligible_candidates(
     max: usize,
     learner: Harness,
 ) -> Result<Vec<(String, PathBuf)>, String> {
-    let processed = ledger_latest(vault, learner);
+    let (current, learn) = current_generations(vault)?;
+    let processed = learn.latest(learner);
     let inflight = inflight_sessions(vault, learner);
     let jobs = job_sids();
     let mut candidates = Vec::new();
-    for generation in current_generations(vault)? {
+    for generation in current {
         if jobs.contains(&generation.sid)
             || generation.learned_current(&processed)?
             || inflight.contains(&generation.sid)
@@ -533,10 +512,8 @@ pub fn eligible_and_claim(
 }
 
 pub fn eligibility_stats(vault: &Path, learner: Harness) -> Result<(usize, usize), String> {
-    Ok((
-        current_generations(vault)?.len(),
-        ledger_latest(vault, learner).len(),
-    ))
+    let (current, learn) = current_generations(vault)?;
+    Ok((current.len(), learn.latest(learner).len()))
 }
 
 const COMMIT_CAP: u64 = 256 * 1024 * 1024;
@@ -588,12 +565,12 @@ fn exclude_from_commit(vault: &Path, sealed: &Path, size: u64) {
 }
 
 pub async fn compress_sweep(vault: &Path, idle: Duration) -> Result<(), CompressError> {
-    let pending = pending_generations(vault).map_err(CompressError::Inventory)?;
+    let (pending, learn) = pending_generations(vault).map_err(CompressError::Inventory)?;
     if !which("zstd") {
         return Err(CompressError::Operational("zstd not on PATH".into()));
     }
-    let claude = ledger_latest(vault, Harness::ClaudeCode);
-    let codex = ledger_latest(vault, Harness::Codex);
+    let claude = learn.latest(Harness::ClaudeCode);
+    let codex = learn.latest(Harness::Codex);
     let jobs = job_sids();
     let mut sealed = 0u32;
     for selected in pending {

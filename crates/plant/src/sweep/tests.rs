@@ -80,7 +80,7 @@ fn walker_skips_non_date_dirs_but_finds_dated_sessions() {
         std::fs::write(directory.join("turns.jsonl"), "{}\n").unwrap();
     }
 
-    let raw = pending_generations(&sessions).unwrap();
+    let (raw, _) = pending_generations(&sessions).unwrap();
     assert_eq!(raw.len(), 1, "only the dated session, got {raw:?}");
     assert_eq!(raw[0].sid, sid);
     assert_eq!(raw[0].selected, GenerationKind::Raw);
@@ -91,11 +91,11 @@ fn walker_skips_non_date_dirs_but_finds_dated_sessions() {
     );
 
     std::fs::remove_file(dated.join("turns.jsonl")).unwrap();
-    let all = current_generations(&sessions).unwrap();
+    let (all, _) = current_generations(&sessions).unwrap();
     assert_eq!(all.len(), 1);
     assert_eq!(all[0].selected, GenerationKind::Sealed);
     assert_eq!(all[0].path(), dated.join("turns.jsonl.zst"));
-    assert!(pending_generations(&sessions).unwrap().is_empty());
+    assert!(pending_generations(&sessions).unwrap().0.is_empty());
 
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -293,15 +293,6 @@ fn malformed_active_lease_fails_closed() {
 }
 
 #[test]
-fn iso_to_epoch_parses_ledger_timestamps() {
-    assert_eq!(iso_to_epoch("1970-01-01T00:00:00Z"), Some(0));
-    assert_eq!(iso_to_epoch("2000-01-01T00:00:00Z"), Some(946_684_800));
-    assert_eq!(iso_to_epoch("2000-01-01T00:00:00.123Z"), Some(946_684_800));
-    assert_eq!(iso_to_epoch("not a date"), None);
-    assert_eq!(iso_to_epoch(""), None);
-}
-
-#[test]
 fn resumed_session_is_relearned_per_generation() {
     let root = temp_root("resume");
     let sessions = root.join("sessions");
@@ -348,7 +339,12 @@ fn resumed_session_is_relearned_per_generation() {
     let sealed = SessionGeneration::current(sid.to_string(), inventory).unwrap();
     assert_eq!(sealed.selected, GenerationKind::Sealed);
     assert!(sealed
-        .learned_current(&ledger_latest(&sessions, Harness::ClaudeCode))
+        .learned_current(
+            &current_generations(&sessions)
+                .unwrap()
+                .1
+                .latest(Harness::ClaudeCode)
+        )
         .unwrap());
 
     std::fs::remove_dir_all(root).unwrap();
