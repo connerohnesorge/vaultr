@@ -1,7 +1,7 @@
-# Native session-storage formats — Claude Code 2.1.210 & Codex CLI 0.144.4
+# Native session-storage formats — Claude Code 2.1.210, Codex CLI 0.144.4, and Pi 0.82.1
 
 Documented from real on-disk data on this Mac (2026-07-15). Goal: enable a Rust writer to emit
-synthetic-but-valid session files that `claude --resume <id>` and `codex resume <id>` natively resume.
+synthetic-but-valid session files that Claude Code, Codex, and Pi natively resume.
 
 ---
 
@@ -283,7 +283,63 @@ the DB, provided filename and `session_meta.id` agree. Recent rollouts all repor
 
 ---
 
-## 3. Synthetic-writer checklist
+## 3. Pi
+
+### 3.1 Path and filename
+
+```
+~/.pi/agent/sessions/--<encoded-cwd>--/<UTC-timestamp>_<uuidv7>.jsonl
+```
+
+`PI_CODING_AGENT_SESSION_DIR` overrides the complete session root.
+Otherwise, Pi uses `PI_CODING_AGENT_DIR/sessions`, then `~/.pi/agent/sessions`.
+The cwd encoding removes the leading slash and maps `/`, `\`, and `:` to `-`.
+The filename timestamp uses UTC with colons and the decimal separator mapped to `-`.
+
+### 3.2 Version 3 records
+
+The first line is metadata and does not participate in the entry chain:
+
+```json
+{"type":"session","version":3,"id":"<uuidv7>","timestamp":"2026-07-29T12:00:00.000Z","cwd":"/path/to/project"}
+```
+
+Every later entry has an eight-character hexadecimal `id`, a `parentId`, and an ISO UTC timestamp.
+The first entry has `parentId:null`; every later entry names the previous entry.
+An optional `model_change` records a captured model:
+
+```json
+{"type":"model_change","id":"a1b2c3d4","parentId":null,"timestamp":"...","provider":"openai-codex","modelId":"gpt-5.6-sol"}
+```
+
+Conversation entries wrap Pi agent messages:
+
+```json
+{"type":"message","id":"...","parentId":"...","timestamp":"...","message":{
+  "role":"user","content":[{"type":"text","text":"hello"}],"timestamp":1785340800000
+}}
+{"type":"message","id":"...","parentId":"...","timestamp":"...","message":{
+  "role":"assistant","content":[{"type":"text","text":"hi"}],
+  "api":"openai-codex-responses","provider":"openai-codex","model":"gpt-5.6-sol",
+  "usage":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"totalTokens":0,
+           "cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},
+  "stopReason":"stop","timestamp":1785340800001
+}}
+```
+
+Tool calls use `{"type":"toolCall","id","name","arguments"}` assistant blocks.
+Their result is a separate `toolResult` message with the same `toolCallId`.
+Pi accepts a conservative session without response IDs, signatures, thinking blocks, or details.
+
+### 3.3 Resume discovery
+
+`pi --session <absolute-file>` opens the generated file directly.
+`SessionManager.open(path)` validates and loads the same version 3 file.
+No database update is required.
+
+---
+
+## 4. Synthetic-writer checklist
 
 ### Claude Code — minimal viable resumable session
 
@@ -321,6 +377,16 @@ the DB, provided filename and `session_meta.id` agree. Recent rollouts all repor
 7. DB row optional — backfill/read-repair creates it from the filename; do not write the sqlite
    yourself.
 
+### Pi — minimal viable resumable session
+
+1. Choose UUIDv7 `P`; write the cwd-encoded UTC filename beneath the resolved Pi session root.
+2. Write a version 3 `session` header with `id:P`, `cwd`, and an ISO UTC timestamp.
+3. Optionally write `model_change` when the Session Capture identifies a model.
+4. Write one linear eight-hex-ID chain of `message` entries.
+5. Use Pi `user`, `assistant`, and paired `toolResult` message shapes.
+6. Omit opaque reasoning and signatures; use zero usage for reconstructed assistant messages.
+7. Resume by absolute path with `pi --session <path>`.
+
 ### Risks
 
 - **Claude**: broken `parentUuid` chain or a `last-prompt.leafUuid` pointing at a missing uuid may
@@ -334,11 +400,13 @@ the DB, provided filename and `session_meta.id` agree. Recent rollouts all repor
   already claims the uuid with a different `rollout_path`, resume may follow the DB; missing
   `event_msg/user_message` yields an empty preview/title (`has_user_event:0`) but sessions still
   appear (real rows with 0 exist).
-- Both CLIs move fast; re-verify against the exact installed version before shipping the writer.
+- **Pi**: version 3 requires a valid linked entry chain and typed message roles; malformed tool pairs
+  should degrade to text instead of producing an unresumable history.
+- All three CLIs move fast; re-verify against the exact installed version before shipping a writer.
 
 ---
 
-## 4. Injected-scaffolding inventory
+## 5. Injected-scaffolding inventory
 
 **Injected scaffolding** = text the harness/hooks add to requests at wire time — claudeMd context,
 `<system-reminder>` blocks, agent/skill/hook listings, AGENTS.md, `<permissions>` /

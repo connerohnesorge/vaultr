@@ -1,6 +1,6 @@
 //! `vaultr session fork` orchestration: reconstruct a captured session from
 //! the vault (never from native agent stores) and write it as a fresh native
-//! session for Claude Code or Codex, then launch the target CLI on it.
+//! session for Claude Code, Codex, or Pi, then launch the target CLI on it.
 //!
 //! Same-harness forks pass the reconstructed raw wire history through with
 //! minimal transformation (the cacheability gate requires the resumed messages
@@ -8,7 +8,7 @@
 //! through the normalized model plus best-effort tool translation.
 
 use crate::recon::Harness;
-use crate::{claude_writer, codex_writer, normalize, recon, translate, vault};
+use crate::{claude_writer, codex_writer, normalize, pi_writer, recon, translate, vault};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 pub enum Target {
     Claude,
     Codex,
+    Pi,
 }
 
 #[derive(Debug, Default)]
@@ -25,10 +26,16 @@ pub struct ForkOptions {
     pub cwd: Option<PathBuf>,
     /// Skip launching the target CLI; print the command instead.
     pub no_launch: bool,
+    /// Optional first prompt for the resumed target session.
+    pub prompt: Option<String>,
+    /// Restrict the resumed target to its native read-only controls.
+    pub read_only: bool,
     /// Override CLAUDE_CONFIG_DIR resolution (tests).
     pub claude_config_dir: Option<PathBuf>,
     /// Override CODEX_HOME resolution (tests).
     pub codex_home: Option<PathBuf>,
+    /// Override Pi session-root resolution (tests).
+    pub pi_session_dir: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -79,7 +86,7 @@ pub fn fork(root: &Path, id: &str, target: Target, opts: &ForkOptions) -> Result
     let cwd_str = cwd.to_string_lossy().to_string();
     let git_branch = session.meta.git_branch.as_deref();
 
-    let (new_id, path, launch) = match target {
+    let (new_id, path, mut launch) = match target {
         Target::Claude => {
             let config_root = config_root(
                 opts.claude_config_dir.as_deref(),
@@ -136,7 +143,35 @@ pub fn fork(root: &Path, id: &str, target: Target, opts: &ForkOptions) -> Result
             let launch = vec!["codex".into(), "resume".into(), id.clone()];
             (id, path, launch)
         }
+        Target::Pi => {
+            let session_root = pi_session_root(opts.pi_session_dir.as_deref())?;
+            let (provider, api) = match source {
+                Harness::Claude => ("anthropic", "anthropic-messages"),
+                Harness::Codex => ("openai-codex", "openai-codex-responses"),
+            };
+            let messages = normalize::normalize(&recon.messages);
+            let (id, path) = pi_writer::write(
+                &session_root,
+                &cwd_str,
+                provider,
+                api,
+                session.meta.model.as_deref(),
+                &messages,
+            )?;
+            let launch = vec![
+                "pi".into(),
+                "--session".into(),
+                path.to_string_lossy().into_owned(),
+            ];
+            (id, path, launch)
+        }
     };
+    if opts.read_only {
+        apply_read_only(target, &mut launch);
+    }
+    if let Some(prompt) = &opts.prompt {
+        launch.push(prompt.clone());
+    }
 
     Ok(ForkOutcome {
         new_id,
@@ -144,6 +179,21 @@ pub fn fork(root: &Path, id: &str, target: Target, opts: &ForkOptions) -> Result
         cwd,
         launch,
     })
+}
+
+fn apply_read_only(target: Target, launch: &mut Vec<String>) {
+    let (index, args): (usize, &[&str]) = match target {
+        Target::Claude => (
+            1,
+            &["--permission-mode", "plan", "--tools", "Read,Grep,Glob"],
+        ),
+        Target::Codex => (
+            2,
+            &["--sandbox", "read-only", "--ask-for-approval", "never"],
+        ),
+        Target::Pi => (1, &["--tools", "read,grep,find,ls"]),
+    };
+    launch.splice(index..index, args.iter().map(|arg| (*arg).to_string()));
 }
 
 /// Replace the current process with the target CLI in the fork's cwd.
@@ -186,6 +236,31 @@ fn config_root(
     };
     if !root.is_absolute() {
         bail!("{label} must be absolute (nothing was written)");
+    }
+    Ok(root)
+}
+
+fn pi_session_root(override_root: Option<&Path>) -> Result<PathBuf> {
+    let root = if let Some(root) = override_root {
+        root.to_path_buf()
+    } else if let Some(root) =
+        std::env::var_os("PI_CODING_AGENT_SESSION_DIR").filter(|value| !value.is_empty())
+    {
+        root.into()
+    } else if let Some(root) =
+        std::env::var_os("PI_CODING_AGENT_DIR").filter(|value| !value.is_empty())
+    {
+        PathBuf::from(root).join("sessions")
+    } else {
+        PathBuf::from(
+            std::env::var_os("HOME")
+                .filter(|value| !value.is_empty())
+                .context("HOME is missing or empty (nothing was written)")?,
+        )
+        .join(".pi/agent/sessions")
+    };
+    if !root.is_absolute() {
+        bail!("Pi session root must be absolute (nothing was written)");
     }
     Ok(root)
 }

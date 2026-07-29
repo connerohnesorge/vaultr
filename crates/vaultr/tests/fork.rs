@@ -2,11 +2,11 @@
 //! ~/.codex, or the vault. Integration smokes read the real vault read-only
 //! and skip when it is absent.
 
-use chrono::{Local, TimeZone};
+use chrono::{Local, TimeZone, Utc};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use vaultr::fork::{self, ForkOptions, Target};
-use vaultr::{claude_writer, codex_writer, recon};
+use vaultr::{claude_writer, codex_writer, normalize, pi_writer, recon};
 
 fn tmp() -> tempfile::TempDir {
     tempfile::tempdir().expect("tempdir")
@@ -353,6 +353,113 @@ fn codex_passthrough_only_lifts_one_truly_leading_developer_message() {
     assert_eq!(base.as_deref(), Some("first"));
 }
 
+// ---------- Pi writer ----------
+
+#[test]
+fn pi_v3_path_chain_and_tool_pairs() {
+    let root = tmp();
+    let id = uuid::Uuid::now_v7().to_string();
+    let started = Utc.with_ymd_and_hms(2026, 7, 3, 23, 58, 7).unwrap();
+    let messages = normalize::normalize(&sample_messages());
+    let path = pi_writer::write_with_id(
+        root.path(),
+        "/Users/x/.dotfiles",
+        "anthropic",
+        "anthropic-messages",
+        Some("claude-opus-4-8"),
+        &messages,
+        &id,
+        started,
+    )
+    .unwrap();
+    assert_eq!(
+        path.strip_prefix(root.path()).unwrap(),
+        PathBuf::from(format!(
+            "--Users-x-.dotfiles--/2026-07-03T23-58-07-000Z_{id}.jsonl"
+        ))
+    );
+
+    let recs = read_jsonl(&path);
+    assert_eq!(recs[0]["type"], "session");
+    assert_eq!(recs[0]["version"], 3);
+    assert_eq!(recs[0]["id"], id);
+    assert_eq!(recs[0]["cwd"], "/Users/x/.dotfiles");
+    assert_eq!(recs[1]["type"], "model_change");
+    assert_eq!(recs[1]["provider"], "anthropic");
+    assert_eq!(recs[1]["modelId"], "claude-opus-4-8");
+
+    let entries = &recs[1..];
+    assert!(entries[0]["parentId"].is_null());
+    for window in entries.windows(2) {
+        assert_eq!(window[1]["parentId"], window[0]["id"]);
+    }
+    assert!(entries.iter().all(|entry| {
+        entry["id"]
+            .as_str()
+            .is_some_and(|id| id.len() == 8 && id.chars().all(|c| c.is_ascii_hexdigit()))
+    }));
+
+    let messages: Vec<&Value> = entries
+        .iter()
+        .filter(|entry| entry["type"] == "message")
+        .map(|entry| &entry["message"])
+        .collect();
+    assert_eq!(
+        messages
+            .iter()
+            .map(|message| message["role"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["user", "assistant", "toolResult", "assistant"]
+    );
+    assert!(!messages[0].to_string().contains("secret scaffolding"));
+    let call = messages[1]["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|block| block["type"] == "toolCall")
+        .unwrap();
+    assert_eq!(call["name"], "bash");
+    assert_eq!(call["arguments"]["command"], "ls");
+    assert_eq!(messages[2]["toolCallId"], call["id"]);
+    assert_eq!(messages[2]["toolName"], "bash");
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+}
+
+#[test]
+fn pi_collision_is_refused() {
+    let root = tmp();
+    let id = uuid::Uuid::now_v7().to_string();
+    let started = Utc.with_ymd_and_hms(2026, 7, 3, 23, 58, 7).unwrap();
+    let messages = normalize::normalize(&sample_messages());
+    let write = || {
+        pi_writer::write_with_id(
+            root.path(),
+            "/tmp",
+            "anthropic",
+            "anthropic-messages",
+            None,
+            &messages,
+            &id,
+            started,
+        )
+    };
+    let path = write().unwrap();
+    let before = std::fs::read_to_string(&path).unwrap();
+    assert!(write()
+        .unwrap_err()
+        .to_string()
+        .contains("refusing to overwrite"));
+    assert_eq!(std::fs::read_to_string(path).unwrap(), before);
+}
+
 // ---------- fork() end-to-end over a fixture vault ----------
 
 fn fixture_vault(
@@ -422,6 +529,8 @@ fn opts(cwd: Option<PathBuf>, claude: &Path, codex: &Path) -> ForkOptions {
         no_launch: true,
         claude_config_dir: Some(claude.to_path_buf()),
         codex_home: Some(codex.to_path_buf()),
+        pi_session_dir: Some(codex.to_path_buf()),
+        ..Default::default()
     }
 }
 
@@ -446,6 +555,8 @@ fn fork_cli(
         .current_dir(sandbox)
         .env_remove("CLAUDE_CONFIG_DIR")
         .env_remove("CODEX_HOME")
+        .env_remove("PI_CODING_AGENT_DIR")
+        .env_remove("PI_CODING_AGENT_SESSION_DIR")
         .arg("--vault")
         .arg(root)
         .arg("session")
@@ -455,6 +566,7 @@ fn fork_cli(
         .arg(match target {
             Target::Claude => "claude",
             Target::Codex => "codex",
+            Target::Pi => "pi",
         })
         .arg("--cwd")
         .arg(cwd)
@@ -503,7 +615,7 @@ fn fork_canonicalizes_relative_and_symlink_cwds() {
     let relative_path = relative.path().strip_prefix(&current).unwrap();
     let (root, id) = fixture_vault("claude-code", &sample_messages(), None);
     let canonical = relative.path().canonicalize().unwrap();
-    for target in [Target::Claude, Target::Codex] {
+    for target in [Target::Claude, Target::Codex, Target::Pi] {
         let out = fork::fork(
             root.path(),
             &id,
@@ -521,6 +633,12 @@ fn fork_canonicalizes_relative_and_symlink_cwds() {
                 read_jsonl(&out.path)[0]["payload"]["cwd"],
                 canonical.to_string_lossy().as_ref()
             ),
+            Target::Pi => {
+                assert_eq!(
+                    read_jsonl(&out.path)[0]["cwd"],
+                    canonical.to_string_lossy().as_ref()
+                )
+            }
         }
     }
 
@@ -532,7 +650,7 @@ fn fork_canonicalizes_relative_and_symlink_cwds() {
         std::os::unix::fs::symlink(real.path(), &link).unwrap();
         let (root, id) = fixture_vault("claude-code", &sample_messages(), None);
         let canonical = real.path().canonicalize().unwrap();
-        for target in [Target::Claude, Target::Codex] {
+        for target in [Target::Claude, Target::Codex, Target::Pi] {
             let out = fork::fork(
                 root.path(),
                 &id,
@@ -550,6 +668,10 @@ fn fork_canonicalizes_relative_and_symlink_cwds() {
                     read_jsonl(&out.path)[0]["payload"]["cwd"],
                     canonical.to_string_lossy().as_ref()
                 ),
+                Target::Pi => assert_eq!(
+                    read_jsonl(&out.path)[0]["cwd"],
+                    canonical.to_string_lossy().as_ref()
+                ),
             }
         }
     }
@@ -559,7 +681,7 @@ fn fork_canonicalizes_relative_and_symlink_cwds() {
 fn fork_rejects_missing_home_and_relative_config_roots_before_write() {
     let workdir = tmp();
     let (root, id) = fixture_vault("claude-code", &sample_messages(), None);
-    for target in [Target::Claude, Target::Codex] {
+    for target in [Target::Claude, Target::Codex, Target::Pi] {
         for home in [None, Some("")] {
             let sandbox = tmp();
             let output = fork_cli(
@@ -583,6 +705,7 @@ fn fork_rejects_missing_home_and_relative_config_roots_before_write() {
         let (name, value) = match target {
             Target::Claude => ("CLAUDE_CONFIG_DIR", "relative-claude"),
             Target::Codex => ("CODEX_HOME", "relative-codex"),
+            Target::Pi => ("PI_CODING_AGENT_SESSION_DIR", "relative-pi"),
         };
         let output = fork_cli(
             root.path(),
@@ -749,6 +872,100 @@ fn fork_cross_harness_claude_to_codex() {
     let fname = out.path.file_stem().unwrap().to_string_lossy().to_string();
     assert!(fname.ends_with(&out.new_id));
     assert_eq!(recs[0]["payload"]["id"].as_str().unwrap(), out.new_id);
+}
+
+#[test]
+fn fork_codex_to_pi_uses_native_v3_history() {
+    let cfg = tmp();
+    let workdir = tmp();
+    let (root, id) = fixture_vault(
+        "codex",
+        &codex_items(),
+        Some(&workdir.path().to_string_lossy()),
+    );
+    let out = fork::fork(
+        root.path(),
+        &id,
+        Target::Pi,
+        &opts(None, cfg.path(), cfg.path()),
+    )
+    .unwrap();
+    let recs = read_jsonl(&out.path);
+    assert_eq!(recs[0]["type"], "session");
+    assert_eq!(recs[0]["version"], 3);
+    assert_eq!(recs[0]["id"], out.new_id);
+    assert_eq!(recs[1]["type"], "model_change");
+    assert_eq!(recs[1]["provider"], "openai-codex");
+    assert_eq!(recs[1]["modelId"], "gpt-5.6-sol");
+    assert!(recs.iter().any(|entry| {
+        entry["message"]["content"]
+            .as_array()
+            .is_some_and(|blocks| blocks.iter().any(|block| block["name"] == "bash"))
+    }));
+    assert_eq!(
+        out.launch,
+        [
+            "pi".to_string(),
+            "--session".to_string(),
+            out.path.to_string_lossy().into_owned()
+        ]
+    );
+}
+
+#[test]
+fn fork_prompt_and_read_only_flags_are_target_native() {
+    let cfg = tmp();
+    let workdir = tmp();
+    let (root, id) = fixture_vault(
+        "claude-code",
+        &sample_messages(),
+        Some(&workdir.path().to_string_lossy()),
+    );
+    for target in [Target::Claude, Target::Codex, Target::Pi] {
+        let mut options = opts(None, cfg.path(), cfg.path());
+        options.prompt = Some("review this".into());
+        options.read_only = true;
+        let out = fork::fork(root.path(), &id, target, &options).unwrap();
+        match target {
+            Target::Claude => assert_eq!(
+                out.launch,
+                [
+                    "claude",
+                    "--permission-mode",
+                    "plan",
+                    "--tools",
+                    "Read,Grep,Glob",
+                    "--resume",
+                    &out.new_id,
+                    "review this",
+                ]
+            ),
+            Target::Codex => assert_eq!(
+                out.launch,
+                [
+                    "codex",
+                    "resume",
+                    "--sandbox",
+                    "read-only",
+                    "--ask-for-approval",
+                    "never",
+                    &out.new_id,
+                    "review this",
+                ]
+            ),
+            Target::Pi => assert_eq!(
+                out.launch,
+                [
+                    "pi",
+                    "--tools",
+                    "read,grep,find,ls",
+                    "--session",
+                    out.path.to_string_lossy().as_ref(),
+                    "review this",
+                ]
+            ),
+        }
+    }
 }
 
 #[test]
@@ -956,6 +1173,11 @@ fn smoke(harness: &str, target: Target) {
             assert_eq!(recs[0]["payload"]["id"].as_str().unwrap(), out.new_id);
             assert!(recs.iter().any(|r| r["type"] == "response_item"));
         }
+        Target::Pi => {
+            assert_eq!(recs[0]["type"], "session");
+            assert_eq!(recs[0]["id"].as_str().unwrap(), out.new_id);
+            assert!(recs.iter().any(|r| r["type"] == "message"));
+        }
     }
 }
 
@@ -977,4 +1199,14 @@ fn smoke_codex_to_codex() {
 #[test]
 fn smoke_codex_to_claude() {
     smoke("codex", Target::Claude);
+}
+
+#[test]
+fn smoke_claude_to_pi() {
+    smoke("claude-code", Target::Pi);
+}
+
+#[test]
+fn smoke_codex_to_pi() {
+    smoke("codex", Target::Pi);
 }

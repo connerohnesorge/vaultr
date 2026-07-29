@@ -100,8 +100,14 @@ export PANE_CHOICE=
 "$(dirname "$0")/fork.sh" >"$tmp/fork-prompt"
 assert_nul_fields "$CAPTURED_ARGV" \
   session fork "$sid" --into claude --cwd "$hostile"
-printf 'Fork %s into [1] claude or [2] codex? ' "$sid" >"$tmp/expected-prompt"
+printf 'Fork %s into [1] claude, [2] codex, or [3] pi? ' "$sid" >"$tmp/expected-prompt"
 cmp "$tmp/expected-prompt" "$tmp/fork-prompt"
+test ! -e "$marker"
+
+export PANE_CHOICE=3
+"$(dirname "$0")/fork.sh" >/dev/null
+assert_nul_fields "$CAPTURED_ARGV" \
+  session fork "$sid" --into pi --cwd "$hostile"
 test ! -e "$marker"
 
 export RUN_PANE_COMMAND=0

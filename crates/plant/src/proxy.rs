@@ -346,7 +346,7 @@ async fn handle(
         }
     }
 
-    let url = format!("{upstream_base}{path}{query}");
+    let url = http_upstream_url(adapter, upstream_base, &path, &query);
     let mut builder = ctx
         .client
         .request(method.parse().unwrap_or(reqwest::Method::POST), &url)
@@ -515,6 +515,10 @@ async fn handle(
         .unwrap()
 }
 
+fn http_upstream_url(adapter: &Adapter, base: &str, path: &str, query: &str) -> String {
+    format!("{base}{}{query}", adapter.upstream_path(path))
+}
+
 pub(crate) fn health_body(adapter: &Adapter) -> serde_json::Value {
     serde_json::json!({
         "service": "plant",
@@ -540,6 +544,20 @@ pub fn decode_bytes(raw: &[u8], encoding: Option<&str>) -> std::io::Result<Vec<u
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn pi_codex_http_path_is_rewritten_once() {
+        let adapter = crate::adapter::adapters().remove(1);
+        let base = "https://chatgpt.com/backend-api/codex";
+        assert_eq!(
+            http_upstream_url(&adapter, base, "/codex/responses", "?feature=1"),
+            "https://chatgpt.com/backend-api/codex/responses?feature=1"
+        );
+        assert_eq!(
+            http_upstream_url(&adapter, base, "/responses", ""),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
+    }
 
     /// ACTIVE_CAPTURE_TASKS and SKIP_CAPTURE_FINISH are process-global, so the
     /// tests that read them must not overlap.

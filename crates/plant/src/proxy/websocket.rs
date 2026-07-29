@@ -61,7 +61,11 @@ pub(super) async fn upgrade(
         .query()
         .map(|query| format!("?{query}"))
         .unwrap_or_default();
-    let url = match upstream_url(&ctx.adapter.upstream, &path, &query) {
+    let url = match upstream_url(
+        &ctx.adapter.upstream,
+        ctx.adapter.upstream_path(&path),
+        &query,
+    ) {
         Ok(url) => url,
         Err(error) => {
             return Response::builder()
@@ -641,14 +645,24 @@ mod tests {
 
     #[test]
     fn websocket_url_preserves_base_path_and_query() {
+        let adapter = crate::adapter::adapters().remove(1);
         assert_eq!(
             upstream_url(
                 "https://chatgpt.com/backend-api/codex/",
-                "/responses",
+                adapter.upstream_path("/codex/responses"),
                 "?feature=1"
             )
             .unwrap(),
             "wss://chatgpt.com/backend-api/codex/responses?feature=1"
+        );
+        assert_eq!(
+            upstream_url(
+                "https://chatgpt.com/backend-api/codex/",
+                adapter.upstream_path("/responses"),
+                ""
+            )
+            .unwrap(),
+            "wss://chatgpt.com/backend-api/codex/responses"
         );
     }
 

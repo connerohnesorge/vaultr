@@ -75,6 +75,17 @@ impl Adapter {
         }
     }
 
+    /// Pi's Codex provider appends `/codex/responses` to a bare proxy base.
+    /// Plant's upstream already ends in `/codex`, so strip that exact duplicate
+    /// only for transport while preserving the observed path in the Envelope.
+    pub fn upstream_path<'a>(&self, path: &'a str) -> &'a str {
+        if self.harness == Harness::Codex && path == "/codex/responses" {
+            "/responses"
+        } else {
+            path
+        }
+    }
+
     /// A response is complete only when the transport ended cleanly and a
     /// parsed SSE event has the exact terminal type for this harness.
     pub fn response_complete(&self, events: &[Value], transport_complete: bool) -> bool {
@@ -281,6 +292,12 @@ mod tests {
         let x = codex();
         assert!(x.captures("POST", "/backend-api/codex/responses"));
         assert!(!x.captures("POST", "/backend-api/codex/responses/count_tokens"));
+        assert_eq!(x.upstream_path("/codex/responses"), "/responses");
+        assert_eq!(x.upstream_path("/responses"), "/responses");
+        assert_eq!(
+            x.upstream_path("/prefix/codex/responses"),
+            "/prefix/codex/responses"
+        );
     }
 
     #[test]

@@ -56,7 +56,7 @@ enum SessionCmd {
         #[arg(long, hide = true)]
         stats: bool,
     },
-    /// Fork a captured session into a fresh native Claude/Codex session
+    /// Fork a captured session into a fresh native Claude/Codex/Pi session
     Fork {
         id: String,
         /// Target harness to fork into
@@ -68,6 +68,12 @@ enum SessionCmd {
         /// Write the session file but do not launch the target CLI
         #[arg(long)]
         no_launch: bool,
+        /// Submit an initial prompt after resuming the target session
+        #[arg(long)]
+        prompt: Option<String>,
+        /// Restrict the resumed target to native read-only controls
+        #[arg(long)]
+        read_only: bool,
     },
 }
 
@@ -94,10 +100,14 @@ fn run() -> Result<()> {
             into,
             cwd,
             no_launch,
+            prompt,
+            read_only,
         }) => {
             let opts = fork::ForkOptions {
                 cwd,
                 no_launch,
+                prompt,
+                read_only,
                 ..Default::default()
             };
             let outcome = fork::fork(&root, &id, into, &opts)?;

@@ -2,6 +2,7 @@ pub mod claude_writer;
 pub mod codex_writer;
 pub mod fork;
 pub mod normalize;
+pub mod pi_writer;
 pub mod recon;
 pub mod render;
 pub mod translate;

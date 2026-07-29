@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Open a focused right split, ask Claude or Codex, then fork the pane's session into it.
+# Open a focused right split, select a native target, then fork the pane's session into it.
 set -euo pipefail
 cd "$(dirname "$0")"
 . ./lib.sh
@@ -16,6 +16,6 @@ new=$("$HERDR" pane split "$pane" --direction right --ratio 0.5 --focus \
 # terminal. The pane's cwd is passed explicitly — it is where the agent is
 # actually running, and some captured sessions have no recorded cwd.
 printf -v command '%q ' bash -c \
-  'printf "Fork %s into [1] claude or [2] codex? " "$1"; read -r c; case $c in 2|codex) t=codex;; *) t=claude;; esac; vaultr session fork "$1" --into "$t" --cwd "$2"' \
+  'printf "Fork %s into [1] claude, [2] codex, or [3] pi? " "$1"; read -r c; case $c in 2|codex) t=codex;; 3|pi) t=pi;; *) t=claude;; esac; vaultr session fork "$1" --into "$t" --cwd "$2"' \
   bash "$sid" "$pcwd"
 "$HERDR" pane run "$new" "$command"
