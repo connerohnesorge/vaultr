@@ -1,3 +1,9 @@
+---
+enables:
+  - id: size-capture-headroom-floor-to-write
+    reason: That proposal modifies the Storage headroom preflight requirement this proposal adds.
+---
+
 # Record dropped capture turns
 
 ## Problem
