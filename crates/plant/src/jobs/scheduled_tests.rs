@@ -408,7 +408,11 @@ async fn scheduled_record_failure_blocks_the_next_dispatch() {
     match begin_scheduled_attempt(&job).unwrap() {
         ScheduledAttemptStart::Blocked(detail) => assert_eq!(
             detail,
-            format!("attempt {} has no durable final outcome", fence.id)
+            format!(
+                "attempt {} has no durable final outcome; \
+                 if it is abandoned, run `plant jobs unblock record-fails`",
+                fence.id
+            )
         ),
         _ => panic!("retained attempt fence must block the next scheduler cycle"),
     }

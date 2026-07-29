@@ -14,6 +14,7 @@ pub enum Command {
     SessionsStuck(Duration),
     CompressOnce(Duration),
     JobsRun(String),
+    JobsUnblock(String),
     AgentRun(AgentRunArgs),
 }
 
@@ -68,6 +69,9 @@ pub fn parse_command(argv: &[String]) -> Result<Command, String> {
         }
         [group, action, name] if group == "jobs" && action == "run" && !name.is_empty() => {
             Ok(Command::JobsRun(name.clone()))
+        }
+        [group, action, name] if group == "jobs" && action == "unblock" && !name.is_empty() => {
+            Ok(Command::JobsUnblock(name.clone()))
         }
         [group, action, rest @ ..] if group == "sessions" && action == "eligible" => {
             parse_eligible(rest).map(Command::SessionsEligible)

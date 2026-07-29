@@ -43,7 +43,7 @@ fn usage(error: &str) -> i32 {
     eprintln!("plant: {error}");
     eprintln!(
         "usage: plant [--self-test | server stop | sessions eligible|coverage|stuck ... | \
-         compress once ... | jobs run <name> | agent run --cli claude|codex ...]"
+         compress once ... | jobs run|unblock <name> | agent run --cli claude|codex ...]"
     );
     2
 }
@@ -218,6 +218,24 @@ async fn dispatch(command: Command) -> i32 {
                 }
             }
         }
+        Command::JobsUnblock(name) => match jobs::unblock_job(&name) {
+            Ok(jobs::Unblocked::NoFence) => {
+                println!("[job:{name}] no attempt fence, nothing to unblock");
+                0
+            }
+            Ok(jobs::Unblocked::AlreadyClear) => {
+                println!("[job:{name}] fence resolves on its own; the next tick clears it");
+                0
+            }
+            Ok(jobs::Unblocked::Cleared(id)) => {
+                println!("[job:{name}] recorded attempt {id} failed and cleared the fence");
+                0
+            }
+            Err(error) => {
+                eprintln!("[job:{name}] unblock failed: {error}");
+                1
+            }
+        },
         Command::AgentRun(args) => {
             // No nesting: a job-spawned agent must never spawn another (jobs spawning jobs).
             // launch_line stamps PLANT_AGENT=1 into every agent plant starts; if it's set here

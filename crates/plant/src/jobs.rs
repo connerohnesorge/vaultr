@@ -331,6 +331,7 @@ enum FenceReconcile {
 }
 
 fn reconcile_fence_at<F>(
+    name: &str,
     fence_path: &Path,
     attempt_parent: &Path,
     ledger_path: &Path,
@@ -373,15 +374,29 @@ where
                     ),
                 )?;
             }
-            Ok(_) => {
+            // Absent stays blocking. It does NOT prove nothing ran: a job with
+            // no agent dispatch never writes a receipt at all, and the
+            // herdr-unavailable path deletes its claim to keep the key
+            // retryable. Clearing here would re-run plain script jobs whose
+            // only failure was appending the final ledger record.
+            Ok(crate::agent_run::ReceiptLookup::Absent) => {
                 return Ok(FenceReconcile::Blocked(format!(
-                    "attempt {} has no durable final outcome",
+                    "attempt {} has no durable final outcome; \
+                     if it is abandoned, run `plant jobs unblock {name}`",
+                    existing.id
+                )))
+            }
+            Ok(crate::agent_run::ReceiptLookup::Pending) => {
+                return Ok(FenceReconcile::Blocked(format!(
+                    "attempt {} claimed an agent run that never finished; \
+                     if its agent is gone, run `plant jobs unblock {name}`",
                     existing.id
                 )))
             }
             Err(error) => {
                 return Ok(FenceReconcile::Blocked(format!(
-                    "attempt {} has an unreadable agent run receipt: {error}",
+                    "attempt {} has an unreadable agent run receipt: {error}; \
+                     run `plant jobs unblock {name}`",
                     existing.id
                 )))
             }
@@ -395,12 +410,63 @@ where
 fn reconcile_fence(name: &str) -> io::Result<FenceReconcile> {
     let ledger = ledger_path(name);
     reconcile_fence_at(
+        name,
         &attempt_path(name),
         &attempt_dir(),
         &ledger,
         ledger.parent().expect("job ledger has a parent"),
         File::sync_all,
     )
+}
+
+/// Outcome of an operator unblock request.
+#[derive(Debug, PartialEq)]
+pub enum Unblocked {
+    NoFence,
+    AlreadyClear,
+    Cleared(String),
+}
+
+/// Clear a fence held by a pending or unreadable receipt, recording the
+/// abandonment so the job-health sweep sees it instead of a silent job.
+///
+/// Takes the same attempt flock a dispatch takes, so it cannot race a live
+/// tick, and refuses to force a fence ordinary reconciliation would clear.
+pub fn unblock_job(name: &str) -> io::Result<Unblocked> {
+    let _lock = match acquire_attempt_lock(name)? {
+        AttemptLockStart::Ready(lock) => lock,
+        AttemptLockStart::Blocked(detail) => {
+            return Err(io::Error::other(format!("job {name} is busy: {detail}")))
+        }
+    };
+    let fence_path = attempt_path(name);
+    let Ok(text) = std::fs::read_to_string(&fence_path) else {
+        return Ok(Unblocked::NoFence);
+    };
+    let fence: AttemptFence = serde_json::from_str(&text)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    // Never force what resolves itself — a conclusive receipt or a matching
+    // ledger record must still take the ordinary reconciliation path.
+    if let FenceReconcile::Ready = reconcile_fence(name)? {
+        return Ok(Unblocked::AlreadyClear);
+    }
+    let ledger = ledger_path(name);
+    append_ledger_record(
+        ledger.parent().expect("job ledger has a parent"),
+        &ledger,
+        &ledger_record(
+            &fence.id,
+            "failed",
+            0,
+            &format!(
+                "unblocked by operator: attempt {} abandoned without a durable outcome",
+                fence.id
+            ),
+        ),
+    )?;
+    std::fs::remove_file(&fence_path)?;
+    sync_dir(&attempt_dir())?;
+    Ok(Unblocked::Cleared(fence.id))
 }
 
 enum AttemptLockStart {
@@ -844,6 +910,123 @@ pub async fn scheduler(cfg: Cfg, vault: PathBuf) {
 mod tests {
     use super::*;
 
+    /// Receipts are keyed by sha256 of the attempt id; mirror that here rather
+    /// than exporting the private helper.
+    fn write_receipt(state: &Path, key: &str, body: &str) {
+        use sha2::{Digest, Sha256};
+        let dir = state.join("agent-runs");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(format!("{:x}.json", Sha256::digest(key.as_bytes()))), body)
+            .unwrap();
+    }
+
+    fn fenced_job(tag: &str, id: &str) -> (PathBuf, crate::state::TestDirGuard) {
+        let root = std::env::temp_dir().join(format!("plant-{tag}-{}", uuid::Uuid::new_v4()));
+        let state = root.join("state");
+        std::fs::create_dir_all(state.join("job-attempts")).unwrap();
+        std::fs::create_dir_all(state.join("jobs")).unwrap();
+        let guard = crate::state::use_test_dir(state.clone());
+        write_fence(
+            &attempt_path("j"),
+            &AttemptFence { id: id.to_string(), started_ts: 1, retryable: false },
+        )
+        .unwrap();
+        (state, guard)
+    }
+
+    #[test]
+    fn absent_receipt_keeps_blocking_but_names_the_remedy() {
+        let (state, _guard) = fenced_job("fence-absent", "never-recorded");
+        // The incident shape. Absent must NOT auto-clear: a job that dispatches
+        // no agent never writes a receipt, so clearing would re-run a script
+        // whose only failure was appending its final ledger record.
+        let FenceReconcile::Blocked(detail) = reconcile_fence("j").unwrap() else {
+            panic!("an unproven outcome must not silently re-dispatch");
+        };
+        assert!(detail.contains("plant jobs unblock j"), "{detail}");
+        assert!(attempt_path("j").exists());
+        std::fs::remove_dir_all(state.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn pending_receipt_still_blocks_and_names_the_unblock_command() {
+        let (state, _guard) = fenced_job("fence-pending", "claimed-never-finished");
+        write_receipt(
+            &state,
+            "claimed-never-finished",
+            r#"{"state":"in_progress","key":"claimed-never-finished"}"#,
+        );
+        let FenceReconcile::Blocked(detail) = reconcile_fence("j").unwrap() else {
+            panic!("a claimed run with no outcome is genuinely ambiguous and must block");
+        };
+        assert!(detail.contains("plant jobs unblock j"), "{detail}");
+        assert!(attempt_path("j").exists());
+        std::fs::remove_dir_all(state.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn conclusive_receipt_still_reconciles_into_a_ledger_record() {
+        let (state, _guard) = fenced_job("fence-conclusive", "finished");
+        write_receipt(
+            &state,
+            "finished",
+            r#"{"state":"succeeded","key":"finished","detail":"agent done"}"#,
+        );
+        assert!(matches!(reconcile_fence("j").unwrap(), FenceReconcile::Ready));
+        let ledger = std::fs::read_to_string(state.join("jobs/j.jsonl")).unwrap();
+        assert!(ledger.contains("reconciled from agent run receipt"), "{ledger}");
+        std::fs::remove_dir_all(state.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn unblock_clears_an_abandoned_fence_with_one_failed_record() {
+        let (state, _guard) = fenced_job("unblock-pending", "abandoned");
+        write_receipt(&state, "abandoned", r#"{"state":"in_progress","key":"abandoned"}"#);
+        assert_eq!(
+            unblock_job("j").unwrap(),
+            Unblocked::Cleared("abandoned".to_string())
+        );
+        assert!(!attempt_path("j").exists());
+        let lines: Vec<_> = std::fs::read_to_string(state.join("jobs/j.jsonl"))
+            .unwrap()
+            .lines()
+            .map(String::from)
+            .collect();
+        assert_eq!(lines.len(), 1, "exactly one record so health sees one failure");
+        assert!(lines[0].contains(r#""outcome":"failed""#), "{}", lines[0]);
+        assert!(lines[0].contains("abandoned without a durable outcome"), "{}", lines[0]);
+        std::fs::remove_dir_all(state.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn unblock_refuses_to_force_a_self_resolving_fence() {
+        let (state, _guard) = fenced_job("unblock-resolving", "finished");
+        write_receipt(
+            &state,
+            "finished",
+            r#"{"state":"succeeded","key":"finished","detail":"agent done"}"#,
+        );
+        assert_eq!(unblock_job("j").unwrap(), Unblocked::AlreadyClear);
+        let ledger = std::fs::read_to_string(state.join("jobs/j.jsonl")).unwrap();
+        assert!(
+            !ledger.contains("unblocked by operator"),
+            "reconciliation owns this fence, not the operator: {ledger}"
+        );
+        std::fs::remove_dir_all(state.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn unblock_without_a_fence_is_a_harmless_no_op() {
+        let root = std::env::temp_dir().join(format!("plant-unblock-none-{}", uuid::Uuid::new_v4()));
+        let state = root.join("state");
+        std::fs::create_dir_all(state.join("job-attempts")).unwrap();
+        std::fs::create_dir_all(state.join("jobs")).unwrap();
+        let _guard = crate::state::use_test_dir(state.clone());
+        assert_eq!(unblock_job("j").unwrap(), Unblocked::NoFence);
+        assert!(!state.join("jobs/j.jsonl").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn job_filenames_parse_name_and_interval() {
         assert_eq!(
@@ -934,7 +1117,7 @@ mod tests {
             b"{\"attempt_id\":\"written-but-not-durable\",\"outcome\":\"success\"}\n",
         )
         .unwrap();
-        let error = reconcile_fence_at(&fence_path, &attempts, &ledger, &ledgers, |_| {
+        let error = reconcile_fence_at("t", &fence_path, &attempts, &ledger, &ledgers, |_| {
             Err(io::Error::other("injected sync failure"))
         })
         .unwrap_err();
@@ -988,7 +1171,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            reconcile_fence_at(&fence_path, &attempts, &ledger, &ledgers, File::sync_all,).unwrap(),
+            reconcile_fence_at("t", &fence_path, &attempts, &ledger, &ledgers, File::sync_all,).unwrap(),
             FenceReconcile::Ready
         ));
         assert!(!fence_path.exists());
@@ -1004,7 +1187,7 @@ mod tests {
             0
         );
         assert!(matches!(
-            reconcile_fence_at(&fence_path, &attempts, &ledger, &ledgers, File::sync_all,).unwrap(),
+            reconcile_fence_at("t", &fence_path, &attempts, &ledger, &ledgers, File::sync_all,).unwrap(),
             FenceReconcile::Ready
         ));
         assert!(!record_is_due(

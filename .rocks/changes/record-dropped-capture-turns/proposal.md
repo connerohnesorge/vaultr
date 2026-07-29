@@ -2,6 +2,8 @@
 enables:
   - id: size-capture-headroom-floor-to-write
     reason: That proposal modifies the Storage headroom preflight requirement this proposal adds.
+  - id: report-capture-drops-on-health
+    reason: That proposal reports the dropped-turn accounting this proposal adds.
 ---
 
 # Record dropped capture turns
