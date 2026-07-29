@@ -494,8 +494,21 @@ pub fn eligible_and_claim(
         .map_err(|error| format!("open {}: {error}", lock_path.display()))?;
     lock.lock()
         .map_err(|error| format!("lock {}: {error}", lock_path.display()))?;
-    if read_inflight(&path)?.is_some() {
-        return Ok(Vec::new());
+    if let Some(lease) = read_inflight(&path)? {
+        let (current, learn) = current_generations(vault)?;
+        let processed = learn.latest(learner);
+        let current: HashMap<_, _> = current
+            .into_iter()
+            .map(|generation| (generation.sid.clone(), generation))
+            .collect();
+        for sid in lease.sids {
+            let Some(generation) = current.get(&sid) else {
+                return Ok(Vec::new());
+            };
+            if !generation.learned_current(&processed)? {
+                return Ok(Vec::new());
+            }
+        }
     }
     let batch = eligible_candidates(vault, idle, max, learner)?;
     if batch.is_empty() {

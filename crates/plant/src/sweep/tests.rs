@@ -220,19 +220,23 @@ fn stuck_classification_covers_every_ledger_state() {
 }
 
 #[test]
-fn inflight_lease_atomically_dedupes_dispatch_until_expiry() {
+fn inflight_lease_dedupes_until_completion_or_expiry() {
     let root = temp_root("inflight");
     let sessions = root.join("sessions");
     let sid = "e768f4c4-inflight";
+    let next_sid = "f87905d5-next";
     let directory = sessions.join("2026/07/16").join(sid);
+    let next_directory = sessions.join("2026/07/16").join(next_sid);
     std::fs::create_dir_all(&directory).unwrap();
+    std::fs::create_dir_all(&next_directory).unwrap();
     std::fs::write(directory.join("turns.jsonl"), "{}\n".repeat(6)).unwrap();
+    std::fs::write(next_directory.join("turns.jsonl"), "{}\n".repeat(6)).unwrap();
     std::fs::create_dir_all(root.join("learnings")).unwrap();
 
     let first = eligible_and_claim(
         &sessions,
         Duration::ZERO,
-        10,
+        1,
         Harness::ClaudeCode,
         Duration::from_secs(3600),
     )
@@ -249,10 +253,28 @@ fn inflight_lease_atomically_dedupes_dispatch_until_expiry() {
     .unwrap();
     assert!(during.is_empty(), "active batch must win");
 
+    std::fs::write(
+        directory.join("learn-claude-test-20260716T120000Z.json"),
+        r#"{"processed_at":"2026-07-16T12:00:00Z","outcome":"learned"}"#,
+    )
+    .unwrap();
+    let completed = eligible_and_claim(
+        &sessions,
+        Duration::ZERO,
+        1,
+        Harness::ClaudeCode,
+        Duration::from_secs(3600),
+    )
+    .unwrap();
+    assert!(
+        completed.iter().any(|path| path.ends_with(next_sid)),
+        "recorded batch must release the next claim before lease expiry"
+    );
+
     publish_inflight(
         &inflight_path(&sessions, Harness::ClaudeCode).unwrap(),
         &InflightLease {
-            sids: vec![sid.to_string()],
+            sids: vec![next_sid.to_string()],
             expires_at: epoch_now().saturating_sub(1),
         },
     )
@@ -265,7 +287,7 @@ fn inflight_lease_atomically_dedupes_dispatch_until_expiry() {
         Duration::from_secs(3600),
     )
     .unwrap();
-    assert!(after.iter().any(|path| path.ends_with(sid)));
+    assert!(after.iter().any(|path| path.ends_with(next_sid)));
 
     std::fs::remove_dir_all(root).unwrap();
 }
