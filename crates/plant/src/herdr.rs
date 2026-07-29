@@ -462,12 +462,16 @@ async fn close_workspace(id: &str) {
     }
 }
 
-async fn register_discovered_session_id(label: &str, pane: Option<&str>, discover: bool) {
+async fn register_discovered_session_id(
+    label: &str,
+    pane: Option<&str>,
+    discover: bool,
+) -> Option<String> {
     if !discover {
-        return;
+        return None;
     }
     let Some(pane) = pane else {
-        return;
+        return None;
     };
     for _ in 0..3 {
         let Some(sid) = pane_list()
@@ -479,9 +483,52 @@ async fn register_discovered_session_id(label: &str, pane: Option<&str>, discove
         };
         crate::sweep::register_job_sid(&sid);
         println!("[herdr:{label}] registered job self-capture {sid}");
-        return;
+        return Some(sid);
     }
     eprintln!("[herdr:{label}] no agent_session id for pane {pane}; self-capture may reach learn");
+    None
+}
+
+fn capture_has_completed_envelope(path: &Path) -> Result<bool, String> {
+    let mut completed = false;
+    vaultr::recon::for_each_envelope(path, |envelope| {
+        completed |= envelope
+            .pointer("/response/complete")
+            .and_then(Value::as_bool)
+            == Some(true);
+        Ok(())
+    })
+    .map_err(|error| error.to_string())?;
+    Ok(completed)
+}
+
+fn session_has_completed_envelope(vault: &Path, session_id: &str) -> Result<bool, String> {
+    let session =
+        vaultr::vault::resolve_id(vault, session_id).map_err(|error| error.to_string())?;
+    let directory =
+        vaultr::vault::session_dir(vault, &session).map_err(|error| error.to_string())?;
+    let capture = vaultr::vault::capture_file(&directory).map_err(|error| error.to_string())?;
+    capture_has_completed_envelope(&capture)
+}
+
+async fn wait_for_completed_envelope(vault: &Path, session_id: &str) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match session_has_completed_envelope(vault, session_id) {
+            Ok(true) => return Ok(()),
+            Ok(false) if Instant::now() >= deadline => {
+                return Err(format!(
+                    "session {session_id} produced no completed capture envelope"
+                ));
+            }
+            Err(error) if Instant::now() >= deadline => {
+                return Err(format!(
+                    "could not inspect capture for session {session_id}: {error}"
+                ));
+            }
+            _ => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
 }
 
 /// Reclaim inactive workspaces left by interrupted or intentionally retained runs.
@@ -651,7 +698,7 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
             format!("<tail read failed: {}>", tail.failure_detail())
         };
         println!(
-            "[herdr:{}] agent done; tail:\n{}",
+            "[herdr:{}] agent terminal state observed; tail:\n{}",
             agent_run.label, tail_text
         );
         AgentRunOutcome::Succeeded("agent done".to_string())
@@ -661,12 +708,28 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
     // Register this pane's self-capture before cleanup can close it, so no learn pass
     // ever dispatches on plant's own housekeeping run. Claude preset its sid pre-launch;
     // codex ids are only knowable now, from what herdr reports for the pane.
-    register_discovered_session_id(
+    let discovered_session_id = register_discovered_session_id(
         &agent_run.label,
         pane_id.as_deref(),
         agent_run.discover_session_id,
     )
     .await;
+    let session_id = agent_run
+        .preset_session_id
+        .clone()
+        .or(discovered_session_id);
+    let outcome = match (outcome, session_id) {
+        (AgentRunOutcome::Succeeded(_), Some(session_id)) => {
+            match wait_for_completed_envelope(&crate::vault_root(), &session_id).await {
+                Ok(()) => AgentRunOutcome::Succeeded("agent done".to_string()),
+                Err(detail) => AgentRunOutcome::Failed(detail),
+            }
+        }
+        (AgentRunOutcome::Succeeded(_), None) => AgentRunOutcome::Failed(
+            "agent reached a terminal state without a capture session id".to_string(),
+        ),
+        (outcome, _) => outcome,
+    };
     match (
         should_cleanup(agent_run.cleanup, &outcome),
         workspace_id.as_deref(),
@@ -997,6 +1060,21 @@ mod tests {
     }
 
     #[test]
+    fn capture_completion_requires_a_completed_envelope() {
+        let path =
+            std::env::temp_dir().join(format!("plant-capture-{}.jsonl", uuid::Uuid::new_v4()));
+        std::fs::write(&path, "{\"response\":{\"complete\":false}}\n").unwrap();
+        assert!(!capture_has_completed_envelope(&path).unwrap());
+        std::fs::write(
+            &path,
+            "{\"response\":{\"complete\":false}}\n{\"response\":{\"complete\":true}}\n",
+        )
+        .unwrap();
+        assert!(capture_has_completed_envelope(&path).unwrap());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn cleanup_follows_policy_and_outcome() {
         let succeeded = AgentRunOutcome::Succeeded("done".into());
         let failed = AgentRunOutcome::Failed("timeout".into());
@@ -1122,7 +1200,7 @@ mod tests {
             timeout: Duration::from_secs(120),
             cleanup: WorkspaceCleanup::Always,
             preset_session_id: None,
-            discover_session_id: false,
+            discover_session_id: true,
             env: Vec::new(),
         })
         .await;
