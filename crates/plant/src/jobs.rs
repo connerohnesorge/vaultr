@@ -176,7 +176,8 @@ pub fn launch_line(harness: Harness, model: Option<&str>, args: Option<&str>) ->
         }
         // sandboxed codex blocks on its first approval prompt — background panes can't answer
         Harness::Codex => "command codex --dangerously-bypass-approvals-and-sandbox \
-             -c 'shell_environment_policy.set.PLANT_AGENT=\"1\"'"
+             -c 'shell_environment_policy.set.PLANT_AGENT=\"1\"' \
+             -c model_reasoning_effort=xhigh"
             .to_string(),
     };
     if let Some(m) = model {
@@ -1204,11 +1205,12 @@ mod tests {
             launch_line(
                 Harness::Codex,
                 Some("gpt-5.6-sol"),
-                Some("-c model_reasoning_effort=xhigh")
+                Some("-c model_reasoning_effort=high")
             ),
             "command codex --dangerously-bypass-approvals-and-sandbox \
-             -c 'shell_environment_policy.set.PLANT_AGENT=\"1\"' -m 'gpt-5.6-sol' \
-             -c model_reasoning_effort=xhigh"
+             -c 'shell_environment_policy.set.PLANT_AGENT=\"1\"' \
+             -c model_reasoning_effort=xhigh -m 'gpt-5.6-sol' \
+             -c model_reasoning_effort=high"
         );
         assert_eq!(
             launch_line(Harness::ClaudeCode, Some("opus[1m]"), None),
