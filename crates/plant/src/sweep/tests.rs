@@ -119,6 +119,24 @@ fn walker_propagates_hostile_numeric_symlink_errors() {
 }
 
 #[test]
+fn sealing_gates_on_idle_alone_not_on_the_learners() {
+    let root = temp_root("seal-gate");
+    let directory = root.join("session");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join("turns.jsonl"), "{}\n".repeat(6)).unwrap();
+    let inventory = vaultr::vault::CaptureGenerations::load(&directory).unwrap();
+    let generation = SessionGeneration::current("session".to_string(), inventory).unwrap();
+
+    // Nothing has learned this session and it is in no job registry — under the old
+    // learned-both conjunct this could never seal, which is what stranded the backlog.
+    assert!(generation.ready_to_seal(Duration::ZERO).unwrap());
+    // Idle is still the whole gate: a capture written moments ago must not seal.
+    assert!(!generation.ready_to_seal(Duration::from_secs(3600)).unwrap());
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn generation_policy_propagates_post_inventory_io_errors() {
     let root = temp_root("generation-io");
     let directory = root.join("session");
@@ -151,12 +169,13 @@ fn prior_generation_loss_after_inventory_fails_maintenance_policy() {
     let learned = HashMap::from([("session".to_string(), u64::MAX)]);
 
     std::fs::remove_file(&sealed).unwrap();
+    // `learned_current` still guards the *eligibility* path (`eligible_candidates`,
+    // the in-flight lease), so a vanished prior generation is still an error there.
+    // `ready_to_seal` no longer consults it — sealing gates on idle alone — so it is
+    // deliberately no longer asserted here.
     let error = generation.learned_current(&learned).unwrap_err();
     assert!(error.contains(&sealed.display().to_string()), "{error}");
-    let error = generation
-        .ready_to_seal(&learned, &learned, &HashSet::new(), Duration::ZERO)
-        .unwrap_err();
-    assert!(error.contains(&sealed.display().to_string()), "{error}");
+    assert!(generation.ready_to_seal(Duration::ZERO).unwrap());
 
     std::fs::remove_dir_all(root).unwrap();
 }

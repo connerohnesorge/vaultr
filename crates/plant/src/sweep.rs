@@ -161,21 +161,18 @@ impl SessionGeneration {
             .map_err(|error| format!("read capture generation {}: {error}", self.path().display()))
     }
 
-    fn ready_to_seal(
-        &self,
-        claude: &HashMap<String, u64>,
-        codex: &HashMap<String, u64>,
-        jobs: &HashSet<String>,
-        idle: Duration,
-    ) -> Result<bool, String> {
+    /// Sealing gates on idle alone. It deliberately does NOT wait for the
+    /// learners: raw `turns.jsonl` is gitignored, so a session that has not
+    /// been sealed cannot reach another host, and a remote learner could
+    /// therefore never learn it — the old learned-both conjunct was circular.
+    /// `recon.mjs` decompresses `.zst` transparently, so learning a sealed
+    /// session costs nothing. Eligibility still consults the learn ledger and
+    /// `job-sids.txt` (see `eligible_candidates`); only *sealing* stops doing so.
+    fn ready_to_seal(&self, idle: Duration) -> Result<bool, String> {
         if self.selected == GenerationKind::Detached {
             return Ok(true);
         }
-        Ok(
-            (self.learned_current(claude)? && self.learned_current(codex)?
-                || jobs.contains(&self.sid))
-                && self.idle_for(idle)?,
-        )
+        self.idle_for(idle)
     }
 }
 
@@ -529,7 +526,12 @@ pub fn eligibility_stats(vault: &Path, learner: Harness) -> Result<(usize, usize
     Ok((current.len(), learn.latest(learner).len()))
 }
 
-const COMMIT_CAP: u64 = 256 * 1024 * 1024;
+/// Below GitLab's hard 100 MiB blob limit, with margin. A seal between the two
+/// passes this cap, gets committed, and is then rejected remote-side on every
+/// push forever — stranding every later commit behind it until someone hand-edits
+/// `.gitignore`. That happened once already (a 100.7 MiB seal, still listed in
+/// `vault/.gitignore`), which is why this is not simply "big enough".
+const COMMIT_CAP: u64 = 90 * 1024 * 1024;
 
 #[derive(Debug)]
 pub enum CompressError {
@@ -578,17 +580,14 @@ fn exclude_from_commit(vault: &Path, sealed: &Path, size: u64) {
 }
 
 pub async fn compress_sweep(vault: &Path, idle: Duration) -> Result<(), CompressError> {
-    let (pending, learn) = pending_generations(vault).map_err(CompressError::Inventory)?;
+    let (pending, _learn) = pending_generations(vault).map_err(CompressError::Inventory)?;
     if !which("zstd") {
         return Err(CompressError::Operational("zstd not on PATH".into()));
     }
-    let claude = learn.latest(Harness::ClaudeCode);
-    let codex = learn.latest(Harness::Codex);
-    let jobs = job_sids();
     let mut sealed = 0u32;
     for selected in pending {
         if !selected
-            .ready_to_seal(&claude, &codex, &jobs, idle)
+            .ready_to_seal(idle)
             .map_err(CompressError::Inventory)?
         {
             continue;

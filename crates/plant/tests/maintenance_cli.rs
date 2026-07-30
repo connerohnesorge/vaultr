@@ -164,11 +164,17 @@ fn manual_compression_recovers_owned_capture_state_before_sweeping() {
     )
     .unwrap();
 
+    // This test is about recovery running *before* the sweep, not about sealing.
+    // Sealing gates on idle alone, so `--idle 0s` would seal this just-written
+    // capture and the stub `zstd` above (which writes nothing) would produce an
+    // invalid frame. An idle window the fixture cannot satisfy keeps the sweep a
+    // no-op — which is what it was here under the old learned-both gate too, since
+    // this session is unlearned and in no job registry.
     let output = run(
         &home,
         &sessions,
         &bin,
-        &["compress", "once", "--idle", "0s"],
+        &["compress", "once", "--idle", "3600s"],
     );
     assert_eq!(
         output.status.code(),
