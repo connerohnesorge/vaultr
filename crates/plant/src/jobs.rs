@@ -128,6 +128,15 @@ fn jobs_in(dir: &Path) -> Vec<Job> {
         .collect()
 }
 
+/// Three buckets, most-specific-wins by job name:
+///   `shared/`      — every host
+///   flat `jobs/*`  — gated by the `.hostname` marker (legacy; see below)
+///   `<hostname>/`  — this host only
+///
+/// The flat bucket is the pre-bucket layout and is kept working through the grace
+/// window: one marker can only ever name one host, so a second machine could not
+/// have its own jobs at all. A host bucket overrides a same-named job from either
+/// other bucket, so a machine can specialise `learn` without forking the schedule.
 fn load_jobs_at(dir: &Path, short_hostname: &str) -> Vec<Job> {
     let local_jobs_enabled = match std::fs::read_to_string(dir.join(".hostname")) {
         Ok(hostname) => hostname.trim() == short_hostname,
@@ -135,10 +144,21 @@ fn load_jobs_at(dir: &Path, short_hostname: &str) -> Vec<Job> {
     };
     let mut jobs = jobs_in(&dir.join("shared"));
     if local_jobs_enabled {
-        jobs.extend(jobs_in(dir));
+        overlay(&mut jobs, jobs_in(dir));
     }
+    overlay(&mut jobs, jobs_in(&dir.join(short_hostname)));
     jobs.sort_by(|a, b| a.name.cmp(&b.name));
     jobs
+}
+
+/// Apply a more specific bucket over a less specific one, replacing by job name.
+fn overlay(jobs: &mut Vec<Job>, specific: Vec<Job>) {
+    for job in specific {
+        match jobs.iter_mut().find(|existing| existing.name == job.name) {
+            Some(existing) => *existing = job,
+            None => jobs.push(job),
+        }
+    }
 }
 
 pub fn load_jobs() -> Vec<Job> {
@@ -1086,6 +1106,48 @@ mod tests {
         std::fs::write(root.join(".hostname"), "CB14957\n").unwrap();
         assert_eq!(names("CB14957"), ["local", "portable"]);
         assert_eq!(names("allocator-vm"), ["portable"]);
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn host_bucket_adds_jobs_and_overrides_less_specific_buckets() {
+        let root = std::env::temp_dir().join(format!("plant-job-bucket-{}", uuid::Uuid::new_v4()));
+        let shared = root.join("shared");
+        let vm = root.join("allocator-vm");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::create_dir_all(&vm).unwrap();
+        std::fs::write(root.join(".hostname"), "CB14957\n").unwrap();
+        std::fs::write(root.join("door-mail.30m.ts"), "").unwrap();
+        std::fs::write(shared.join("health.15m.sh"), "").unwrap();
+        std::fs::write(vm.join("learn.3h.sh"), "").unwrap();
+        // same name as a shared job: the host bucket wins, it does not duplicate
+        std::fs::write(vm.join("health.5m.sh"), "").unwrap();
+
+        let jobs = |host| load_jobs_at(&root, host);
+        let names = |host| {
+            jobs(host)
+                .into_iter()
+                .map(|job| job.name)
+                .collect::<Vec<_>>()
+        };
+
+        // The VM never sees the Mac's flat jobs, and gets its own learner.
+        assert_eq!(names("allocator-vm"), ["health", "learn"]);
+        let health = jobs("allocator-vm")
+            .into_iter()
+            .find(|job| job.name == "health")
+            .unwrap();
+        assert_eq!(health.every, Duration::from_secs(300));
+        assert_eq!(health.path, vm.join("health.5m.sh"));
+
+        // The Mac is unaffected: no bucket of its own, flat jobs still gated in.
+        assert_eq!(names("CB14957"), ["door-mail", "health"]);
+        let mac_health = jobs("CB14957")
+            .into_iter()
+            .find(|job| job.name == "health")
+            .unwrap();
+        assert_eq!(mac_health.every, Duration::from_secs(900));
 
         std::fs::remove_dir_all(root).unwrap();
     }
