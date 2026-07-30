@@ -18,6 +18,59 @@ fn detached(
     }
 }
 
+// The seal-time scrub is the only thing that reads a capture before it is
+// committed — the pre-push secret gate skips `.zst` entirely. Every value below
+// is synthetic but shaped like one that actually reached origin/main.
+#[test]
+fn scrub_redacts_leaked_credential_shapes_without_over_matching_base64() {
+    let patterns = secret_regexes();
+    let needles = HashSet::new();
+    let planted = [
+        ("litellm", "sk-Xy3kQp9ZrT2vBn7LmA4sD6fG8hJ1kL5nP0qR2tU4"),
+        ("gitlab pat", "glpat-A1b2C3d4E5f6G7h8I9j0"),
+        ("gitlab runner", "glrt-Z9y8X7w6V5u4T3s2R1q0"),
+        ("anthropic", "sk-ant-api03-A1b2C3d4E5f6G7h8I9j0K1l2"),
+        ("aws key id", "AKIAIOSFODNN7EXAMPLE"),
+        ("github", "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8"),
+        ("slack token", "xoxb-1234567890-ABCDEFGHIJ"),
+        (
+            "slack webhook",
+            "https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXX",
+        ),
+        ("google api", "AIzaSyA1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6q"),
+        ("google oauth", "ya29.A1b2C3d4E5f6G7h8I9j0K1l2"),
+        (
+            "private key",
+            "-----BEGIN RSA PRIVATE KEY-----\\nMIIBOgIBAAJBAK\\n-----END RSA PRIVATE KEY-----",
+        ),
+        (
+            "aws secret",
+            "export AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        ),
+    ];
+    for (label, secret) in planted {
+        let line = format!("{{\"text\":\"{secret}\"}}");
+        let (redacted, hits) = redact_line(line, &needles, &patterns);
+        assert!(hits > 0, "{label}: not redacted");
+        assert!(!redacted.contains(secret), "{label}: survived");
+        // The delimiter the `sk-` guard consumes is structural JSON: a match
+        // must not eat the quote that closes the field name.
+        serde_json::from_str::<Value>(&redacted)
+            .unwrap_or_else(|error| panic!("{label}: {error} in {redacted}"));
+    }
+
+    // Bare `sk-` inside a base64url run is what made the naive pattern hit 39%
+    // of seals. Inside base64 the preceding byte is always a base64 byte, so the
+    // delimiter guard drops it — assert the naive shape is present, or this
+    // control passes for the wrong reason.
+    let base64 = "{\"blob\":\"aGVsbG9Xb3JsZHNrLQABsk-Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MA\"}";
+    assert!(regex::Regex::new(r"sk-[A-Za-z0-9_-]{20,}")
+        .unwrap()
+        .is_match(base64));
+    let (kept, hits) = redact_line(base64.to_string(), &needles, &patterns);
+    assert_eq!((kept.as_str(), hits), (base64, 0));
+}
+
 #[cfg(unix)]
 #[test]
 fn detachment_rejects_symlinked_capture_and_sidecar_sources() {

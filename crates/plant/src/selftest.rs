@@ -1316,6 +1316,34 @@ pub async fn self_test() {
         );
         serde_json::from_str::<Value>(scrubbed.trim()).unwrap(); // redaction must not break JSON
 
+        // -- scrub: the shapes that reached origin/main unredacted, end to end --
+        // Synthetic values. The pre-push gate cannot read a seal, so this pass
+        // is the only thing between these and a commit.
+        let leaked = vault.join("scrub-leaked-shapes.jsonl");
+        let planted = [
+            format!("sk-{}", "Xy3kQp9ZrT2vBn7LmA4sD6fG8hJ1kL5nP0qR2tU4"),
+            format!("glpat-{}", "A1b2C3d4E5f6G7h8I9j0"),
+            format!("glrt-{}", "Z9y8X7w6V5u4T3s2R1q0"),
+            format!(
+                "AWS_SECRET_ACCESS_KEY={}",
+                "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+            ),
+        ];
+        // base64url noise: `sk-` mid-run must survive, or the scrub eats captured bodies.
+        let noise = "aGVsbG9Xb3JsZHNrLQABsk-Zm9vYmFyYmF6cXV4MTIzNDU2Nzg5MA";
+        std::fs::write(
+            &leaked,
+            json!({ "out": format!("{} blob={noise}", planted.join(" ")) }).to_string() + "\n",
+        )
+        .unwrap();
+        assert!(scrub(&leaked).await);
+        let scrubbed = std::fs::read_to_string(&leaked).unwrap();
+        for secret in &planted {
+            assert!(!scrubbed.contains(secret.as_str()), "unredacted: {secret}");
+        }
+        assert!(scrubbed.contains(noise), "base64 body must survive scrub");
+        serde_json::from_str::<Value>(scrubbed.trim()).unwrap();
+
         // -- scrub: optional denylist redacts a plaintext string no regex can match --
         let home = vault.join("denylist-home");
         std::fs::create_dir_all(home.join(".config/wireproxy")).unwrap();

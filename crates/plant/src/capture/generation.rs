@@ -20,9 +20,24 @@ pub(crate) struct SealedCapture {
 fn secret_regexes() -> Vec<regex::Regex> {
     [
         r"sk-ant-[A-Za-z0-9_-]{20,}",
-        // ponytail: bare `sk-` over-matches captured base64. Add a specific
-        // prefix only if it can actually enter captured Anthropic bodies.
+        // LiteLLM / OpenAI. The leading delimiter is load-bearing, not decor:
+        // inside a base64 run `sk-` is always preceded by a base64 byte, so
+        // demanding a non-base64 byte in front took this from 1254 of 3182
+        // committed seals down to 28, and every >=130-byte over-match to zero.
+        // It is a capture group because the replacement puts it back — it is
+        // often the quote closing a JSON field name.
+        // ponytail: the {,63} ceiling is what measured clean; a longer key
+        // (sk-proj-…) redacts its first 63 bytes and leaks the tail. Raise it
+        // only with the same over-match measurement behind it.
+        r"(^|[^A-Za-z0-9_/+-])sk-[A-Za-z0-9_-]{20,63}",
+        r"glpat-[A-Za-z0-9_-]{20,}",
+        r"glrt-[A-Za-z0-9_-]{20,}",
         r"(?:AKIA|ASIA)[0-9A-Z]{16}",
+        // The 40-char AWS secret, keyed on the field name so it cannot
+        // over-match base64. Nothing else catches this shape: the pre-push
+        // gate never reads a seal, and detect-aws-credentials only matches
+        // keys already in ~/.aws/credentials, which is empty on this host.
+        r#"(?i)aws_secret_access_key["']?\s*[:=]\s*["']?[A-Za-z0-9+/]{40}"#,
         r"gh[posru]_[A-Za-z0-9]{36,}",
         r"xox[baprs]-[A-Za-z0-9-]{10,}",
         r"https://hooks\.slack\.com/services/[A-Za-z0-9/]+",
@@ -51,7 +66,10 @@ fn redact_line(
     for pattern in patterns {
         if pattern.is_match(&line) {
             hits += pattern.find_iter(&line).count();
-            line = pattern.replace_all(&line, "[REDACTED]").into_owned();
+            // `${1}` is the delimiter the `sk-` guard had to consume for lack
+            // of look-behind; every other pattern has no group 1, and regex
+            // expands a missing group to "".
+            line = pattern.replace_all(&line, "${1}[REDACTED]").into_owned();
         }
     }
     (line, hits)
