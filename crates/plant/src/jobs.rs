@@ -194,8 +194,17 @@ pub fn launch_line(harness: Harness, model: Option<&str>, args: Option<&str>) ->
         Harness::ClaudeCode => {
             "PLANT_AGENT=1 command claude --dangerously-skip-permissions".to_string()
         }
-        // sandboxed codex blocks on its first approval prompt — background panes can't answer
+        // sandboxed codex blocks on its first approval prompt — background panes can't answer.
+        // --dangerously-bypass-hook-trust is the same problem by a second mechanism: codex
+        // requires persisted per-hook trust and prompts "Press t to trust" for any hook it has
+        // not seen, which on a fresh box is every hook in the stowed ~/.codex/hooks.json. The
+        // pane sits on that prompt forever, no API call is ever made, and plant reports "agent
+        // reached a terminal state without a capture session id" — the machine this was
+        // developed on had answered the prompt by hand months earlier, so it only ever appears
+        // on a newly provisioned host. The hooks are the box's own dotfiles, which is precisely
+        // the "automation that already vets hook sources" the flag documents.
         Harness::Codex => "command codex --dangerously-bypass-approvals-and-sandbox \
+             --dangerously-bypass-hook-trust \
              -c 'shell_environment_policy.set.PLANT_AGENT=\"1\"' \
              -c model_reasoning_effort=xhigh"
             .to_string(),
@@ -1270,6 +1279,7 @@ mod tests {
                 Some("-c model_reasoning_effort=high")
             ),
             "command codex --dangerously-bypass-approvals-and-sandbox \
+             --dangerously-bypass-hook-trust \
              -c 'shell_environment_policy.set.PLANT_AGENT=\"1\"' \
              -c model_reasoning_effort=xhigh -m 'gpt-5.6-sol' \
              -c model_reasoning_effort=high"
@@ -1278,6 +1288,21 @@ mod tests {
             launch_line(Harness::ClaudeCode, Some("opus[1m]"), None),
             "PLANT_AGENT=1 command claude --dangerously-skip-permissions --model='opus[1m]'"
         );
+    }
+
+    /// Every prompt codex can raise before its first API call is fatal to a background pane:
+    /// nobody can answer it, so plant only ever sees a terminal state with no capture session.
+    /// A host where a human once answered the prompt by hand hides this completely, so assert
+    /// the bypasses are on the launch line rather than trusting local state.
+    #[test]
+    fn codex_launch_answers_every_prompt_a_background_pane_cannot() {
+        let line = launch_line(Harness::Codex, None, None);
+        for flag in [
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--dangerously-bypass-hook-trust",
+        ] {
+            assert!(line.contains(flag), "{flag} missing from: {line}");
+        }
     }
 
     #[test]
