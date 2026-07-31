@@ -60,6 +60,37 @@ fn eligibility_is_independent_per_learner() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+/// A seal's mtime on any machine but the producer is when git wrote the file,
+/// so a fresh clone would otherwise be blind to its entire corpus for one idle
+/// window — and blind again after any re-checkout. Both files here are written
+/// now; only the raw one may be held back.
+#[test]
+fn a_just_written_seal_is_eligible_but_a_just_written_raw_capture_is_not() {
+    let root = temp_root("checkout-mtime");
+    let sessions = root.join("sessions");
+    let sealed_id = "sealed-by-another-machine";
+    let raw_id = "still-being-written";
+    let sealed_dir = sessions.join("2026/07/31").join(sealed_id);
+    let raw_dir = sessions.join("2026/07/31").join(raw_id);
+    std::fs::create_dir_all(&sealed_dir).unwrap();
+    std::fs::create_dir_all(&raw_dir).unwrap();
+    std::fs::write(sealed_dir.join("turns.jsonl.zst"), "sealed").unwrap();
+    std::fs::write(raw_dir.join("turns.jsonl"), "{}\n".repeat(6)).unwrap();
+
+    let eligible =
+        eligible_sessions(&sessions, Duration::from_secs(3600), 10, Harness::ClaudeCode).unwrap();
+    assert!(
+        eligible.iter().any(|path| path.ends_with(sealed_id)),
+        "a seal checked out seconds ago must still be learnable: {eligible:?}"
+    );
+    assert!(
+        !eligible.iter().any(|path| path.ends_with(raw_id)),
+        "a raw capture written seconds ago is still live and must wait: {eligible:?}"
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn walker_skips_non_date_dirs_but_finds_dated_sessions() {
     let root = temp_root("walker");

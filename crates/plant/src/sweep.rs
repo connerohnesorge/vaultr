@@ -135,7 +135,18 @@ impl SessionGeneration {
             .map(|duration| duration.as_secs()))
     }
 
+    /// Idle gates the Raw generation only. Sealed and detached captures are
+    /// frozen — sealing already required the same idle window — and their mtime
+    /// on every machine but the producer is when git wrote the file, not when
+    /// the session went quiet. Gating them on mtime makes a fresh clone blind to
+    /// its whole corpus for an hour, and re-blinds it on any re-checkout or
+    /// merge that rewrites the file: the allocator VM reported
+    /// "[eligible:claude] 0 of 3266 sessions" against a 1374-session backlog
+    /// with every job green. Same short-circuit as `substantive`.
     fn idle_for(&self, idle: Duration) -> Result<bool, String> {
+        if self.selected != GenerationKind::Raw {
+            return Ok(true);
+        }
         Ok(self
             .idle_secs()?
             .is_some_and(|seconds| seconds >= idle.as_secs()))
