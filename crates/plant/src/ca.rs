@@ -35,6 +35,13 @@ pub struct Ca {
     /// Where the CA cert is on disk — exactly what `NODE_EXTRA_CA_CERTS` and the
     /// NixOS wrapper's fail-closed guard point at.
     cert_path: PathBuf,
+    /// System roots + this CA, for `SSL_CERT_FILE`. `NODE_EXTRA_CA_CERTS` alone
+    /// is not enough: Claude Code checks Remote Control eligibility early,
+    /// against the *system* trust store, before it applies the extra-certs
+    /// path. That request is MITM'd like any other, so without this the check
+    /// fails and reports the feature-flag service as unreachable — while every
+    /// later request succeeds, because by then the extra CA is loaded.
+    bundle_path: Option<PathBuf>,
     leaves: Mutex<HashMap<String, Arc<rustls::ServerConfig>>>,
 }
 
@@ -74,15 +81,24 @@ impl Ca {
         // and both are identical by construction. Keep it that way.
         let issuer = Issuer::new(ca_params().map_err(to_io)?, key);
 
+        let cert_pem = std::fs::read_to_string(&cert_path)?;
+        let bundle_path = write_bundle(dir, &cert_pem)?;
+
         Ok(Self {
             issuer,
             cert_path,
+            bundle_path,
             leaves: Mutex::new(HashMap::new()),
         })
     }
 
     pub fn cert_path(&self) -> &Path {
         &self.cert_path
+    }
+
+    /// Merged system+local trust bundle, when a system bundle was locatable.
+    pub fn bundle_path(&self) -> Option<&Path> {
+        self.bundle_path.as_deref()
     }
 
     /// A `ServerConfig` presenting a leaf for `host`, minted on first use and
@@ -126,6 +142,44 @@ impl Ca {
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
         Ok(config)
     }
+}
+
+/// Write `<dir>/ca-bundle.crt` = system roots + our CA, and return its path.
+///
+/// The system bundle comes from `PLANT_SYSTEM_CA_BUNDLE` (the NixOS unit passes
+/// the exact `cacert` store path) or the usual Linux locations. Returns `None`
+/// when none is found — macOS has no such file and does not need this — because
+/// pointing `SSL_CERT_FILE` at a bundle holding only our CA would break TLS to
+/// every host we do *not* intercept.
+fn write_bundle(dir: &Path, ca_pem: &str) -> io::Result<Option<PathBuf>> {
+    const CANDIDATES: [&str; 3] = [
+        "/etc/ssl/certs/ca-bundle.crt",
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+    ];
+
+    let system = std::env::var_os("PLANT_SYSTEM_CA_BUNDLE")
+        .map(PathBuf::from)
+        .filter(|p| p.exists())
+        .or_else(|| {
+            CANDIDATES
+                .iter()
+                .map(PathBuf::from)
+                .find(|candidate| candidate.exists())
+        });
+    let Some(system) = system else {
+        return Ok(None);
+    };
+
+    let mut merged = std::fs::read_to_string(&system)?;
+    if !merged.ends_with('\n') {
+        merged.push('\n');
+    }
+    merged.push_str(ca_pem);
+
+    let path = dir.join("ca-bundle.crt");
+    std::fs::write(&path, merged)?;
+    Ok(Some(path))
 }
 
 /// The one definition of the CA. Used both to self-sign the stored cert and to
@@ -221,6 +275,27 @@ mod tests {
         let c = ca.server_config("claude.ai").unwrap();
         assert!(Arc::ptr_eq(&a, &b));
         assert!(!Arc::ptr_eq(&a, &c));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The merged bundle must contain the system roots as well as our CA.
+    /// Shipping only our CA would make SSL_CERT_FILE reject every host we do
+    /// not intercept, which looks like a network outage rather than a trust bug.
+    #[test]
+    fn bundle_merges_system_roots_with_our_ca() {
+        let dir = tempdir("bundle");
+        std::fs::create_dir_all(&dir).unwrap();
+        let fake_system = dir.join("system-roots.pem");
+        std::fs::write(&fake_system, "-----BEGIN CERTIFICATE-----\nSYSTEMROOT\n-----END CERTIFICATE-----").unwrap();
+        std::env::set_var("PLANT_SYSTEM_CA_BUNDLE", &fake_system);
+
+        let ca = Ca::load_or_create_in(&dir).unwrap();
+        let bundle = std::fs::read_to_string(ca.bundle_path().expect("bundle written")).unwrap();
+
+        assert!(bundle.contains("SYSTEMROOT"), "system roots must survive");
+        assert!(bundle.contains(&pem(&ca)), "our CA must be appended");
+
+        std::env::remove_var("PLANT_SYSTEM_CA_BUNDLE");
         std::fs::remove_dir_all(&dir).ok();
     }
 

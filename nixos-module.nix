@@ -7,12 +7,13 @@
   cfg = config.services.vaultr;
   home = config.users.users.${cfg.user}.home or "/home/${cfg.user}";
   caPath = "${home}/.local/state/plant/ca.pem";
+  caBundlePath = "${home}/.local/state/plant/ca-bundle.crt";
   # Routing lives in managed settings, not this wrapper: background agents
   # (`claude agents`, `--bg`, `/background`) run under a shared supervisor that
   # never sees a PATH wrapper's exports. The wrapper only refuses to start
   # uncaptured.
   claude = pkgs.writeShellScriptBin "claude" ''
-    if [ ! -f "${caPath}" ]; then
+    if [ ! -f "${caPath}" ] || [ ! -f "${caBundlePath}" ]; then
       echo "plant CA missing at ${caPath} — is the plant service running?" >&2
       exit 1
     fi
@@ -81,6 +82,14 @@ in {
         HTTPS_PROXY = "http://127.0.0.1:18923";
         NO_PROXY = "localhost,127.0.0.1,::1,.lan.cnb.rocks,.svc,.cluster.local";
         NODE_EXTRA_CA_CERTS = caPath;
+        # Claude Code checks Remote Control eligibility early, against the
+        # *system* trust store, before it applies NODE_EXTRA_CA_CERTS. That
+        # request is intercepted like any other, so without a system-level
+        # trust anchor the check fails and blames the feature-flag service —
+        # even though every later request works. Plant writes this bundle as
+        # system roots + its own CA, so unintercepted hosts still verify.
+        SSL_CERT_FILE = caBundlePath;
+        NIX_SSL_CERT_FILE = caBundlePath;
       };
     };
 
@@ -93,6 +102,9 @@ in {
       environment = {
         HOME = home;
         PATH = lib.mkForce "/run/current-system/sw/bin:/run/wrappers/bin";
+        # Exact store path rather than /etc/ssl/certs/*, so the merged bundle
+        # plant writes can never be built from a missing or partial file.
+        PLANT_SYSTEM_CA_BUNDLE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
       };
       serviceConfig = {
         User = cfg.user;

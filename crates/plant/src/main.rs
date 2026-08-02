@@ -524,6 +524,12 @@ async fn run_daemon() {
     let ca = match ca::Ca::load_or_create() {
         Ok(ca) => {
             println!("ca={}", ca.cert_path().display());
+            match ca.bundle_path() {
+                Some(bundle) => println!("ca-bundle={}", bundle.display()),
+                // macOS has no such file and does not need one; on Linux this
+                // means SSL_CERT_FILE consumers will not trust the local CA.
+                None => println!("ca-bundle=none (no system bundle found)"),
+            }
             Arc::new(ca)
         }
         Err(error) => {

@@ -59,9 +59,12 @@ pub(super) async fn handle(
             splice(upgraded, &host, port).await
         };
         if let Err(error) = outcome {
-            // A client hanging up mid-tunnel is routine.
+            // A client hanging up mid-tunnel is routine. Match case-insensitively:
+            // the OS spells it "Connection reset by peer", so a lowercase-only
+            // check logs every ordinary disconnect as if it were a fault.
             let msg = error.to_string();
-            if !msg.contains("connection reset") && !msg.contains("broken pipe") {
+            let lowered = msg.to_ascii_lowercase();
+            if !lowered.contains("connection reset") && !lowered.contains("broken pipe") {
                 eprintln!("[connect] {host}:{port}: {msg}");
             }
         }
