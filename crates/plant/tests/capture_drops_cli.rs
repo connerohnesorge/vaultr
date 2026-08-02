@@ -54,14 +54,16 @@ fn recorded_drops_reach_the_coverage_audit_and_the_health_job() {
     assert!(!stdout.contains("KNOWN-INCOMPLETE"), "{stdout}");
 
     // A floor above any real volume is the full-volume simulation for the alert.
+    let floor = u64::MAX;
     let stuck = Command::new(env!("CARGO_BIN_EXE_plant"))
         .args(["sessions", "stuck"])
         .env("VAULT_SESSIONS", &root)
-        .env("PLANT_CAPTURE_HEADROOM_BYTES", u64::MAX.to_string())
+        .env("PLANT_CAPTURE_HEADROOM_BYTES", floor.to_string())
         .output()
         .unwrap();
     let stdout = String::from_utf8(stuck.stdout).unwrap();
     assert!(stdout.contains("low-headroom alert:"), "{stdout}");
+    assert!(stdout.contains(&format!("floor={floor}")), "{stdout}");
     assert!(
         stdout.contains(&format!("dropped-turn alert: {lossy} dropped=7")),
         "{stdout}"

@@ -259,6 +259,17 @@ pub async fn prepare_capture(
     req: CapturedRequest,
     body: Value,
 ) -> Result<PendingCapture, String> {
+    let free = crate::fsutil::free_bytes(vault);
+    prepare_capture_with_free(vault, adapter, req, body, free).await
+}
+
+async fn prepare_capture_with_free(
+    vault: &Path,
+    adapter: &Adapter,
+    req: CapturedRequest,
+    body: Value,
+    free: Option<u64>,
+) -> Result<PendingCapture, String> {
     let label = adapter.harness.capture_label();
     let sid = req.ids.session_id.clone().ok_or_else(|| {
         UNRECORDED_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -267,7 +278,7 @@ pub async fn prepare_capture(
     // Preflight: a failed multi-MB state.json write consumes the free blocks the
     // small drop marker needs, so skip it and record the gap while it still fits.
     let floor = crate::fsutil::headroom_floor();
-    if let Some(reason) = headroom_shortfall(crate::fsutil::free_bytes(vault), floor) {
+    if let Some(reason) = headroom_shortfall(free, floor) {
         record_drop(vault, &sid, &reason);
         return Err(reason);
     }

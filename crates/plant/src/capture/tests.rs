@@ -35,7 +35,57 @@ fn preflight_skips_only_a_measured_volume_below_the_floor() {
     assert!(headroom_shortfall(Some(99), 100).is_some());
     assert!(headroom_shortfall(Some(100), 100).is_none());
     assert!(headroom_shortfall(None, 100).is_none(), "unmeasurable != full");
-    assert_eq!(crate::fsutil::headroom_floor(), 2 * 1024 * 1024 * 1024);
+    assert_eq!(crate::fsutil::headroom_floor(), 67_108_864);
+}
+
+#[tokio::test]
+async fn one_gib_of_reported_free_space_reserves_capture() {
+    let vault = temp_vault("one-gib-headroom");
+    let adapter = claude_adapter();
+    let sid = uuid::Uuid::new_v4().to_string();
+
+    let pending = prepare_capture_with_free(
+        &vault,
+        &adapter,
+        captured(Some(&sid)),
+        json!({"model": "m", "messages": []}),
+        Some(1024 * 1024 * 1024),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(pending.sequence, 0);
+    assert!(pending.dir.join("state.json").is_file());
+    drop(pending);
+    fs::remove_dir_all(vault).unwrap();
+}
+
+#[tokio::test]
+async fn below_floor_capture_records_a_dropped_turn() {
+    let vault = temp_vault("below-floor");
+    let adapter = claude_adapter();
+    let sid = uuid::Uuid::new_v4().to_string();
+
+    let error = match prepare_capture_with_free(
+        &vault,
+        &adapter,
+        captured(Some(&sid)),
+        json!({"model": "m", "messages": []}),
+        Some(67_108_863),
+    )
+    .await
+    {
+        Ok(_) => panic!("below-floor capture reserved a sequence"),
+        Err(error) => error,
+    };
+    assert_eq!(error, "storage headroom 67108863 below floor 67108864");
+    let meta: Meta = serde_json::from_str(
+        &fs::read_to_string(vault.join(".meta").join(format!("{sid}.json"))).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(meta.dropped_turns, 1);
+    assert_eq!(meta.last_drop_reason.as_deref(), Some(error.as_str()));
+    fs::remove_dir_all(vault).unwrap();
 }
 
 #[test]

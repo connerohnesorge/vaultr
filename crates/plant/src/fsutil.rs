@@ -12,13 +12,13 @@ pub fn free_bytes(path: &Path) -> Option<u64> {
     Some(stat.f_bavail as u64 * stat.f_frsize as u64)
 }
 
-/// Free space below this leaves the small `.meta` drop marker unwritable, so
-/// capture skips the multi-megabyte journal write instead.
+/// The default holds several times the measured 18 MiB peak demand of one
+/// capture replacement write, leaving room for the small `.meta` drop marker.
 pub fn headroom_floor() -> u64 {
     std::env::var("PLANT_CAPTURE_HEADROOM_BYTES")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(2 * 1024 * 1024 * 1024)
+        .unwrap_or(64 * 1024 * 1024)
 }
 
 /// Atomically replace `path` from a unique temporary file in the same directory.
