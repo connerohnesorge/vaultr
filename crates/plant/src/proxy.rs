@@ -1,6 +1,7 @@
 //! Reverse proxy — hyper server, reqwest streaming upstream, capture tee.
 //! Ports startProxy/capturedStream (wireproxy.ts:437-525).
 
+mod connect;
 mod websocket;
 
 use crate::adapter::Adapter;
@@ -148,6 +149,9 @@ pub struct ProxyCtx {
     pub vault: PathBuf,
     pub client: reqwest::Client,
     pub otel: Arc<Otel>,
+    /// Mints leaf certs for the CONNECT interception path. Shared across
+    /// adapters — one CA per Plant, one `NODE_EXTRA_CA_CERTS` for clients.
+    pub ca: Arc<crate::ca::Ca>,
 }
 
 /// Bind the listener. Separate from serve() so main can detect EADDRINUSE and exit 0.
@@ -275,6 +279,25 @@ async fn serve_with_shutdown(
 }
 
 async fn handle(
+    req: Request<hyper::body::Incoming>,
+    ctx: Arc<ProxyCtx>,
+    capture_tasks: CaptureTasks,
+) -> Response<BoxBody> {
+    // Forward-proxy entry point. Must precede everything else: a CONNECT target
+    // is authority-form, so uri().path() is meaningless here.
+    //
+    // Kept split from handle_origin so the two never call each other in a
+    // cycle — an intercepted connection serves handle_origin directly, and a
+    // recursive async fn has no inferrable Send bound.
+    if req.method() == hyper::Method::CONNECT {
+        return connect::handle(req, ctx, capture_tasks).await;
+    }
+    handle_origin(req, ctx, capture_tasks).await
+}
+
+/// Origin-form request: the reverse-proxy path. Reached both from a plaintext
+/// `ANTHROPIC_BASE_URL` client and from inside an intercepted TLS tunnel.
+async fn handle_origin(
     mut req: Request<hyper::body::Incoming>,
     ctx: Arc<ProxyCtx>,
     capture_tasks: CaptureTasks,
@@ -799,11 +822,13 @@ mod tests {
     fn test_ctx(upstream: std::net::SocketAddr) -> Arc<ProxyCtx> {
         let mut adapter = crate::adapter::adapters().remove(0);
         adapter.upstream = format!("http://{upstream}");
+        let ca_dir = std::env::temp_dir().join(format!("plant-test-ca-{}", std::process::id()));
         Arc::new(ProxyCtx {
             adapter,
             vault: std::env::temp_dir(),
             client: reqwest::Client::new(),
             otel: Arc::new(Otel::new()),
+            ca: Arc::new(crate::ca::Ca::load_or_create_in(&ca_dir).unwrap()),
         })
     }
 

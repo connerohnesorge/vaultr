@@ -4,6 +4,7 @@
 
 mod adapter;
 mod agent_run;
+mod ca;
 mod capture;
 mod cli;
 mod coverage;
@@ -516,6 +517,22 @@ async fn run_daemon() {
     let client = http_client();
     println!("vault={}", vault.display());
 
+    // Eager, and fatal on failure. Clients read the CA once at their own
+    // startup via NODE_EXTRA_CA_CERTS, so it has to exist before the first
+    // `claude` runs — and a Plant serving CONNECT with no CA would answer 200
+    // and then fail every handshake, which reads as a network fault.
+    let ca = match ca::Ca::load_or_create() {
+        Ok(ca) => {
+            println!("ca={}", ca.cert_path().display());
+            Arc::new(ca)
+        }
+        Err(error) => {
+            eprintln!("[plant] CA init failed: {error}");
+            record_exit(started, "exit:1");
+            std::process::exit(1);
+        }
+    };
+
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let mut accept_loops = tokio::task::JoinSet::new();
     for (listener, _, adapter) in ownership.into_servers() {
@@ -524,6 +541,7 @@ async fn run_daemon() {
             vault: vault.clone(),
             client: client.clone(),
             otel: otel.clone(),
+            ca: ca.clone(),
         });
         accept_loops.spawn(proxy::serve_until_shutdown(
             listener,

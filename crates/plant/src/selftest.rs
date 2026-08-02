@@ -293,11 +293,14 @@ fn start_proxy(
     tokio::spawn(async move {
         let (listener, port) = proxy::bind(0).await.unwrap();
         tx.send(port).unwrap();
+        // CA under the pid-keyed vault so parallel self-tests never share one.
+        let ca = crate::ca::Ca::load_or_create_in(&vault.join("ca")).unwrap();
         let ctx = Arc::new(ProxyCtx {
             adapter,
             vault,
             client: crate::http_client(),
             otel,
+            ca: Arc::new(ca),
         });
         proxy::serve(listener, ctx).await;
     });
@@ -377,6 +380,105 @@ fn record_test_request(otel: &crate::otel::Otel, model: &str) {
         &req,
         &resp,
         &vaultr::recon::parse_sse(SSE),
+    );
+}
+
+/// The forward-proxy leg the `HTTPS_PROXY` wiring depends on.
+///
+/// Covers both halves and the split between them: a CONNECT to the adapter's
+/// own upstream host is decrypted and captured, and a CONNECT to any other host
+/// is spliced through untouched. Getting that split wrong in either direction is
+/// silent — an over-broad intercept breaks every unrelated TLS host with an
+/// untrusted cert, an under-broad one drops capture with no error anywhere.
+async fn connect_forward_proxy(
+    vault: &std::path::Path,
+    upstream_port: u16,
+    otel: Arc<crate::otel::Otel>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // "localhost" rather than an IP: leaf SANs are DNS names, matching the real
+    // shape (api.anthropic.com). Plant resolves it back to the fake upstream.
+    let upstream = format!("http://localhost:{upstream_port}");
+    let port = start_proxy(adapters().remove(0), upstream, vault, otel);
+
+    // --- blind tunnel: a host that is not the upstream stays opaque ---
+    let echo = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+    let echo_port = echo.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = echo.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 64];
+                if let Ok(n) = sock.read(&mut buf).await {
+                    let _ = sock.write_all(&buf[..n]).await;
+                }
+            });
+        }
+    });
+
+    let mut tunnel = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    tunnel
+        .write_all(
+            format!("CONNECT 127.0.0.1:{echo_port} HTTP/1.1\r\nHost: 127.0.0.1:{echo_port}\r\n\r\n")
+                .as_bytes(),
+        )
+        .await
+        .unwrap();
+    let mut head = [0u8; 12];
+    tunnel.read_exact(&mut head).await.unwrap();
+    assert_eq!(
+        &head[..12],
+        b"HTTP/1.1 200",
+        "CONNECT to a non-upstream host must be accepted"
+    );
+    // Drain the rest of the response head.
+    let mut scratch = [0u8; 256];
+    loop {
+        let n = tunnel.read(&mut scratch).await.unwrap();
+        if scratch[..n].ends_with(b"\r\n\r\n") || n == 0 {
+            break;
+        }
+    }
+    tunnel.write_all(b"ping").await.unwrap();
+    let mut echoed = [0u8; 4];
+    tunnel.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(
+        &echoed, b"ping",
+        "a non-upstream CONNECT must splice bytes, not terminate TLS"
+    );
+
+    // --- interception: the upstream host is decrypted and captured ---
+    let ca_pem = std::fs::read(vault.join("ca").join("ca.pem")).unwrap();
+    let client = reqwest::Client::builder()
+        .proxy(reqwest::Proxy::all(format!("http://127.0.0.1:{port}")).unwrap())
+        .add_root_certificate(reqwest::Certificate::from_pem(&ca_pem).unwrap())
+        .build()
+        .unwrap();
+
+    let sid = "019f9999-4444-7abc-8def-0123456789ab";
+    let response = client
+        .post("https://localhost/v1/messages")
+        .header("content-type", "application/json")
+        .json(&json!({
+            "model": "m", "stream": true, "tools": [], "system": "s",
+            "messages": [{ "role": "user", "content": "through the tunnel" }],
+            "metadata": { "user_id": json!({ "session_id": sid }).to_string() },
+        }))
+        .send()
+        .await
+        .expect("intercepted CONNECT must reach the upstream");
+    assert_eq!(response.status(), 200);
+    response.text().await.unwrap();
+
+    let envelope = wait_for_envelope(vault, sid).await;
+    assert_eq!(envelope["request"]["path"], "/v1/messages");
+    assert_eq!(envelope["response"]["complete"], true);
+    assert_eq!(
+        envelope["request"]["body_delta"]["history"]["append"][0]["content"],
+        "through the tunnel",
+        "an intercepted turn must capture exactly like the plaintext path"
     );
 }
 
@@ -1419,6 +1521,8 @@ pub async fn self_test() {
         assert!(snapshots[0]["ts"].as_str().is_some());
         std::env::remove_var("PLANT_HERDR_INTERVAL_SECS");
     }
+
+    connect_forward_proxy(&vault, upstream_port, otel.clone()).await;
 
     match prior_socket {
         Some(path) => std::env::set_var("HERDR_SOCKET_PATH", path),

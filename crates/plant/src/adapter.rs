@@ -63,6 +63,30 @@ pub fn adapters() -> Vec<Adapter> {
 }
 
 impl Adapter {
+    /// Host of `upstream`, but only when the base carries no path prefix.
+    ///
+    /// This is the sole test for "may Plant terminate TLS for this CONNECT".
+    /// A base with a path (Codex's `.../backend-api/codex`) is excluded: an
+    /// intercepted origin-form request would be re-appended to that prefix and
+    /// reach the wrong URL, so such hosts get a blind tunnel instead. Derived
+    /// from `upstream` rather than hardcoded so `VAULTR_ANTHROPIC_UPSTREAM`
+    /// keeps working — including the self-test's plain-HTTP fake upstream.
+    ///
+    /// The port is stripped and never matched on: a client only issues CONNECT
+    /// for an `https://` URL, so TLS always follows the 200 regardless of port.
+    pub fn interceptable_host(&self) -> Option<&str> {
+        let rest = self
+            .upstream
+            .strip_prefix("https://")
+            .or_else(|| self.upstream.strip_prefix("http://"))?
+            .trim_end_matches('/');
+        if rest.contains('/') || rest.contains('@') {
+            return None;
+        }
+        let host = rest.split(':').next().unwrap_or_default();
+        (!host.is_empty()).then_some(host)
+    }
+
     pub fn captures(&self, method: &str, path: &str) -> bool {
         match self.harness {
             // Exact match, not a prefix: /v1/messages/count_tokens carries no

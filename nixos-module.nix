@@ -6,8 +6,16 @@
 }: let
   cfg = config.services.vaultr;
   home = config.users.users.${cfg.user}.home or "/home/${cfg.user}";
+  caPath = "${home}/.local/state/plant/ca.pem";
+  # Routing lives in managed settings, not this wrapper: background agents
+  # (`claude agents`, `--bg`, `/background`) run under a shared supervisor that
+  # never sees a PATH wrapper's exports. The wrapper only refuses to start
+  # uncaptured.
   claude = pkgs.writeShellScriptBin "claude" ''
-    export ANTHROPIC_BASE_URL="http://127.0.0.1:18923"
+    if [ ! -f "${caPath}" ]; then
+      echo "plant CA missing at ${caPath} — is the plant service running?" >&2
+      exit 1
+    fi
     exec ${lib.getExe' cfg.claudePackage "claude"} "$@"
   '';
   codex = pkgs.writeShellScriptBin "codex" ''
@@ -56,6 +64,25 @@ in {
       claude
       codex
     ];
+
+    # Claude Code >= 2.1.196 disables Remote Control whenever ANTHROPIC_BASE_URL
+    # names a host other than api.anthropic.com, and there is no override — so
+    # capture routes via HTTPS_PROXY instead, leaving the base URL unset. Plant
+    # answers CONNECT, intercepts api.anthropic.com with its own CA, and splices
+    # every other host through untouched.
+    #
+    # remoteControlAtStartup only reads from a settings scope, and only the
+    # policy scope can turn it *on* — a project or local settings file can still
+    # set it false, so this is a default rather than a mandate.
+    environment.etc."claude-code/managed-settings.json".text = builtins.toJSON {
+      remoteControlAtStartup = true;
+      env = {
+        HTTP_PROXY = "http://127.0.0.1:18923";
+        HTTPS_PROXY = "http://127.0.0.1:18923";
+        NO_PROXY = "localhost,127.0.0.1,::1,.lan.cnb.rocks,.svc,.cluster.local";
+        NODE_EXTRA_CA_CERTS = caPath;
+      };
+    };
 
     systemd.services.plant = {
       description = "Plant Claude Code and Codex session capture";
