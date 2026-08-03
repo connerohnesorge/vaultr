@@ -720,6 +720,31 @@ pub(crate) fn recover_live(vault: &Path, min_age: std::time::Duration) -> Result
 }
 
 fn recover(vault: &Path, live_cutoff: Option<&str>) -> Result<(), String> {
+    // A sessions root that does not exist yet holds no sessions, so there is
+    // nothing to recover. Treating that as an error is fatal at startup: the
+    // daemon runs recovery *before* it writes its CA, so a box whose vault has
+    // not been cloned yet crashlooped with no proxy and no CA, and every
+    // `claude` invocation failed closed on the missing CA.
+    //
+    // Do not "fix" this by creating the root. On allocator VMs it lives inside
+    // the dotfiles repo, and `git clone` refuses a destination that exists and
+    // is non-empty, so pre-creating it breaks provisioning for every box that
+    // clones dotfiles.
+    //
+    // This is deliberately scoped to recovery rather than to
+    // `vault::walk_session_dirs`, which distinguishes a missing root from an
+    // empty one on purpose — relaxing it there would let a typo'd
+    // $VAULT_SESSIONS report "no sessions" instead of failing. try_exists
+    // follows the symlink (~/.dotfiles -> ~/dotfiles is the usual shape) and
+    // still surfaces a permission error rather than swallowing it.
+    if !vault.try_exists().map_err(|error| {
+        format!(
+            "capture recovery: inspect session root {}: {error}",
+            vault.display()
+        )
+    })? {
+        return Ok(());
+    }
     let root = canonical_root(vault);
     let mut directories = BTreeMap::new();
     let mut journals = BTreeMap::new();
