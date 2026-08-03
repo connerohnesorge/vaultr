@@ -73,13 +73,20 @@ fn attrs_from_map(map: &Map<String, Value>) -> Value {
     )
 }
 
+// Every plant process exports cumulative counters starting at zero from its own
+// process start, so the resource identity must be unique per process. A constant
+// `service.instance.id` collapsed all hosts onto one Prometheus series: the stored
+// value flip-flopped between writers, each downward flip read as a counter reset,
+// and `increase()` re-added the full counter every time — inflating 24h token
+// totals ~200x. plant owns fixed ports per host, so hostname is a unique id.
 fn resource(loki_labels: bool) -> Value {
+    let host = json!(hostname());
     let mut vals: Vec<(&str, Value)> = vec![
         ("service.namespace", json!("claude-code")),
-        ("service.name", json!("cohnesor")),
+        ("service.name", json!("vaultr")),
         ("deployment.environment", json!("workstation")),
-        ("host.name", json!(hostname())),
-        ("service.instance.id", json!("vaultr")),
+        ("host.name", host.clone()),
+        ("service.instance.id", host),
     ];
     if loki_labels {
         vals.push(("loki.resource.labels", json!("service.namespace")));
@@ -392,5 +399,29 @@ mod tests {
         // the OTLP request deadline is not affected by the token override
         assert_ne!(otel.token_timeout, otel.timeout);
         std::env::remove_var("VAULTR_OTEL_TOKEN_TIMEOUT_MS");
+    }
+
+    // a constant service.instance.id collapses every host onto one Prometheus
+    // series, so concurrent writers read as counter resets and inflate increase().
+    #[test]
+    fn resource_instance_id_is_per_host() {
+        let attr = |res: &Value, key: &str| -> String {
+            res["attributes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|a| a["key"] == key)
+                .unwrap_or_else(|| panic!("resource is missing {key}"))["value"]["stringValue"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let host = hostname();
+        let metrics = resource(false);
+        assert_eq!(attr(&metrics, "service.instance.id"), host);
+        assert_eq!(attr(&metrics, "host.name"), host);
+        assert_eq!(attr(&metrics, "service.name"), "vaultr");
+        // logs must carry the same identity as metrics or the two correlate wrong
+        assert_eq!(attr(&resource(true), "service.instance.id"), host);
     }
 }

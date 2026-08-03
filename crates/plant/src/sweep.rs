@@ -7,6 +7,7 @@ use crate::process::{run, run30, which};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -172,6 +173,51 @@ impl SessionGeneration {
             .map_err(|error| format!("read capture generation {}: {error}", self.path().display()))
     }
 
+    fn is_quota_probe_candidate(&self) -> bool {
+        let Some(directory) = self.path().parent() else {
+            return false;
+        };
+        let Ok(text) = std::fs::read_to_string(directory.join("state.json")) else {
+            return false;
+        };
+        let Ok(state) = serde_json::from_str::<serde_json::Value>(&text) else {
+            return false;
+        };
+        state
+            .pointer("/request_body/max_tokens")
+            .and_then(serde_json::Value::as_u64)
+            == Some(1)
+            && state
+                .pointer("/request_body/messages/0/content")
+                .and_then(serde_json::Value::as_str)
+                == Some("quota")
+    }
+
+    fn is_standalone_quota_probe(&self) -> Result<bool, String> {
+        if !self.is_quota_probe_candidate() {
+            return Ok(false);
+        }
+        let path = self.path();
+        let file = std::fs::File::open(path)
+            .map_err(|error| format!("open quota probe candidate {}: {error}", path.display()))?;
+        let one_envelope = match self.selected {
+            GenerationKind::Sealed => {
+                let decoder = zstd::stream::read::Decoder::new(file).map_err(|error| {
+                    format!(
+                        "decompress quota probe candidate {}: {error}",
+                        path.display()
+                    )
+                })?;
+                transcript_has_exactly_one_envelope(decoder)
+            }
+            GenerationKind::Raw | GenerationKind::Detached => {
+                transcript_has_exactly_one_envelope(file)
+            }
+        }
+        .map_err(|error| format!("read quota probe candidate {}: {error}", path.display()))?;
+        Ok(one_envelope)
+    }
+
     /// Sealing gates on idle alone. It deliberately does NOT wait for the
     /// learners: raw `turns.jsonl` is gitignored, so a session that has not
     /// been sealed cannot reach another host, and a remote learner could
@@ -184,6 +230,21 @@ impl SessionGeneration {
             return Ok(true);
         }
         self.idle_for(idle)
+    }
+}
+
+fn transcript_has_exactly_one_envelope(reader: impl Read) -> std::io::Result<bool> {
+    let mut lines = BufReader::new(reader).lines();
+    let Some(first) = lines.next() else {
+        return Ok(false);
+    };
+    first?;
+    match lines.next() {
+        None => Ok(true),
+        Some(second) => {
+            second?;
+            Ok(false)
+        }
     }
 }
 
@@ -457,6 +518,7 @@ fn eligible_candidates(
             || generation.learned_current(&processed)?
             || inflight.contains(&generation.sid)
             || !generation.idle_for(idle)?
+            || generation.is_standalone_quota_probe()?
             || !generation.substantive()?
         {
             continue;

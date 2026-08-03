@@ -60,6 +60,131 @@ fn eligibility_is_independent_per_learner() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[test]
+fn quota_probe_filter_requires_both_state_fields_and_one_envelope() {
+    let root = temp_root("quota-probes");
+    let sessions = root.join("sessions");
+    let day = sessions.join("2026/07/15");
+    let standalone = day.join("standalone-quota-probe");
+    let trailing = day.join("real-session-with-trailing-probe");
+    let quota_prompt = day.join("real-session-mentioning-quota");
+
+    for (directory, max_tokens) in [(&standalone, 1), (&trailing, 1), (&quota_prompt, 2)] {
+        std::fs::create_dir_all(directory).unwrap();
+        let state = serde_json::json!({
+            "schema_version": 1,
+            "harness": "claude-code",
+            "session_id": directory.file_name().unwrap().to_str().unwrap(),
+            "request_body": {
+                "max_tokens": max_tokens,
+                "messages": [{"role": "user", "content": "quota"}]
+            }
+        });
+        std::fs::write(
+            directory.join("state.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+    }
+    std::fs::write(
+        standalone.join("turns.jsonl.zst"),
+        zstd::encode_all("{}\n".as_bytes(), 1).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(
+        trailing.join("turns.jsonl.zst"),
+        zstd::encode_all("{}\n{}\n".as_bytes(), 1).unwrap(),
+    )
+    .unwrap();
+    // Invalid compressed bytes prove a non-candidate transcript is never decompressed.
+    std::fs::write(quota_prompt.join("turns.jsonl.zst"), "not zstd").unwrap();
+
+    for learner in [Harness::ClaudeCode, Harness::Codex] {
+        let eligible = eligible_sessions(&sessions, Duration::ZERO, 10, learner).unwrap();
+        assert!(!eligible.contains(&standalone), "{learner:?}: {eligible:?}");
+        assert!(eligible.contains(&trailing), "{learner:?}: {eligible:?}");
+        assert!(eligible.contains(&quota_prompt), "{learner:?}: {eligible:?}");
+    }
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn quota_probe_confirmation_stops_after_two_envelopes_in_a_large_transcript() {
+    use std::cell::Cell;
+    use std::io::Read;
+    use std::rc::Rc;
+
+    struct EnvelopeReader {
+        envelopes: Vec<Vec<u8>>,
+        next: usize,
+        reads: Rc<Cell<usize>>,
+    }
+
+    impl Read for EnvelopeReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let Some(envelope) = self.envelopes.get(self.next) else {
+                return Ok(0);
+            };
+            assert!(
+                envelope.len() <= buffer.len(),
+                "confirmation requested the large third envelope"
+            );
+            buffer[..envelope.len()].copy_from_slice(envelope);
+            self.next += 1;
+            self.reads.set(self.reads.get() + 1);
+            Ok(envelope.len())
+        }
+    }
+
+    let reads = Rc::new(Cell::new(0));
+    let reader = EnvelopeReader {
+        envelopes: vec![b"{}\n".to_vec(), b"{}\n".to_vec(), vec![b'x'; 2 * 1024 * 1024]],
+        next: 0,
+        reads: Rc::clone(&reads),
+    };
+
+    assert!(!transcript_has_exactly_one_envelope(reader).unwrap());
+    assert_eq!(reads.get(), 2);
+}
+
+#[test]
+fn measured_quota_probe_false_positive_2a82e018_remains_eligible() {
+    let root = temp_root("quota-probe-false-positive");
+    let sessions = root.join("sessions");
+    let directory = sessions
+        .join("2026/07/15")
+        .join("2a82e018-3268-44f9-bda1-56be8b9bc9a9");
+    std::fs::create_dir_all(&directory).unwrap();
+    let state = serde_json::json!({
+        "schema_version": 1,
+        "harness": "claude-code",
+        "session_id": "2a82e018-3268-44f9-bda1-56be8b9bc9a9",
+        "request_body": {
+            "max_tokens": 1,
+            "messages": [{"role": "user", "content": "quota"}]
+        }
+    });
+    std::fs::write(
+        directory.join("state.json"),
+        serde_json::to_vec(&state).unwrap(),
+    )
+    .unwrap();
+    let transcript = "{}\n".repeat(369);
+    std::fs::write(
+        directory.join("turns.jsonl.zst"),
+        zstd::encode_all(transcript.as_bytes(), 1).unwrap(),
+    )
+    .unwrap();
+
+    for learner in [Harness::ClaudeCode, Harness::Codex] {
+        let eligible = eligible_sessions(&sessions, Duration::ZERO, 10, learner).unwrap();
+        assert_eq!(eligible, vec![directory.clone()]);
+    }
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 /// A seal's mtime on any machine but the producer is when git wrote the file,
 /// so a fresh clone would otherwise be blind to its entire corpus for one idle
 /// window — and blind again after any re-checkout. Both files here are written
