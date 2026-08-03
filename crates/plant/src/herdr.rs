@@ -228,6 +228,31 @@ fn pane_is_working(panes: &[Pane], pane: &str) -> bool {
         .any(|candidate| candidate.pane_id == pane && candidate.agent_status == "working")
 }
 
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Did the typed prompt actually reach the composer?
+///
+/// A pane reports `idle` as soon as the harness process is up, which on a box
+/// where that harness has never launched is BEFORE its TUI can accept
+/// keystrokes. `pane run` then types into nothing, the text is lost, the agent
+/// goes straight to `done`, and the run fails as "agent reached a terminal
+/// state without a capture session id" — a message that says nothing about
+/// typing. Reproduced on both harnesses on a freshly provisioned box; the
+/// identical command succeeds on the next (warm) run every time.
+///
+/// Only the head of the prompt is compared, against a whitespace-collapsed
+/// pane read, because the composer wraps long text. Callers must read with
+/// `--source recent-unwrapped` so a wrap does not split a word mid-needle.
+fn composer_shows_prompt(pane_text: &str, prompt: &str) -> bool {
+    let needle: String = collapse_whitespace(prompt).chars().take(24).collect();
+    if needle.trim().is_empty() {
+        return true;
+    }
+    collapse_whitespace(pane_text).contains(&needle)
+}
+
 fn same_pane_identity(expected: &PaneIdentity, panes: &[Pane], pane: &str) -> bool {
     panes.iter().any(|candidate| {
         candidate.pane_id == pane
@@ -404,6 +429,27 @@ impl AgentStartSubscription {
             "submitted prompt never reached a terminal state after working".to_string()
         })?
     }
+}
+
+/// Read the pane unwrapped and report whether the prompt is sitting in it.
+/// A failed read returns `true` so an unrelated herdr hiccup can never cause a
+/// duplicate prompt — the long lifecycle wait still reports the real outcome.
+async fn prompt_reached_composer(pane: &str, prompt: &str) -> bool {
+    let read = run30(&[
+        "herdr",
+        "pane",
+        "read",
+        pane,
+        "--source",
+        "recent-unwrapped",
+        "--lines",
+        "40",
+    ])
+    .await;
+    if !read.ok {
+        return true;
+    }
+    composer_shows_prompt(&read.out, prompt)
 }
 
 fn require_command(result: &RunResult, action: &str) -> Result<(), String> {
@@ -663,9 +709,27 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
         // An immediate Enter is swallowed by the slash-command palette; let the
         // composer settle before deciding whether a submit keystroke is needed.
         tokio::time::sleep(Duration::from_secs(2)).await;
-        let already_working = pane_list()
+        let mut already_working = pane_list()
             .await
             .is_some_and(|panes| pane_is_working(&panes, pane));
+        // A cold TUI can swallow the whole prompt (see `composer_shows_prompt`).
+        // Retype only when the agent has NOT started and the text is demonstrably
+        // absent: a blind retype would append a second copy whenever the first
+        // one did land. An unreadable pane counts as present for the same reason.
+        if !already_working && !prompt_reached_composer(pane, &agent_run.prompt).await {
+            eprintln!(
+                "[herdr:{}] prompt did not reach the composer in {pane}, retyping",
+                agent_run.label
+            );
+            let retyped = run30(&["herdr", "pane", "run", pane, &agent_run.prompt]).await;
+            if let Err(detail) = require_command(&retyped, "prompt retyping") {
+                return AgentRunOutcome::Failed(detail);
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            already_working = pane_list()
+                .await
+                .is_some_and(|panes| pane_is_working(&panes, pane));
+        }
         if !already_working {
             let submitted = run30(&["herdr", "pane", "send-keys", pane, "Enter"]).await;
             if let Err(detail) = require_command(&submitted, "prompt submission") {
@@ -1000,6 +1064,32 @@ mod tests {
         assert!(same_pane_identity(&identity, &[original.clone()], "w1:p1"));
         original.terminal_id = "replacement".to_string();
         assert!(!same_pane_identity(&identity, &[original], "w1:p1"));
+    }
+
+    #[test]
+    fn empty_composer_is_detected_so_a_cold_tui_gets_the_prompt_again() {
+        let prompt = "$Vault Learn with `--learner codex` and these session directories \
+                      as input: /home/dev/.dotfiles/vault/sessions/2026/07/16/8f9aa81d";
+
+        // What a cold pane actually showed: the harness up, the composer empty
+        // apart from its placeholder, zero tokens spent.
+        let cold = "\n\n› Improve documentation in @filename\n\n  gpt-5.6-sol xhigh · ~/dotfiles";
+        assert!(
+            !composer_shows_prompt(cold, prompt),
+            "an empty composer must not read as delivered"
+        );
+
+        // Delivered, and wrapped across lines the way the composer renders it.
+        let wrapped = "› $Vault Learn with `--learner\n  codex` and these session\n  directories as input: /home/…";
+        assert!(
+            composer_shows_prompt(wrapped, prompt),
+            "a wrapped prompt is present and must NOT be retyped — a second copy \
+             would hand the agent the same instruction twice"
+        );
+
+        // A prompt that is entirely whitespace has no needle to look for; never
+        // retype on it.
+        assert!(composer_shows_prompt(cold, "   \n  "));
     }
 
     #[test]
