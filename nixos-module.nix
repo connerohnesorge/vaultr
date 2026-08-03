@@ -17,6 +17,15 @@
       echo "plant CA missing at ${caPath} — is the plant service running?" >&2
       exit 1
     fi
+    # These MUST be real environment variables, not settings.json `env`: the
+    # runtime initialises its TLS trust store at process start, before any
+    # settings file is read, so a value delivered through settings arrives too
+    # late to be trusted. Verified — with SSL_CERT_FILE supplied only through
+    # managed settings, Remote Control eligibility fails; exported here, it
+    # passes. Everything else can safely live in managed settings.
+    export SSL_CERT_FILE="${caBundlePath}"
+    export NIX_SSL_CERT_FILE="${caBundlePath}"
+    export NODE_EXTRA_CA_CERTS="${caPath}"
     exec ${lib.getExe' cfg.claudePackage "claude"} "$@"
   '';
   codex = pkgs.writeShellScriptBin "codex" ''
@@ -81,13 +90,18 @@ in {
         HTTP_PROXY = "http://127.0.0.1:18923";
         HTTPS_PROXY = "http://127.0.0.1:18923";
         NO_PROXY = "localhost,127.0.0.1,::1,.lan.cnb.rocks,.svc,.cluster.local";
+        # Blank, not absent. The user's stowed dotfiles ship a workstation
+        # ~/.claude/settings.json that sets ANTHROPIC_BASE_URL to the old
+        # reverse-proxy port, and settings outrank shell environment — so the
+        # wrapper cannot clear it and the Remote Control host check fails on a
+        # VM that stows dotfiles. Managed scope wins over user scope, and the
+        # check treats an empty value as unset.
+        ANTHROPIC_BASE_URL = "";
+        # Also exported by the wrapper, which is what actually makes the TLS
+        # trust take effect (see the comment there). Repeated here so
+        # background agents, which the supervisor starts outside the wrapper,
+        # still see consistent values.
         NODE_EXTRA_CA_CERTS = caPath;
-        # Claude Code checks Remote Control eligibility early, against the
-        # *system* trust store, before it applies NODE_EXTRA_CA_CERTS. That
-        # request is intercepted like any other, so without a system-level
-        # trust anchor the check fails and blames the feature-flag service —
-        # even though every later request works. Plant writes this bundle as
-        # system roots + its own CA, so unintercepted hosts still verify.
         SSL_CERT_FILE = caBundlePath;
         NIX_SSL_CERT_FILE = caBundlePath;
       };
