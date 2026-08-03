@@ -136,6 +136,7 @@ async fn dispatch_holds_one_guard_across_capacity_and_typed_execution() {
             id: attempt_id,
             started_ts: epoch_now(),
             retryable: false,
+            action: None,
         },
     )
     .unwrap();
@@ -219,6 +220,172 @@ async fn dispatch_holds_one_guard_across_capacity_and_typed_execution() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn resumed_compression_uses_the_durable_action_inside_the_daemon() {
+    let root = std::env::temp_dir().join(format!(
+        "plant-resumed-compression-action-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let sessions = root.join("vault/sessions");
+    let state = root.join("state");
+    let marker = root.join("wrapper-called");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::create_dir_all(state.join("job-attempts")).unwrap();
+    let _state = crate::state::use_test_dir(state.clone());
+    let wrapper = root.join("compress.30m.sh");
+    std::fs::write(
+        &wrapper,
+        format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_fence(
+        &state.join("job-attempts/compress.json"),
+        &AttemptFence {
+            id: "resumed-under-listener-owner".to_string(),
+            started_ts: 1,
+            retryable: false,
+            action: Some(JobAction::InProcessCompression),
+        },
+    )
+    .unwrap();
+    let job = Job {
+        name: "compress".to_string(),
+        path: wrapper,
+        every: Duration::from_secs(1800),
+        // The durable fence, not current discovery metadata, owns replay.
+        action: JobAction::Script,
+    };
+
+    let semaphore = tokio::sync::Semaphore::new(1);
+    assert_eq!(
+        dispatch_scheduled(&job, &sessions, &semaphore, SCRIPT_BACKSTOP).await,
+        ScheduledDispatch::Finished(0)
+    );
+    assert!(!marker.exists(), "replay must stay in-process");
+    let ledger = std::fs::read_to_string(state.join("jobs/compress.jsonl")).unwrap();
+    let records: Vec<serde_json::Value> = ledger
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["attempt_id"], "resumed-under-listener-owner");
+    assert!(!state.join("job-attempts/compress.json").exists());
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn typed_script_fence_without_a_receipt_stays_blocked() {
+    let root = std::env::temp_dir().join(format!(
+        "plant-typed-script-fence-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let sessions = root.join("vault/sessions");
+    let state = root.join("state");
+    let marker = root.join("script-called");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::create_dir_all(state.join("job-attempts")).unwrap();
+    let _state = crate::state::use_test_dir(state.clone());
+    let script = root.join("audit.1m.sh");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_fence(
+        &state.join("job-attempts/audit.json"),
+        &AttemptFence {
+            id: "typed-script-unresolved".to_string(),
+            started_ts: 1,
+            retryable: false,
+            action: Some(JobAction::Script),
+        },
+    )
+    .unwrap();
+    let job = Job {
+        name: "audit".to_string(),
+        path: script,
+        every: Duration::from_secs(60),
+        action: JobAction::Script,
+    };
+
+    let semaphore = tokio::sync::Semaphore::new(1);
+    assert_eq!(
+        dispatch_scheduled(&job, &sessions, &semaphore, SCRIPT_BACKSTOP).await,
+        ScheduledDispatch::Blocked
+    );
+    assert!(!marker.exists(), "an unresolved script must not run twice");
+    assert!(state.join("job-attempts/audit.json").exists());
+    assert!(!state.join("jobs/audit.jsonl").exists());
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn ledger_backed_fence_clears_without_execution() {
+    let root = std::env::temp_dir().join(format!(
+        "plant-ledger-backed-compression-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let sessions = root.join("vault/sessions");
+    let state = root.join("state");
+    let marker = root.join("wrapper-called");
+    std::fs::create_dir_all(&sessions).unwrap();
+    std::fs::create_dir_all(state.join("job-attempts")).unwrap();
+    std::fs::create_dir_all(state.join("jobs")).unwrap();
+    let _state = crate::state::use_test_dir(state.clone());
+    let wrapper = root.join("compress.30m.sh");
+    std::fs::write(
+        &wrapper,
+        format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_fence(
+        &state.join("job-attempts/compress.json"),
+        &AttemptFence {
+            id: "already-durable".to_string(),
+            started_ts: 1,
+            retryable: false,
+            action: Some(JobAction::InProcessCompression),
+        },
+    )
+    .unwrap();
+    std::fs::write(
+        state.join("jobs/compress.jsonl"),
+        format!(
+            "{{\"ts\":{},\"attempt_id\":\"already-durable\",\"outcome\":\"success\"}}\n",
+            epoch_now()
+        ),
+    )
+    .unwrap();
+    let job = Job {
+        name: "compress".to_string(),
+        path: wrapper,
+        every: Duration::from_secs(1800),
+        action: JobAction::InProcessCompression,
+    };
+
+    let semaphore = tokio::sync::Semaphore::new(1);
+    assert_eq!(
+        dispatch_scheduled(&job, &sessions, &semaphore, SCRIPT_BACKSTOP).await,
+        ScheduledDispatch::NotDue
+    );
+    assert!(!marker.exists(), "durable completion must not replay");
+    assert!(!state.join("job-attempts/compress.json").exists());
+    assert_eq!(
+        std::fs::read_to_string(state.join("jobs/compress.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 /// Write a keyed Agent Run receipt the way the `plant agent run` child would,
 /// straight to its content-addressed path, so the scheduler side can be tested
 /// without a Herdr lifecycle.
@@ -237,6 +404,7 @@ fn strand_fence(state: &Path, name: &str, id: &str) {
             id: id.to_string(),
             started_ts: epoch_now(),
             retryable: false,
+            action: None,
         },
     )
     .unwrap();
@@ -342,7 +510,9 @@ async fn conclusive_receipts_reconcile_fences_the_scheduler_never_recorded() {
         let before = std::fs::read_to_string(state.join("jobs/audit.jsonl")).unwrap();
         match reconcile_fence("audit").unwrap() {
             FenceReconcile::Blocked(detail) => assert!(detail.contains(id), "{detail}"),
-            FenceReconcile::Ready => panic!("{id} must not clear its fence"),
+            FenceReconcile::Ready | FenceReconcile::ResumableCompression(_) => {
+                panic!("{id} must not clear its fence")
+            }
         }
         assert!(state.join("job-attempts/audit.json").exists());
         assert_eq!(
