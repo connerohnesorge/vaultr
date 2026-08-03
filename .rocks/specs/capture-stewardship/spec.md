@@ -512,6 +512,10 @@ sweep or refuse to run. A gracefully draining daemon MUST retain both listeners
 until no in-flight task can append. Job discovery MUST assign compression an
 in-process action, and daemon dispatch MUST use that typed action rather than
 executing the manual wrapper.
+After capture recovery, a replacement listener-owning daemon MUST resume an
+unresolved `InProcessCompression` fence under its original attempt ID.
+The resumed sweep MUST use the existing Sealing transaction contract.
+Committed compressed generations MUST NOT be duplicated.
 
 #### Scenario: Complete incumbent already owns both harnesses
 
@@ -535,6 +539,14 @@ executing the manual wrapper.
 - THEN discovery and dispatch select the in-process compression action
 - AND that daemon invokes the sweep directly without spawning a child Plant or executing the manual wrapper
 - AND any operational failure is recorded as a failed job outcome
+
+#### Scenario: Restart resumes scheduled compression
+
+- GIVEN scheduled compression left an unresolved typed `InProcessCompression` fence
+- WHEN the replacement daemon retains both listeners and completes capture recovery
+- THEN the daemon resumes Sealing under the original attempt ID
+- AND Sealing recovers or retains incomplete transaction evidence
+- AND Sealing does not duplicate a committed compressed generation
 
 ### Requirement: Complete Envelope record reconstruction
 

@@ -47,3 +47,19 @@ died, without a second Herdr lifecycle and without a second recovery journal.
 
 An absent, pending, unreadable, or mismatched receipt keeps the existing
 fail-closed behavior. Reconciliation never treats an uncertain receipt as proof.
+
+### ADR-0004: Only typed compression fences replay in process
+
+Every new scheduled attempt fence records `Script` or `InProcessCompression`.
+Manual job execution records `Script`.
+An absent kind identifies a legacy fence.
+
+A matching durable ledger record remains authoritative and clears the fence before replay.
+An unresolved `InProcessCompression` fence returns its held attempt guard to the listener-owning daemon.
+The daemon reuses the fenced attempt ID without publishing another fence.
+Cadence remains secondary until that attempt reaches durable completion.
+Restart-independent workers accept only `Script` actions.
+The listener-owning daemon retains every `InProcessCompression` action.
+
+This replay relies on `capture-stewardship/design.md` ADR-0001 for crash-recoverable Sealing.
+Script and legacy actionless fences remain fail-closed because their side effects are not proven replay-safe.

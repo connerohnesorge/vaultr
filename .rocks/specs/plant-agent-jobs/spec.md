@@ -101,6 +101,10 @@ Plant MUST acquire scheduler capacity before it publishes a scheduled attempt fe
 After capacity admission, Plant MUST acquire the per-job cross-process flock.
 While holding the flock, Plant MUST verify ledger writability, reconcile prior state, and recheck cadence.
 Plant MUST publish the fence immediately before the scheduled action.
+Every new attempt fence MUST persist its scheduled action kind.
+The supported action kinds MUST be `Script` and `InProcessCompression`.
+An absent action kind MUST identify a legacy fence.
+Restart-independent script workers MUST NOT execute `InProcessCompression`.
 Plant MUST retain the flock through one durable final-record or retryable-fence transition.
 Plant MUST retain a nonretryable fence whenever the final outcome cannot be proven durable.
 On daemon cancellation, Plant MUST stop both listener supervisors from accepting.
@@ -167,9 +171,28 @@ A capture tee MUST stop pulling a stalled upstream when its client receiver clos
 #### Scenario: Scheduled compression uses the same lifecycle
 
 - WHEN the exact `compress` job is due in the listener-owning daemon
-- THEN Plant dispatches typed `InProcessCompression` inside the same held attempt guard
+- THEN Plant publishes an `InProcessCompression` fence inside the same held attempt guard
+- AND Plant dispatches typed `InProcessCompression` through that guard
 - AND never executes the wrapper or records through an unfenced path
-- BUT a manual `plant jobs run compress` executes the wrapper through normal attempt fencing
+
+#### Scenario: Manual compression uses script identity
+
+- WHEN an operator runs `plant jobs run compress`
+- THEN Plant publishes a `Script` fence through normal attempt fencing
+- AND Plant executes the manual wrapper
+
+#### Scenario: A legacy fence has no action identity
+
+- GIVEN a previous Plant version published an actionless fence
+- WHEN Plant deserializes that fence
+- THEN Plant identifies it as legacy state
+- AND Plant does not infer an action kind from the current job name
+
+#### Scenario: Script workers cannot own compression
+
+- WHEN Plant dispatches scheduled work through a restart-independent script worker
+- THEN the worker accepts only a `Script` action
+- AND the listener-owning daemon retains every `InProcessCompression` action
 
 #### Scenario: Compression owns the complete capture boundary
 

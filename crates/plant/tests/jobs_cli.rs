@@ -36,7 +36,7 @@ fn manual_jobs_propagate_normalized_statuses() {
     let home = tmp.join("home");
     let vault = tmp.join("vault");
     let sessions = vault.join("sessions");
-    let jobs = vault.join("jobs");
+    let jobs = vault.join("jobs/shared"); // flat bucket is retired
     fs::create_dir_all(home.join(".dotfiles")).unwrap();
     fs::create_dir_all(&sessions).unwrap();
     fs::create_dir_all(&jobs).unwrap();
@@ -147,6 +147,73 @@ fn manual_jobs_propagate_normalized_statuses() {
 }
 
 #[test]
+fn manual_compression_command_publishes_a_script_fence() {
+    let tmp = std::env::temp_dir().join(format!(
+        "plant-manual-compress-fence-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let home = tmp.join("home");
+    let sessions = tmp.join("vault/sessions");
+    let jobs = tmp.join("vault/jobs/shared");
+    let started = home.join("wrapper-started");
+    let release = home.join("release-wrapper");
+    fs::create_dir_all(home.join(".dotfiles")).unwrap();
+    fs::create_dir_all(&sessions).unwrap();
+    fs::create_dir_all(&jobs).unwrap();
+    write_job(
+        &jobs.join("compress.30m.sh"),
+        "#!/bin/sh\n\
+         touch \"$HOME/wrapper-started\"\n\
+         while [ ! -e \"$HOME/release-wrapper\" ]; do sleep 1; done\n",
+    );
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_plant"))
+        .args(["jobs", "run", "compress"])
+        .env("HOME", &home)
+        .env("VAULT_SESSIONS", &sessions)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let fence_path = home.join(".local/state/plant/job-attempts/compress.json");
+    let mut observed_fence = None;
+    for _ in 0..200 {
+        if started.exists() && fence_path.exists() {
+            observed_fence = fs::read_to_string(&fence_path).ok();
+            break;
+        }
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    fs::write(&release, "release\n").unwrap();
+    let output = child.wait_with_output().unwrap();
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(started.exists(), "manual command must execute the wrapper");
+    let fence: serde_json::Value = serde_json::from_str(
+        observed_fence
+            .as_deref()
+            .expect("manual fence must remain visible while the wrapper runs"),
+    )
+    .unwrap();
+    assert_eq!(fence["action"], "Script");
+    assert!(!fence_path.exists(), "successful manual completion clears the fence");
+
+    fs::remove_dir_all(tmp).unwrap();
+}
+
+#[test]
 fn sessions_stuck_summary_is_deterministic_and_becomes_job_ledger_detail() {
     let tmp = std::env::temp_dir().join(format!(
         "plant-watchdog-{}-{}",
@@ -159,7 +226,7 @@ fn sessions_stuck_summary_is_deterministic_and_becomes_job_ledger_detail() {
     let home = tmp.join("home");
     let vault = tmp.join("vault");
     let sessions = vault.join("sessions");
-    let jobs = vault.join("jobs");
+    let jobs = vault.join("jobs/shared"); // flat bucket is retired
     let day = sessions.join("2026/07/20");
     fs::create_dir_all(home.join(".dotfiles")).unwrap();
     fs::create_dir_all(home.join(".local/state/plant")).unwrap();
@@ -259,7 +326,7 @@ fn unavailable_ledger_prevents_job_side_effects() {
     let home = tmp.join("home");
     let vault = tmp.join("vault");
     let sessions = vault.join("sessions");
-    let jobs = vault.join("jobs");
+    let jobs = vault.join("jobs/shared"); // flat bucket is retired
     fs::create_dir_all(home.join(".dotfiles")).unwrap();
     fs::create_dir_all(home.join(".local/state/plant")).unwrap();
     fs::create_dir_all(&sessions).unwrap();
@@ -290,7 +357,7 @@ fn final_record_failure_keeps_attempt_fenced() {
     let home = tmp.join("home");
     let vault = tmp.join("vault");
     let sessions = vault.join("sessions");
-    let jobs = vault.join("jobs");
+    let jobs = vault.join("jobs/shared"); // flat bucket is retired
     fs::create_dir_all(home.join(".dotfiles")).unwrap();
     fs::create_dir_all(&sessions).unwrap();
     fs::create_dir_all(&jobs).unwrap();

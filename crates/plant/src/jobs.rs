@@ -1,7 +1,8 @@
 //! SwiftBar-style job scheduler: jobs are executable scripts at
-//! <vault content root>/jobs/<name>.<interval>.<ext> or jobs/shared/ (e.g.
-//! learn.15m.sh, door-oncall.30m.ts). A jobs/.hostname marker limits flat jobs
-//! to that short hostname; shared jobs always load. The filename carries the
+//! <vault content root>/jobs/shared/<name>.<interval>.<ext> or
+//! jobs/<short hostname>/ (e.g. learn.15m.sh, door-oncall.30m.ts). Shared jobs
+//! load everywhere; a host bucket loads only on that host and overrides a
+//! same-named shared job. The filename carries the
 //! cadence; the script is exec'd directly, so its shebang picks the interpreter
 //! (bash, bun, …) — Plant maps no extensions. The script body does the work
 //! itself, composing the plant/vaultr CLIs (`plant sessions eligible --claim`,
@@ -44,7 +45,7 @@ pub struct Job {
     pub action: JobAction,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum JobAction {
     Script,
     InProcessCompression,
@@ -128,24 +129,18 @@ fn jobs_in(dir: &Path) -> Vec<Job> {
         .collect()
 }
 
-/// Three buckets, most-specific-wins by job name:
+/// Two buckets, most-specific-wins by job name:
 ///   `shared/`      — every host
-///   flat `jobs/*`  — gated by the `.hostname` marker (legacy; see below)
 ///   `<hostname>/`  — this host only
 ///
-/// The flat bucket is the pre-bucket layout and is kept working through the grace
-/// window: one marker can only ever name one host, so a second machine could not
-/// have its own jobs at all. A host bucket overrides a same-named job from either
-/// other bucket, so a machine can specialise `learn` without forking the schedule.
+/// A host bucket overrides a same-named shared job, so a machine can specialise
+/// `learn` without forking the schedule. Scripts sitting flat in `jobs/` are
+/// deliberately NOT scanned: that was the pre-bucket layout, gated by a
+/// `.hostname` marker that could only ever name one host, so a second machine
+/// could not have jobs of its own. Both are retired — a flat cadence-named
+/// script is now inert, and `jobs/AGENTS.md` says so.
 fn load_jobs_at(dir: &Path, short_hostname: &str) -> Vec<Job> {
-    let local_jobs_enabled = match std::fs::read_to_string(dir.join(".hostname")) {
-        Ok(hostname) => hostname.trim() == short_hostname,
-        Err(error) => error.kind() == io::ErrorKind::NotFound,
-    };
     let mut jobs = jobs_in(&dir.join("shared"));
-    if local_jobs_enabled {
-        overlay(&mut jobs, jobs_in(dir));
-    }
     overlay(&mut jobs, jobs_in(&dir.join(short_hostname)));
     jobs.sort_by(|a, b| a.name.cmp(&b.name));
     jobs
@@ -300,11 +295,13 @@ fn record_is_due(last: Option<u64>, every: Duration, now: u64) -> bool {
     last.is_none_or(|ts| now.saturating_sub(ts) >= every.as_secs())
 }
 
-#[derive(serde::Deserialize, serde::Serialize)]
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
 struct AttemptFence {
     id: String,
     started_ts: u64,
     retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    action: Option<JobAction>,
 }
 
 struct AttemptGuard {
@@ -398,6 +395,7 @@ fn verify_ledger_writable(name: &str) -> io::Result<()> {
 #[derive(Debug)]
 enum FenceReconcile {
     Ready,
+    ResumableCompression(AttemptFence),
     Blocked(String),
 }
 
@@ -426,6 +424,9 @@ where
     if !existing.retryable
         && !ledger_has_attempt_at(ledger_path, ledger_parent, &existing.id, sync)?
     {
+        if existing.action == Some(JobAction::InProcessCompression) {
+            return Ok(FenceReconcile::ResumableCompression(existing));
+        }
         // No ledger record, but the attempt ID doubles as the Agent Run
         // idempotency key: a conclusive receipt proves the effect finished even
         // though the scheduler died before recording it.
@@ -518,8 +519,11 @@ pub fn unblock_job(name: &str) -> io::Result<Unblocked> {
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     // Never force what resolves itself — a conclusive receipt or a matching
     // ledger record must still take the ordinary reconciliation path.
-    if let FenceReconcile::Ready = reconcile_fence(name)? {
-        return Ok(Unblocked::AlreadyClear);
+    match reconcile_fence(name)? {
+        FenceReconcile::Ready | FenceReconcile::ResumableCompression(_) => {
+            return Ok(Unblocked::AlreadyClear)
+        }
+        FenceReconcile::Blocked(_) => {}
     }
     let ledger = ledger_path(name);
     append_ledger_record(
@@ -567,11 +571,12 @@ fn acquire_attempt_lock(name: &str) -> io::Result<AttemptLockStart> {
     Ok(AttemptLockStart::Ready(lock))
 }
 
-fn publish_attempt(name: &str, lock: File) -> io::Result<AttemptGuard> {
+fn publish_attempt(name: &str, action: JobAction, lock: File) -> io::Result<AttemptGuard> {
     let fence = AttemptFence {
         id: uuid::Uuid::new_v4().to_string(),
         started_ts: epoch_now(),
         retryable: false,
+        action: Some(action),
     };
     write_fence(&attempt_path(name), &fence)?;
     Ok(AttemptGuard {
@@ -584,7 +589,13 @@ fn publish_attempt(name: &str, lock: File) -> io::Result<AttemptGuard> {
 fn begin_attempt_locked(name: &str, lock: File) -> io::Result<AttemptStart> {
     verify_ledger_writable(name)?;
     match reconcile_fence(name)? {
-        FenceReconcile::Ready => publish_attempt(name, lock).map(AttemptStart::Ready),
+        FenceReconcile::Ready => {
+            publish_attempt(name, JobAction::Script, lock).map(AttemptStart::Ready)
+        }
+        FenceReconcile::ResumableCompression(fence) => Ok(AttemptStart::Blocked(format!(
+            "attempt {} awaits in-process compression resume",
+            fence.id
+        ))),
         FenceReconcile::Blocked(detail) => Ok(AttemptStart::Blocked(detail)),
     }
 }
@@ -608,14 +619,24 @@ fn begin_scheduled_attempt(job: &Job) -> io::Result<ScheduledAttemptStart> {
         AttemptLockStart::Blocked(detail) => return Ok(ScheduledAttemptStart::Blocked(detail)),
     };
     verify_ledger_writable(&job.name)?;
-    if let FenceReconcile::Blocked(detail) = reconcile_fence(&job.name)? {
-        return Ok(ScheduledAttemptStart::Blocked(detail));
+    match reconcile_fence(&job.name)? {
+        FenceReconcile::Ready => {}
+        FenceReconcile::ResumableCompression(fence) => {
+            return Ok(ScheduledAttemptStart::Ready(AttemptGuard {
+                name: job.name.clone(),
+                fence,
+                _lock: lock,
+            }))
+        }
+        FenceReconcile::Blocked(detail) => {
+            return Ok(ScheduledAttemptStart::Blocked(detail))
+        }
     }
     let due = record_is_due(last_record_ts(&job.name)?, job.every, epoch_now());
     if !due {
         return Ok(ScheduledAttemptStart::NotDue);
     }
-    publish_attempt(&job.name, lock).map(ScheduledAttemptStart::Ready)
+    publish_attempt(&job.name, job.action, lock).map(ScheduledAttemptStart::Ready)
 }
 
 impl AttemptGuard {
@@ -825,11 +846,12 @@ async fn execute_compression(vault: &Path) -> JobExecution {
 
 async fn execute_scheduled(
     job: &Job,
+    action: JobAction,
     vault: &Path,
     script_timeout: Duration,
     attempt_id: &str,
 ) -> JobExecution {
-    match job.action {
+    match action {
         JobAction::Script => execute_script_with_timeout(job, script_timeout, attempt_id).await,
         JobAction::InProcessCompression => execute_compression(vault).await,
     }
@@ -916,7 +938,15 @@ async fn dispatch_scheduled(
         }
     };
     let started = SystemTime::now();
-    let execution = execute_scheduled(job, vault, script_timeout, &attempt.fence.id).await;
+    let Some(action) = attempt.fence.action else {
+        eprintln!(
+            "[job:{}] scheduled dispatch blocked: attempt {} has no action kind",
+            job.name, attempt.fence.id
+        );
+        return ScheduledDispatch::Blocked;
+    };
+    let execution =
+        execute_scheduled(job, action, vault, script_timeout, &attempt.fence.id).await;
     ScheduledDispatch::Finished(finish_execution(job, attempt, started, execution))
 }
 pub async fn scheduler(cfg: Cfg, vault: PathBuf) {
@@ -999,7 +1029,12 @@ mod tests {
         let guard = crate::state::use_test_dir(state.clone());
         write_fence(
             &attempt_path("j"),
-            &AttemptFence { id: id.to_string(), started_ts: 1, retryable: false },
+            &AttemptFence {
+                id: id.to_string(),
+                started_ts: 1,
+                retryable: false,
+                action: None,
+            },
         )
         .unwrap();
         (state, guard)
@@ -1137,8 +1172,12 @@ mod tests {
         }
     }
 
+    /// The retired flat bucket must stay retired. A cadence-named script left at
+    /// `jobs/` top level is inert on every host, and a leftover `.hostname` marker
+    /// grants it nothing — this is the regression that would silently resurrect
+    /// one host's private schedule on every machine.
     #[test]
-    fn hostname_marker_scopes_flat_jobs_but_not_shared_jobs() {
+    fn flat_scripts_and_a_stale_hostname_marker_are_both_ignored() {
         let root = std::env::temp_dir().join(format!("plant-job-host-{}", uuid::Uuid::new_v4()));
         let shared = root.join("shared");
         std::fs::create_dir_all(&shared).unwrap();
@@ -1151,10 +1190,10 @@ mod tests {
                 .map(|job| job.name)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(names("other"), ["local", "portable"]);
+        assert_eq!(names("other"), ["portable"]);
 
         std::fs::write(root.join(".hostname"), "CB14957\n").unwrap();
-        assert_eq!(names("CB14957"), ["local", "portable"]);
+        assert_eq!(names("CB14957"), ["portable"]);
         assert_eq!(names("allocator-vm"), ["portable"]);
 
         std::fs::remove_dir_all(root).unwrap();
@@ -1165,10 +1204,11 @@ mod tests {
         let root = std::env::temp_dir().join(format!("plant-job-bucket-{}", uuid::Uuid::new_v4()));
         let shared = root.join("shared");
         let vm = root.join("allocator-vm");
+        let mac = root.join("CB14957");
         std::fs::create_dir_all(&shared).unwrap();
         std::fs::create_dir_all(&vm).unwrap();
-        std::fs::write(root.join(".hostname"), "CB14957\n").unwrap();
-        std::fs::write(root.join("door-mail.30m.ts"), "").unwrap();
+        std::fs::create_dir_all(&mac).unwrap();
+        std::fs::write(mac.join("door-mail.30m.ts"), "").unwrap();
         std::fs::write(shared.join("health.15m.sh"), "").unwrap();
         std::fs::write(vm.join("learn.3h.sh"), "").unwrap();
         // same name as a shared job: the host bucket wins, it does not duplicate
@@ -1182,7 +1222,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        // The VM never sees the Mac's flat jobs, and gets its own learner.
+        // The VM never sees the Mac's jobs, and gets its own learner.
         assert_eq!(names("allocator-vm"), ["health", "learn"]);
         let health = jobs("allocator-vm")
             .into_iter()
@@ -1191,7 +1231,7 @@ mod tests {
         assert_eq!(health.every, Duration::from_secs(300));
         assert_eq!(health.path, vm.join("health.5m.sh"));
 
-        // The Mac is unaffected: no bucket of its own, flat jobs still gated in.
+        // The Mac gets its own bucket's job plus the un-overridden shared one.
         assert_eq!(names("CB14957"), ["door-mail", "health"]);
         let mac_health = jobs("CB14957")
             .into_iter()
@@ -1210,6 +1250,207 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_attempt_persists_the_discovered_action() {
+        let root = std::env::temp_dir().join(format!(
+            "plant-scheduled-action-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state = root.join("state");
+        let _state = crate::state::use_test_dir(state.clone());
+        let job = Job {
+            name: "compress".to_string(),
+            path: root.join("compress.30m.sh"),
+            every: Duration::from_secs(1800),
+            action: JobAction::InProcessCompression,
+        };
+
+        let ScheduledAttemptStart::Ready(attempt) = begin_scheduled_attempt(&job).unwrap() else {
+            panic!("a first scheduled attempt must be due");
+        };
+        assert_eq!(attempt.fence.action, Some(JobAction::InProcessCompression));
+        let persisted: AttemptFence =
+            serde_json::from_slice(&std::fs::read(attempt_path("compress")).unwrap()).unwrap();
+        assert_eq!(persisted.action, Some(JobAction::InProcessCompression));
+
+        drop(attempt);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn manual_compression_attempt_persists_script_action() {
+        let root = std::env::temp_dir().join(format!(
+            "plant-manual-compression-action-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state = root.join("state");
+        let _state = crate::state::use_test_dir(state.clone());
+
+        let AttemptStart::Ready(attempt) = begin_attempt("compress").unwrap() else {
+            panic!("a first manual attempt must be ready");
+        };
+        assert_eq!(attempt.fence.action, Some(JobAction::Script));
+        let persisted: AttemptFence =
+            serde_json::from_slice(&std::fs::read(attempt_path("compress")).unwrap()).unwrap();
+        assert_eq!(persisted.action, Some(JobAction::Script));
+
+        drop(attempt);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_actionless_fence_deserializes_without_identity() {
+        let fence: AttemptFence = serde_json::from_str(
+            r#"{"id":"legacy","started_ts":1,"retryable":false}"#,
+        )
+        .unwrap();
+
+        assert_eq!(fence.id, "legacy");
+        assert_eq!(fence.action, None);
+    }
+
+    #[test]
+    fn typed_script_fence_still_reconciles_from_its_agent_run_receipt() {
+        let root = std::env::temp_dir().join(format!(
+            "plant-script-receipt-reconcile-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state = root.join("state");
+        std::fs::create_dir_all(state.join("job-attempts")).unwrap();
+        std::fs::create_dir_all(state.join("jobs")).unwrap();
+        let _state = crate::state::use_test_dir(state.clone());
+        write_fence(
+            &attempt_path("script"),
+            &AttemptFence {
+                id: "typed-script-finished".to_string(),
+                started_ts: 1,
+                retryable: false,
+                action: Some(JobAction::Script),
+            },
+        )
+        .unwrap();
+        write_receipt(
+            &state,
+            "typed-script-finished",
+            r#"{"state":"succeeded","key":"typed-script-finished","detail":"agent done"}"#,
+        );
+
+        assert!(matches!(
+            reconcile_fence("script").unwrap(),
+            FenceReconcile::Ready
+        ));
+        let ledger = std::fs::read_to_string(state.join("jobs/script.jsonl")).unwrap();
+        assert!(ledger.contains("reconciled from agent run receipt"), "{ledger}");
+        assert!(!attempt_path("script").exists());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_compression_fence_requires_operator_recovery() {
+        let root = std::env::temp_dir().join(format!(
+            "plant-legacy-compression-fence-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state = root.join("state");
+        std::fs::create_dir_all(state.join("job-attempts")).unwrap();
+        std::fs::create_dir_all(state.join("jobs")).unwrap();
+        let _state = crate::state::use_test_dir(state.clone());
+        write_fence(
+            &attempt_path("compress"),
+            &AttemptFence {
+                id: "legacy-compression".to_string(),
+                started_ts: 1,
+                retryable: false,
+                action: None,
+            },
+        )
+        .unwrap();
+        let job = Job {
+            name: "compress".to_string(),
+            path: root.join("compress.30m.sh"),
+            every: Duration::from_secs(1800),
+            action: JobAction::InProcessCompression,
+        };
+
+        let ScheduledAttemptStart::Blocked(detail) = begin_scheduled_attempt(&job).unwrap() else {
+            panic!("legacy actionless compression must stay blocked");
+        };
+        assert!(detail.contains("plant jobs unblock compress"), "{detail}");
+        assert!(attempt_path("compress").exists());
+
+        assert_eq!(
+            unblock_job("compress").unwrap(),
+            Unblocked::Cleared("legacy-compression".to_string())
+        );
+        let ledger = std::fs::read_to_string(state.join("jobs/compress.jsonl")).unwrap();
+        assert!(ledger.contains(r#""attempt_id":"legacy-compression""#), "{ledger}");
+        assert!(ledger.contains(r#""outcome":"failed""#), "{ledger}");
+        assert!(!attempt_path("compress").exists());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn typed_compression_fence_returns_its_existing_attempt_guard() {
+        let root = std::env::temp_dir().join(format!(
+            "plant-resumable-compression-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let state = root.join("state");
+        std::fs::create_dir_all(state.join("job-attempts")).unwrap();
+        let _state = crate::state::use_test_dir(state.clone());
+        write_fence(
+            &attempt_path("compress"),
+            &AttemptFence {
+                id: "original-compression-attempt".to_string(),
+                started_ts: 1,
+                retryable: false,
+                action: Some(JobAction::InProcessCompression),
+            },
+        )
+        .unwrap();
+        let original_fence = std::fs::read(attempt_path("compress")).unwrap();
+        let job = Job {
+            name: "compress".to_string(),
+            path: root.join("compress.30m.sh"),
+            every: Duration::from_secs(1800),
+            action: JobAction::InProcessCompression,
+        };
+
+        let ScheduledAttemptStart::Ready(attempt) = begin_scheduled_attempt(&job).unwrap() else {
+            panic!("typed compression must resume");
+        };
+        assert_eq!(attempt.fence.id, "original-compression-attempt");
+        assert_eq!(attempt.fence.action, Some(JobAction::InProcessCompression));
+        assert!(attempt_path("compress").exists());
+        assert_eq!(
+            std::fs::read(attempt_path("compress")).unwrap(),
+            original_fence,
+            "resume must not publish a replacement fence"
+        );
+
+        assert_eq!(
+            finish_execution(
+                &job,
+                attempt,
+                SystemTime::now(),
+                JobExecution::Succeeded("resumed compression complete".to_string()),
+            ),
+            0
+        );
+        let ledger = std::fs::read_to_string(state.join("jobs/compress.jsonl")).unwrap();
+        let records: Vec<serde_json::Value> = ledger
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["attempt_id"], "original-compression-attempt");
+        assert!(!attempt_path("compress").exists());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn recovery_requires_the_matching_ledger_descriptor_to_sync() {
         let root = std::env::temp_dir().join(format!("plant-ledger-sync-{}", uuid::Uuid::new_v4()));
         let attempts = root.join("attempts");
@@ -1222,6 +1463,7 @@ mod tests {
             id: "written-but-not-durable".to_string(),
             started_ts: 1,
             retryable: false,
+            action: None,
         };
         write_fence(&fence_path, &fence).unwrap();
         let original_fence = std::fs::read(&fence_path).unwrap();
@@ -1280,6 +1522,7 @@ mod tests {
                 id: "completed".to_string(),
                 started_ts: 99,
                 retryable: false,
+                action: None,
             },
         )
         .unwrap();
