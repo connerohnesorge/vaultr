@@ -36,7 +36,7 @@ fn manual_jobs_propagate_normalized_statuses() {
     let home = tmp.join("home");
     let vault = tmp.join("vault");
     let sessions = vault.join("sessions");
-    let jobs = vault.join("jobs");
+    let jobs = vault.join("jobs/shared"); // flat bucket is retired
     fs::create_dir_all(home.join(".dotfiles")).unwrap();
     fs::create_dir_all(&sessions).unwrap();
     fs::create_dir_all(&jobs).unwrap();
@@ -159,7 +159,7 @@ fn sessions_stuck_summary_is_deterministic_and_becomes_job_ledger_detail() {
     let home = tmp.join("home");
     let vault = tmp.join("vault");
     let sessions = vault.join("sessions");
-    let jobs = vault.join("jobs");
+    let jobs = vault.join("jobs/shared"); // flat bucket is retired
     let day = sessions.join("2026/07/20");
     fs::create_dir_all(home.join(".dotfiles")).unwrap();
     fs::create_dir_all(home.join(".local/state/plant")).unwrap();
@@ -259,7 +259,7 @@ fn unavailable_ledger_prevents_job_side_effects() {
     let home = tmp.join("home");
     let vault = tmp.join("vault");
     let sessions = vault.join("sessions");
-    let jobs = vault.join("jobs");
+    let jobs = vault.join("jobs/shared"); // flat bucket is retired
     fs::create_dir_all(home.join(".dotfiles")).unwrap();
     fs::create_dir_all(home.join(".local/state/plant")).unwrap();
     fs::create_dir_all(&sessions).unwrap();
@@ -290,7 +290,7 @@ fn final_record_failure_keeps_attempt_fenced() {
     let home = tmp.join("home");
     let vault = tmp.join("vault");
     let sessions = vault.join("sessions");
-    let jobs = vault.join("jobs");
+    let jobs = vault.join("jobs/shared"); // flat bucket is retired
     fs::create_dir_all(home.join(".dotfiles")).unwrap();
     fs::create_dir_all(&sessions).unwrap();
     fs::create_dir_all(&jobs).unwrap();

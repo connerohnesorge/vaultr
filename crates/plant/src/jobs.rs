@@ -1,7 +1,8 @@
 //! SwiftBar-style job scheduler: jobs are executable scripts at
-//! <vault content root>/jobs/<name>.<interval>.<ext> or jobs/shared/ (e.g.
-//! learn.15m.sh, door-oncall.30m.ts). A jobs/.hostname marker limits flat jobs
-//! to that short hostname; shared jobs always load. The filename carries the
+//! <vault content root>/jobs/shared/<name>.<interval>.<ext> or
+//! jobs/<short hostname>/ (e.g. learn.15m.sh, door-oncall.30m.ts). Shared jobs
+//! load everywhere; a host bucket loads only on that host and overrides a
+//! same-named shared job. The filename carries the
 //! cadence; the script is exec'd directly, so its shebang picks the interpreter
 //! (bash, bun, …) — Plant maps no extensions. The script body does the work
 //! itself, composing the plant/vaultr CLIs (`plant sessions eligible --claim`,
@@ -128,24 +129,18 @@ fn jobs_in(dir: &Path) -> Vec<Job> {
         .collect()
 }
 
-/// Three buckets, most-specific-wins by job name:
+/// Two buckets, most-specific-wins by job name:
 ///   `shared/`      — every host
-///   flat `jobs/*`  — gated by the `.hostname` marker (legacy; see below)
 ///   `<hostname>/`  — this host only
 ///
-/// The flat bucket is the pre-bucket layout and is kept working through the grace
-/// window: one marker can only ever name one host, so a second machine could not
-/// have its own jobs at all. A host bucket overrides a same-named job from either
-/// other bucket, so a machine can specialise `learn` without forking the schedule.
+/// A host bucket overrides a same-named shared job, so a machine can specialise
+/// `learn` without forking the schedule. Scripts sitting flat in `jobs/` are
+/// deliberately NOT scanned: that was the pre-bucket layout, gated by a
+/// `.hostname` marker that could only ever name one host, so a second machine
+/// could not have jobs of its own. Both are retired — a flat cadence-named
+/// script is now inert, and `jobs/AGENTS.md` says so.
 fn load_jobs_at(dir: &Path, short_hostname: &str) -> Vec<Job> {
-    let local_jobs_enabled = match std::fs::read_to_string(dir.join(".hostname")) {
-        Ok(hostname) => hostname.trim() == short_hostname,
-        Err(error) => error.kind() == io::ErrorKind::NotFound,
-    };
     let mut jobs = jobs_in(&dir.join("shared"));
-    if local_jobs_enabled {
-        overlay(&mut jobs, jobs_in(dir));
-    }
     overlay(&mut jobs, jobs_in(&dir.join(short_hostname)));
     jobs.sort_by(|a, b| a.name.cmp(&b.name));
     jobs
@@ -1137,8 +1132,12 @@ mod tests {
         }
     }
 
+    /// The retired flat bucket must stay retired. A cadence-named script left at
+    /// `jobs/` top level is inert on every host, and a leftover `.hostname` marker
+    /// grants it nothing — this is the regression that would silently resurrect
+    /// one host's private schedule on every machine.
     #[test]
-    fn hostname_marker_scopes_flat_jobs_but_not_shared_jobs() {
+    fn flat_scripts_and_a_stale_hostname_marker_are_both_ignored() {
         let root = std::env::temp_dir().join(format!("plant-job-host-{}", uuid::Uuid::new_v4()));
         let shared = root.join("shared");
         std::fs::create_dir_all(&shared).unwrap();
@@ -1151,10 +1150,10 @@ mod tests {
                 .map(|job| job.name)
                 .collect::<Vec<_>>()
         };
-        assert_eq!(names("other"), ["local", "portable"]);
+        assert_eq!(names("other"), ["portable"]);
 
         std::fs::write(root.join(".hostname"), "CB14957\n").unwrap();
-        assert_eq!(names("CB14957"), ["local", "portable"]);
+        assert_eq!(names("CB14957"), ["portable"]);
         assert_eq!(names("allocator-vm"), ["portable"]);
 
         std::fs::remove_dir_all(root).unwrap();
@@ -1165,10 +1164,11 @@ mod tests {
         let root = std::env::temp_dir().join(format!("plant-job-bucket-{}", uuid::Uuid::new_v4()));
         let shared = root.join("shared");
         let vm = root.join("allocator-vm");
+        let mac = root.join("CB14957");
         std::fs::create_dir_all(&shared).unwrap();
         std::fs::create_dir_all(&vm).unwrap();
-        std::fs::write(root.join(".hostname"), "CB14957\n").unwrap();
-        std::fs::write(root.join("door-mail.30m.ts"), "").unwrap();
+        std::fs::create_dir_all(&mac).unwrap();
+        std::fs::write(mac.join("door-mail.30m.ts"), "").unwrap();
         std::fs::write(shared.join("health.15m.sh"), "").unwrap();
         std::fs::write(vm.join("learn.3h.sh"), "").unwrap();
         // same name as a shared job: the host bucket wins, it does not duplicate
@@ -1182,7 +1182,7 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        // The VM never sees the Mac's flat jobs, and gets its own learner.
+        // The VM never sees the Mac's jobs, and gets its own learner.
         assert_eq!(names("allocator-vm"), ["health", "learn"]);
         let health = jobs("allocator-vm")
             .into_iter()
@@ -1191,7 +1191,7 @@ mod tests {
         assert_eq!(health.every, Duration::from_secs(300));
         assert_eq!(health.path, vm.join("health.5m.sh"));
 
-        // The Mac is unaffected: no bucket of its own, flat jobs still gated in.
+        // The Mac gets its own bucket's job plus the un-overridden shared one.
         assert_eq!(names("CB14957"), ["door-mail", "health"]);
         let mac_health = jobs("CB14957")
             .into_iter()

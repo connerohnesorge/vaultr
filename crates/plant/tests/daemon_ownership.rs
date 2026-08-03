@@ -323,7 +323,8 @@ fn daemon_scheduler_runs_compression_in_process_and_records_conflicts() {
     let root = temp_root("scheduled-compress-ownership");
     let home = root.join("home");
     let sessions = root.join("vault/sessions");
-    let jobs = root.join("vault/jobs");
+    // shared/, not flat: the flat bucket is retired and no longer scanned.
+    let jobs = root.join("vault/jobs/shared");
     fs::create_dir_all(&home).unwrap();
     fs::create_dir_all(&jobs).unwrap();
     let marker = root.join("script-ran");
