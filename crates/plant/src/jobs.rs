@@ -255,6 +255,47 @@ fn last_record_ts_at(path: &Path) -> io::Result<Option<u64>> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "job record has no ts"))
 }
 
+/// Timestamp a script may treat as "everything before this is already handled",
+/// exported as `PLANT_LAST_TS`.
+///
+/// This is the last SUCCESSFUL record, not the ledger tail. Watermark-style jobs
+/// select their batch with it (`find -newer`, `processed_at > $since`), so a
+/// failed record must not advance it: the failed attempt is precisely the one
+/// that did NOT consume its window, and moving the mark to its timestamp makes
+/// the next run skip work nothing ever processed. An operator `plant jobs
+/// unblock` writes such a record hours after the fence was published, which is
+/// how a 19h context-audit window went silently unaudited (2026-08-03).
+///
+/// Dueness deliberately keeps reading the tail via `last_record_ts` — a job that
+/// keeps failing must still wait out its interval instead of hot-looping.
+fn last_success_ts(name: &str) -> io::Result<Option<u64>> {
+    last_success_ts_at(&ledger_path(name))
+}
+
+fn last_success_ts_at(path: &Path) -> io::Result<Option<u64>> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    for line in text.lines().rev().filter(|l| !l.trim().is_empty()) {
+        let record: serde_json::Value = serde_json::from_str(line)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        if record.get("outcome").and_then(serde_json::Value::as_str) != Some("success") {
+            continue;
+        }
+        return record
+            .get("ts")
+            .and_then(serde_json::Value::as_u64)
+            .map(Some)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "job record has no ts"));
+    }
+    // No success on record behaves exactly like an absent ledger: first-run
+    // baseline. Scripts already handle `PLANT_LAST_TS=0` (verify baselines, the
+    // find-based ones scan from the epoch and cap their batch).
+    Ok(None)
+}
+
 fn record_is_due(last: Option<u64>, every: Duration, now: u64) -> bool {
     last.is_none_or(|ts| now.saturating_sub(ts) >= every.as_secs())
 }
@@ -745,7 +786,7 @@ async fn execute_script_with_timeout(
         .env("PLANT_ATTEMPT_ID", attempt_id)
         .env(
             "PLANT_LAST_TS",
-            last_record_ts(&job.name)
+            last_success_ts(&job.name)
                 .ok()
                 .flatten()
                 .unwrap_or(0)
@@ -1268,6 +1309,68 @@ mod tests {
             150,
         ));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// Build a ledger file from (ts, outcome) pairs and hand back its path.
+    fn ledger_of(tag: &str, records: &[(u64, &str)]) -> (PathBuf, PathBuf) {
+        let root =
+            std::env::temp_dir().join(format!("plant-watermark-{tag}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let ledger = root.join("j.jsonl");
+        let body: String = records
+            .iter()
+            .map(|(ts, outcome)| {
+                format!(
+                    r#"{{"ts":{ts},"iso":"x","attempt_id":"a{ts}","outcome":"{outcome}","duration_ms":0,"detail":"d"}}"#
+                ) + "\n"
+            })
+            .collect();
+        std::fs::write(&ledger, body).unwrap();
+        (root, ledger)
+    }
+
+    /// The regression: an abandoned attempt recorded `failed` long after its
+    /// fence was published must not carry the watermark forward over the window
+    /// it never processed.
+    #[test]
+    fn unblock_failure_does_not_advance_the_watermark() {
+        let (root, ledger) = ledger_of(
+            "unblock",
+            &[(100, "success"), (200, "success"), (999, "failed")],
+        );
+        assert_eq!(last_success_ts_at(&ledger).unwrap(), Some(200));
+        // Dueness still reads the tail, so a job that keeps failing waits out
+        // its interval instead of hot-looping.
+        assert_eq!(last_record_ts_at(&ledger).unwrap(), Some(999));
+        assert!(!record_is_due(
+            last_record_ts_at(&ledger).unwrap(),
+            Duration::from_secs(60),
+            1000,
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn watermark_is_the_tail_when_the_tail_succeeded() {
+        let (root, ledger) = ledger_of("tail", &[(100, "failed"), (200, "success")]);
+        assert_eq!(last_success_ts_at(&ledger).unwrap(), Some(200));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A ledger with nothing but failures is indistinguishable from a job that
+    /// has never consumed a window, so it baselines like a first run.
+    #[test]
+    fn watermark_without_any_success_is_a_first_run() {
+        let (root, ledger) = ledger_of("nosuccess", &[(100, "failed"), (200, "failed")]);
+        assert_eq!(last_success_ts_at(&ledger).unwrap(), None);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn watermark_of_an_absent_ledger_is_a_first_run() {
+        let missing =
+            std::env::temp_dir().join(format!("plant-watermark-gone-{}", uuid::Uuid::new_v4()));
+        assert_eq!(last_success_ts_at(&missing).unwrap(), None);
     }
 
     #[test]
