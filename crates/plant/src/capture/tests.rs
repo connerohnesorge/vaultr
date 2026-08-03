@@ -823,6 +823,44 @@ async fn detachment_includes_a_completion_queued_first() {
     );
 }
 
+// Startup recovery runs before the daemon writes its CA, so an absent sessions
+// root must not be fatal — it once crashlooped plant on every allocator VM whose
+// dotfiles repo had not been cloned, leaving no proxy and no CA, which made every
+// `claude` invocation fail closed. Recovery must also not create the root: on
+// those VMs it lives inside the dotfiles repo, and `git clone` refuses a
+// destination that exists and is non-empty.
+#[test]
+fn recovery_tolerates_an_absent_sessions_root_without_creating_it() {
+    let missing = temp_vault("absent-root").join("vault/sessions");
+
+    recover_all(&missing).unwrap();
+
+    assert!(
+        !missing.exists(),
+        "recovery must not create the sessions root at {}",
+        missing.display()
+    );
+}
+
+// The real shape on an allocator VM is a dangling symlink: ~/.dotfiles points at
+// ~/dotfiles, which only appears once the repo is cloned. try_exists follows the
+// link, so this must behave like the plain-missing case above.
+#[test]
+fn recovery_tolerates_a_dangling_symlink_sessions_root() {
+    let base = temp_vault("dangling-root");
+    fs::create_dir_all(&base).unwrap();
+    let link = base.join(".dotfiles");
+    std::os::unix::fs::symlink(base.join("dotfiles"), &link).unwrap();
+    let root = link.join("vault/sessions");
+
+    recover_all(&root).unwrap();
+
+    assert!(
+        !base.join("dotfiles").exists(),
+        "recovery must not materialize the symlink target"
+    );
+}
+
 #[test]
 fn recovery_ignores_evidence_from_another_vault_root() {
     let (_guard, vault) = set_home();
