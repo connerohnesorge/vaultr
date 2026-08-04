@@ -89,6 +89,18 @@ async fn below_floor_capture_records_a_dropped_turn() {
 }
 
 #[test]
+fn recorded_drop_counter_counts_a_persisted_marker() {
+    let vault = temp_vault("recorded-drop-counter");
+    let sid = uuid::Uuid::new_v4().to_string();
+    let before = recorded_drops();
+
+    record_drop(&vault, &sid, "disk full");
+
+    assert!(recorded_drops() > before);
+    fs::remove_dir_all(vault).unwrap();
+}
+
+#[test]
 fn drop_recording_accounts_in_meta_and_falls_back_to_the_process_counter() {
     let vault = temp_vault("drop");
     let sid = uuid::Uuid::new_v4().to_string();

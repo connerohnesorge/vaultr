@@ -15,7 +15,7 @@ use hyper::{Request, Response, StatusCode};
 use serde_json::Value;
 use std::convert::Infallible;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::net::TcpListener;
@@ -313,7 +313,7 @@ async fn handle_origin(
         .unwrap_or_default();
 
     if path == "/health" {
-        let body = health_body(adapter);
+        let body = health_body(adapter, &ctx.vault);
         return Response::builder()
             .header("content-type", "application/json")
             .body(full(body.to_string()))
@@ -542,13 +542,38 @@ fn http_upstream_url(adapter: &Adapter, base: &str, path: &str, query: &str) -> 
     format!("{base}{}{query}", adapter.upstream_path(path))
 }
 
-pub(crate) fn health_body(adapter: &Adapter) -> serde_json::Value {
+pub(crate) fn health_body(adapter: &Adapter, vault: &Path) -> serde_json::Value {
+    health_body_with_status(
+        adapter,
+        capture::recorded_drops(),
+        capture::unrecorded_drops(),
+        crate::fsutil::free_bytes(vault),
+        crate::fsutil::headroom_floor(),
+    )
+}
+
+pub(crate) fn health_body_with_status(
+    adapter: &Adapter,
+    recorded_drops: u64,
+    unrecorded_drops: u64,
+    headroom_bytes: Option<u64>,
+    headroom_floor: u64,
+) -> serde_json::Value {
+    let capture_ok = recorded_drops == 0
+        && unrecorded_drops == 0
+        && headroom_bytes
+            .map(|bytes| bytes >= headroom_floor)
+            .unwrap_or(true);
     serde_json::json!({
         "service": "plant",
         "ok": true,
+        "capture_ok": capture_ok,
         "harness": adapter.harness.capture_label(),
         "upstream": adapter.upstream.trim_end_matches('/'),
-        "unrecorded_drops": capture::unrecorded_drops(),
+        "recorded_drops": recorded_drops,
+        "unrecorded_drops": unrecorded_drops,
+        "headroom_bytes": headroom_bytes,
+        "headroom_floor": headroom_floor,
     })
 }
 
@@ -580,6 +605,57 @@ mod tests {
             http_upstream_url(&adapter, base, "/responses", ""),
             "https://chatgpt.com/backend-api/codex/responses"
         );
+    }
+
+    #[test]
+    fn either_drop_counter_degrades_capture_without_process_liveness() {
+        let adapter = crate::adapter::adapters().remove(0);
+        for (recorded_drops, unrecorded_drops) in [(1, 0), (0, 1)] {
+            let health = health_body_with_status(
+                &adapter,
+                recorded_drops,
+                unrecorded_drops,
+                Some(64),
+                64,
+            );
+
+            assert_eq!(health["recorded_drops"], recorded_drops);
+            assert_eq!(health["unrecorded_drops"], unrecorded_drops);
+            assert_eq!(health["capture_ok"], false);
+            assert_eq!(health["ok"], true);
+        }
+    }
+
+    #[test]
+    fn low_headroom_degrades_capture() {
+        let adapter = crate::adapter::adapters().remove(0);
+        let health = health_body_with_status(&adapter, 0, 0, Some(63), 64);
+
+        assert_eq!(health["headroom_bytes"], 63);
+        assert_eq!(health["headroom_floor"], 64);
+        assert_eq!(health["capture_ok"], false);
+    }
+
+    #[test]
+    fn unmeasurable_volume_reports_null_headroom() {
+        let adapter = crate::adapter::adapters().remove(0);
+        let missing = std::env::temp_dir().join(format!(
+            "plant-missing-health-volume-{}",
+            uuid::Uuid::new_v4()
+        ));
+
+        let health = health_body(&adapter, &missing);
+
+        assert!(health["headroom_bytes"].is_null());
+    }
+
+    #[test]
+    fn unmeasurable_volume_does_not_degrade_capture() {
+        let adapter = crate::adapter::adapters().remove(0);
+        let health = health_body_with_status(&adapter, 0, 0, None, 64);
+
+        assert!(health["headroom_bytes"].is_null());
+        assert_eq!(health["capture_ok"], true);
     }
 
     /// ACTIVE_CAPTURE_TASKS and SKIP_CAPTURE_FINISH are process-global, so the

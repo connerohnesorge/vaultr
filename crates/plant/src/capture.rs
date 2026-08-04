@@ -213,17 +213,29 @@ pub fn update_meta(
 /// Drops this process could not even record in `.meta`. Reported on /health.
 static UNRECORDED_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Drops this process recorded in `.meta`. Reported on /health.
+static RECORDED_DROPS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub fn unrecorded_drops() -> u64 {
     UNRECORDED_DROPS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn recorded_drops() -> u64 {
+    RECORDED_DROPS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Account for one observed turn that capture failed to persist. The marker is
 /// orders of magnitude smaller than the Envelope, so it survives the storage
 /// pressure that usually causes the drop. When even it fails, count in memory.
 pub fn record_drop(vault: &Path, session_id: &str, reason: &str) {
-    if let Err(error) = write_drop(vault, session_id, reason) {
-        UNRECORDED_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        eprintln!("[capture] dropped turn for {session_id} unrecorded: {error}");
+    match write_drop(vault, session_id, reason) {
+        Ok(()) => {
+            RECORDED_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Err(error) => {
+            UNRECORDED_DROPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            eprintln!("[capture] dropped turn for {session_id} unrecorded: {error}");
+        }
     }
 }
 

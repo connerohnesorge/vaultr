@@ -644,17 +644,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn incumbent_health_schema_matches_the_proxy_contract_exactly() {
+    fn healthy_capture_schema_preserves_process_liveness() {
         for adapter in adapter::adapters() {
-            let health = proxy::health_body(&adapter);
+            let health = proxy::health_body_with_status(&adapter, 0, 0, Some(64), 64);
             assert_eq!(
                 health,
                 serde_json::json!({
                     "service": "plant",
                     "ok": true,
+                    "capture_ok": true,
                     "harness": adapter.harness.capture_label(),
                     "upstream": adapter.upstream.trim_end_matches('/'),
-                    "unrecorded_drops": capture::unrecorded_drops(),
+                    "recorded_drops": 0,
+                    "unrecorded_drops": 0,
+                    "headroom_bytes": 64,
+                    "headroom_floor": 64,
                 })
             );
             assert!(health_matches(&health, &adapter));
