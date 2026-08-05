@@ -376,23 +376,62 @@ pub fn http_client() -> reqwest::Client {
         .expect("reqwest client")
 }
 
+/// Budget for one incumbent /health probe. A saturated host starves a *healthy*
+/// incumbent well past a second, and a false negative here is expensive: the
+/// challenger declares incomplete ownership and exits 1, so launchd's KeepAlive
+/// respawns it into the same losing probe — a crash loop caused by load alone,
+/// while the incumbent is serving 200s the whole time. Generous and retried.
+const INCUMBENT_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+const INCUMBENT_PROBE_ATTEMPTS: u32 = 3;
+const INCUMBENT_PROBE_BACKOFF: Duration = Duration::from_millis(500);
+
+fn incumbent_probe_timeout() -> Duration {
+    std::env::var("VAULTR_INCUMBENT_PROBE_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .map(Duration::from_millis)
+        .unwrap_or(INCUMBENT_PROBE_TIMEOUT)
+}
+
 async fn complete_incumbent() -> bool {
     let client = http_client();
+    let timeout = incumbent_probe_timeout();
     for adapter in adapter::adapters() {
-        let url = format!("http://127.0.0.1:{}/health", adapter.port);
-        let response =
-            match tokio::time::timeout(Duration::from_secs(2), client.get(url).send()).await {
-                Ok(Ok(response)) if response.status().is_success() => response,
-                _ => return false,
-            };
-        let Ok(health) = response.json::<serde_json::Value>().await else {
-            return false;
-        };
-        if !health_matches(&health, &adapter) {
+        if !incumbent_owns(&client, &adapter, timeout).await {
             return false;
         }
     }
     true
+}
+
+/// Probe one adapter's /health. Transport failures are retried — they are the
+/// symptom of a starved incumbent, not an absent one. A body that parses but
+/// does not match is a definitive answer (someone else holds the port), so it
+/// short-circuits rather than burning the remaining attempts.
+async fn incumbent_owns(
+    client: &reqwest::Client,
+    adapter: &adapter::Adapter,
+    timeout: Duration,
+) -> bool {
+    let url = format!("http://127.0.0.1:{}/health", adapter.port);
+    for attempt in 0..INCUMBENT_PROBE_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(INCUMBENT_PROBE_BACKOFF).await;
+        }
+        let response = match tokio::time::timeout(timeout, client.get(url.as_str()).send()).await {
+            Ok(Ok(response)) if response.status().is_success() => response,
+            _ => continue,
+        };
+        match response.json::<serde_json::Value>().await {
+            Ok(health) => return health_matches(&health, adapter),
+            Err(_) => continue,
+        }
+    }
+    eprintln!(
+        "[plant] incumbent on 127.0.0.1:{} did not answer /health in {} attempt(s) of {:?}",
+        adapter.port, INCUMBENT_PROBE_ATTEMPTS, timeout
+    );
+    false
 }
 
 fn health_matches(health: &serde_json::Value, adapter: &adapter::Adapter) -> bool {
@@ -663,6 +702,69 @@ mod tests {
             );
             assert!(health_matches(&health, &adapter));
         }
+    }
+
+    /// Stand up a real listener that serves a valid /health body, but only after
+    /// `delay` — an incumbent that is alive and correct, just starved of CPU.
+    /// Returns an adapter pointed at it.
+    async fn starved_incumbent(delay: Duration) -> adapter::Adapter {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut serving = adapter::adapters().remove(0);
+        serving.port = port;
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let body = proxy::health_body_with_status(&serving, 0, 0, Some(64), 64).to_string();
+                tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                         content-length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    use tokio::io::AsyncWriteExt;
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.flush().await;
+                });
+            }
+        });
+        let mut probed = adapter::adapters().remove(0);
+        probed.port = port;
+        probed
+    }
+
+    #[tokio::test]
+    async fn slow_incumbent_under_load_is_not_mistaken_for_a_dead_one() {
+        // 2.5s is past the 2s budget this probe used to carry and well inside the
+        // current one — the exact window in which a loaded host crash-looped a
+        // challenger against an incumbent that was serving 200s throughout.
+        let adapter = starved_incumbent(Duration::from_millis(2_500)).await;
+
+        assert!(
+            incumbent_owns(&http_client(), &adapter, INCUMBENT_PROBE_TIMEOUT).await,
+            "a healthy incumbent answering in 2.5s must be recognized as the owner"
+        );
+        // Negative control against the same live server: shrink only the budget
+        // and the probe must fail, or the assertion above proves nothing.
+        assert!(
+            !incumbent_owns(&http_client(), &adapter, Duration::from_millis(200)).await,
+            "a budget below the incumbent's response time must still read as incomplete"
+        );
+    }
+
+    #[test]
+    fn incumbent_probe_timeout_is_configurable() {
+        std::env::remove_var("VAULTR_INCUMBENT_PROBE_TIMEOUT_MS");
+        assert_eq!(incumbent_probe_timeout(), INCUMBENT_PROBE_TIMEOUT);
+
+        std::env::set_var("VAULTR_INCUMBENT_PROBE_TIMEOUT_MS", "1234");
+        assert_eq!(incumbent_probe_timeout(), Duration::from_millis(1234));
+        std::env::remove_var("VAULTR_INCUMBENT_PROBE_TIMEOUT_MS");
     }
 
     #[tokio::test]
