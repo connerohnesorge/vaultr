@@ -458,7 +458,7 @@ where
                     existing.id
                 )))
             }
-            Ok(crate::agent_run::ReceiptLookup::Pending) => {
+            Ok(crate::agent_run::ReceiptLookup::Pending { .. }) => {
                 return Ok(FenceReconcile::Blocked(format!(
                     "attempt {} claimed an agent run that never finished; \
                      if its agent is gone, run `plant jobs unblock {name}`",
@@ -489,6 +489,36 @@ fn reconcile_fence(name: &str) -> io::Result<FenceReconcile> {
         ledger.parent().expect("job ledger has a parent"),
         File::sync_all,
     )
+}
+
+async fn reconcile_fence_live(name: &str) -> io::Result<FenceReconcile> {
+    let result = reconcile_fence(name)?;
+    if !matches!(result, FenceReconcile::Blocked(_)) {
+        return Ok(result);
+    }
+    let fence_path = attempt_path(name);
+    let text = match std::fs::read_to_string(&fence_path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(result),
+        Err(error) => return Err(error),
+    };
+    let fence: AttemptFence = serde_json::from_str(&text)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if fence.retryable || fence.action == Some(JobAction::InProcessCompression) {
+        return Ok(result);
+    }
+    let identity = match crate::agent_run::lookup_receipt(&fence.id)? {
+        crate::agent_run::ReceiptLookup::Pending {
+            identity: Some(identity),
+        } => identity,
+        _ => return Ok(result),
+    };
+    match crate::agent_run::recover_pending(&fence.id, &identity).await? {
+        crate::agent_run::PendingRecovery::Recovered => reconcile_fence(name),
+        crate::agent_run::PendingRecovery::Retained(detail) => Ok(FenceReconcile::Blocked(
+            format!("attempt {} recovery retained: {detail}", fence.id),
+        )),
+    }
 }
 
 /// Outcome of an operator unblock request.
@@ -586,6 +616,7 @@ fn publish_attempt(name: &str, action: JobAction, lock: File) -> io::Result<Atte
     })
 }
 
+#[cfg(test)]
 fn begin_attempt_locked(name: &str, lock: File) -> io::Result<AttemptStart> {
     verify_ledger_writable(name)?;
     match reconcile_fence(name)? {
@@ -600,10 +631,29 @@ fn begin_attempt_locked(name: &str, lock: File) -> io::Result<AttemptStart> {
     }
 }
 
+#[cfg(test)]
 fn begin_attempt(name: &str) -> io::Result<AttemptStart> {
     match acquire_attempt_lock(name)? {
         AttemptLockStart::Ready(lock) => begin_attempt_locked(name, lock),
         AttemptLockStart::Blocked(detail) => Ok(AttemptStart::Blocked(detail)),
+    }
+}
+
+async fn begin_attempt_live(name: &str) -> io::Result<AttemptStart> {
+    let lock = match acquire_attempt_lock(name)? {
+        AttemptLockStart::Ready(lock) => lock,
+        AttemptLockStart::Blocked(detail) => return Ok(AttemptStart::Blocked(detail)),
+    };
+    verify_ledger_writable(name)?;
+    match reconcile_fence_live(name).await? {
+        FenceReconcile::Ready => {
+            publish_attempt(name, JobAction::Script, lock).map(AttemptStart::Ready)
+        }
+        FenceReconcile::ResumableCompression(fence) => Ok(AttemptStart::Blocked(format!(
+            "attempt {} awaits in-process compression resume",
+            fence.id
+        ))),
+        FenceReconcile::Blocked(detail) => Ok(AttemptStart::Blocked(detail)),
     }
 }
 
@@ -613,6 +663,7 @@ enum ScheduledAttemptStart {
     Blocked(String),
 }
 
+#[cfg(test)]
 fn begin_scheduled_attempt(job: &Job) -> io::Result<ScheduledAttemptStart> {
     let lock = match acquire_attempt_lock(&job.name)? {
         AttemptLockStart::Ready(lock) => lock,
@@ -620,6 +671,30 @@ fn begin_scheduled_attempt(job: &Job) -> io::Result<ScheduledAttemptStart> {
     };
     verify_ledger_writable(&job.name)?;
     match reconcile_fence(&job.name)? {
+        FenceReconcile::Ready => {}
+        FenceReconcile::ResumableCompression(fence) => {
+            return Ok(ScheduledAttemptStart::Ready(AttemptGuard {
+                name: job.name.clone(),
+                fence,
+                _lock: lock,
+            }))
+        }
+        FenceReconcile::Blocked(detail) => return Ok(ScheduledAttemptStart::Blocked(detail)),
+    }
+    let due = record_is_due(last_record_ts(&job.name)?, job.every, epoch_now());
+    if !due {
+        return Ok(ScheduledAttemptStart::NotDue);
+    }
+    publish_attempt(&job.name, job.action, lock).map(ScheduledAttemptStart::Ready)
+}
+
+async fn begin_scheduled_attempt_live(job: &Job) -> io::Result<ScheduledAttemptStart> {
+    let lock = match acquire_attempt_lock(&job.name)? {
+        AttemptLockStart::Ready(lock) => lock,
+        AttemptLockStart::Blocked(detail) => return Ok(ScheduledAttemptStart::Blocked(detail)),
+    };
+    verify_ledger_writable(&job.name)?;
+    match reconcile_fence_live(&job.name).await? {
         FenceReconcile::Ready => {}
         FenceReconcile::ResumableCompression(fence) => {
             return Ok(ScheduledAttemptStart::Ready(AttemptGuard {
@@ -887,7 +962,7 @@ fn finish_execution(
 }
 
 pub async fn run_job(job: &Job) -> i32 {
-    let attempt = match begin_attempt(&job.name) {
+    let attempt = match begin_attempt_live(&job.name).await {
         Ok(AttemptStart::Ready(attempt)) => attempt,
         Ok(AttemptStart::Blocked(detail)) => {
             eprintln!("[job:{}] dispatch blocked: {detail}", job.name);
@@ -923,7 +998,7 @@ async fn dispatch_scheduled(
     };
     // Once capacity is admitted, hold the per-job cross-process flock across
     // the durable cadence recheck, fence, execution, and final transition.
-    let attempt = match begin_scheduled_attempt(job) {
+    let attempt = match begin_scheduled_attempt_live(job).await {
         Ok(ScheduledAttemptStart::Ready(attempt)) => attempt,
         Ok(ScheduledAttemptStart::NotDue) => return ScheduledDispatch::NotDue,
         Ok(ScheduledAttemptStart::Blocked(detail)) => {

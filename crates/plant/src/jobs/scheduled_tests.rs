@@ -603,3 +603,37 @@ async fn scheduled_record_failure_blocks_the_next_dispatch() {
 
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn incomplete_pending_identity_retains_the_attempt_fence() {
+    let root = std::env::temp_dir().join(format!(
+        "plant-pending-identity-fence-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let sessions = root.join("vault/sessions");
+    let state = root.join("state");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let _state = crate::state::use_test_dir(state.clone());
+    let job = Job {
+        name: "identity".to_string(),
+        path: root.join("identity.1m.sh"),
+        every: Duration::from_secs(60),
+        action: JobAction::Script,
+    };
+    strand_fence(&state, "identity", "pending-identity");
+    write_receipt(
+        &state,
+        "pending-identity",
+        r#"{"state":"in_progress","key":"pending-identity","identity":{"workspace_id":"w1","pane_id":"w1:p1","terminal_id":"t1","stage":"working"}}"#,
+    );
+    let semaphore = tokio::sync::Semaphore::new(1);
+
+    assert_eq!(
+        dispatch_scheduled(&job, &sessions, &semaphore, SCRIPT_BACKSTOP).await,
+        ScheduledDispatch::Blocked
+    );
+    assert!(state.join("job-attempts/identity.json").exists());
+    assert!(!state.join("jobs/identity.jsonl").exists());
+
+    std::fs::remove_dir_all(root).unwrap();
+}
