@@ -903,6 +903,29 @@ mod tests {
         })
     }
 
+    /// Assert the listener lease came back, without racing the kernel for it.
+    /// These tests bind port 0, so the moment the lease drops the port is an
+    /// ordinary ephemeral one: it can sit in TIME_WAIT behind the connections
+    /// the test just made, or be claimed by any other process on the box for a
+    /// beat. A single immediate attempt therefore tests machine load as much as
+    /// lease return — it fails 2/2 on a saturated host. Retry to a deadline so
+    /// the assertion says what it means.
+    async fn rebind_once_lease_returns(address: std::net::SocketAddr) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match TcpListener::bind(address).await {
+                Ok(listener) => {
+                    drop(listener);
+                    return;
+                }
+                Err(error) if tokio::time::Instant::now() >= deadline => {
+                    panic!("listener lease never returned within 5s: {error}")
+                }
+                Err(_) => tokio::time::sleep(Duration::from_millis(20)).await,
+            }
+        }
+    }
+
     #[tokio::test]
     async fn shutdown_stops_accepting_but_finishes_the_fixed_connection_set() {
         let (upstream, mut started, release, upstream_task) = blocking_upstream().await;
@@ -961,7 +984,7 @@ mod tests {
         drop(lease);
         second.abort();
         let _ = second.await;
-        drop(TcpListener::bind(address).await.unwrap());
+        rebind_once_lease_returns(address).await;
         upstream_task.abort();
         let _ = upstream_task.await;
     }
@@ -1000,7 +1023,7 @@ mod tests {
             .unwrap()
             .expect_err("aborted connection unexpectedly completed");
         drop(lease);
-        drop(TcpListener::bind(address).await.unwrap());
+        rebind_once_lease_returns(address).await;
 
         upstream_task.abort();
         let _ = upstream_task.await;
@@ -1071,7 +1094,7 @@ mod tests {
         );
         assert!(TcpListener::bind(address).await.is_err());
         drop(lease);
-        drop(TcpListener::bind(address).await.unwrap());
+        rebind_once_lease_returns(address).await;
 
         upstream_task.abort();
         let _ = upstream_task.await;
