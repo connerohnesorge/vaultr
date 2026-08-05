@@ -1,0 +1,20 @@
+# This repo intentionally contains token-shaped strings.
+# Plant's redaction engine is tested against a corpus of fake credentials, so
+# any scanner will flag the test fixtures forever unless they are allowlisted.
+# Everything outside these two paths is scanned normally.
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "vaultr-real-anthropic-key"
+description = "Real Anthropic API key"
+regex = '''sk-ant-[A-Za-z0-9_-]{20,}'''
+keywords = ["sk-ant-"]
+
+[allowlist]
+description = "Redaction-engine test fixtures (deliberately fake secrets)"
+paths = [
+  '''crates/plant/src/capture/generation/tests\.rs''',
+  '''crates/plant/src/selftest\.rs''',
+]

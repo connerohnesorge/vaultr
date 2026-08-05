@@ -1,0 +1,7 @@
+# Pinned so CI, the Nix build, and local dev agree on one compiler.
+# Floating "stable" silently breaks the build whenever a new clippy lint lands,
+# which matters here because Home Manager fetches this flake and runs the result.
+[toolchain]
+channel = "1.96"
+components = ["rustfmt", "clippy"]
+profile = "minimal"

@@ -1,0 +1,7 @@
+{
+  "name": "vaultr-door",
+  "version": "0.1.0",
+  "type": "module",
+  "module": "index.ts",
+  "description": "Door library: vault-file-triggered Herdr agent sessions over `plant agent run`"
+}
