@@ -16,7 +16,7 @@ libc = "0.2"
 regex = "1"
 ignore = "0.4"
 toml = "0.8"
-memoize = "0.3"
+memoize = "0.6"
 lazy_static = "1"
 
 [dev-dependencies]
