@@ -1,0 +1,36 @@
+# Dependency updates. Added when this repo went public: cargo-audit reported
+# 0 vulnerabilities across 261 crates at that point, and this is what keeps
+# that true without anyone remembering to re-run it.
+#
+# Grouped and monthly on purpose. Ungrouped weekly updates on a 261-crate tree
+# produce enough PR noise to get ignored, and an ignored bot is worse than no
+# bot: it trains you to skim past the one PR that mattered. Security advisories
+# are NOT subject to this schedule — GitHub raises those immediately and
+# separately, which is the alert actually worth interrupting for.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 5
+    groups:
+      rust-dependencies:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  # The CI workflows pin actions by major tag; this catches the ones that go
+  # unmaintained or move to a new major.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+
+  # ts/vaultr-door is the door library home-manager installs to
+  # ~/.local/lib/vaultr-door, so it ships to the host like the Rust binaries do.
+  - package-ecosystem: npm
+    directory: "/ts/vaultr-door"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3

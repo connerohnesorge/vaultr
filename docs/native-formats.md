@@ -20,10 +20,10 @@ so paths start with a dash. The encoding is lossy/non-reversible.
 
 | Real cwd | Encoded dir |
 |---|---|
-| `/Users/cohnesor/.dotfiles` | `-Users-cohnesor--dotfiles` |
-| `/Users/cohnesor/.dotfiles/.config/plant` | `-Users-cohnesor--dotfiles--config-plant` |
-| `/Users/cohnesor/Documents/001Repos/das-pantheon/cnb` | `-Users-cohnesor-Documents-001Repos-das-pantheon-cnb` |
-| `/private/tmp/claude-503/-Users-cohnesor--dotfiles/<uuid>/scratchpad` | `-private-tmp-claude-503--Users-cohnesor--dotfiles-<uuid>-scratchpad` |
+| `/Users/dev/.dotfiles` | `-Users-dev--dotfiles` |
+| `/Users/dev/.dotfiles/.config/plant` | `-Users-dev--dotfiles--config-plant` |
+| `/Users/dev/Documents/repos/example-org/cnb` | `-Users-dev-Documents-repos-example-org-cnb` |
+| `/private/tmp/claude-503/-Users-dev--dotfiles/<uuid>/scratchpad` | `-private-tmp-claude-503--Users-dev--dotfiles-<uuid>-scratchpad` |
 
 `sessionId` is a lowercase UUIDv4; the filename stem must equal the `sessionId` field inside records.
 
@@ -53,7 +53,7 @@ Version string in all recent records: `"version":"2.1.210"` (older files: 2.1.20
   "timestamp": "2026-07-15T14:36:01.334Z",             // ISO-8601 UTC, ms precision
   "userType": "external",
   "entrypoint": "cli",
-  "cwd": "/Users/cohnesor/.dotfiles",                  // may change mid-session
+  "cwd": "/Users/dev/.dotfiles",                  // may change mid-session
   "sessionId": "<must match filename>",
   "version": "2.1.210",
   "gitBranch": "main"                                  // present when cwd is a git repo
@@ -213,7 +213,7 @@ Top-level `type` values observed: `session_meta`, `response_item`, `event_msg`, 
 {"timestamp":"2026-07-15T08:53:00.995Z","type":"session_meta","payload":{
   "session_id":"019f64fa-...","id":"019f64fa-...",          // duplicated
   "timestamp":"2026-07-15T08:52:38.481Z",                    // session start, UTC
-  "cwd":"/Users/cohnesor/pantheon-collective/proppy",
+  "cwd":"/Users/dev/projects/example-app",
   "originator":"codex-tui","cli_version":"0.144.4",
   "source":"cli","thread_source":"user","model_provider":"openai",
   "base_instructions":{"text":"You are Codex, an agent based on GPT-5. ..."},
