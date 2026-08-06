@@ -17,4 +17,9 @@ description = "Redaction-engine test fixtures (deliberately fake secrets)"
 paths = [
   '''crates/plant/src/capture/generation/tests\.rs''',
   '''crates/plant/src/selftest\.rs''',
+  '''crates/vaultr/src/secrets/allow\.rs''',
+  '''crates/vaultr/src/secrets/matcher\.rs''',
+  '''crates/vaultr/src/secrets/mod\.rs''',
+  '''crates/vaultr/src/secrets/p_random\.rs''',
+  '''crates/vaultr/src/secrets/patterns\.rs''',
 ]
