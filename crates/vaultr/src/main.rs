@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use vaultr::{fork, normalize, recon, render, validate, vault};
+use vaultr::{fork, normalize, recon, render, scan, validate, vault};
 
 #[derive(Parser)]
 #[command(
@@ -32,6 +32,8 @@ enum Cmd {
         #[arg(long)]
         strict: bool,
     },
+    /// Scan committed text blobs for secrets
+    Scan(scan::ScanArgs),
 }
 
 #[derive(Subcommand)]
@@ -86,41 +88,50 @@ fn main() {
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    let root = vault::root(cli.vault.as_deref())?;
     match cli.command {
-        Cmd::Validate { json, strict } => {
-            let code = validate::run(&root, json, strict)?;
+        Cmd::Scan(args) => {
+            let code = scan::run(args)?;
             std::process::exit(code);
         }
-        Cmd::Session(SessionCmd::List { all }) => list(&root, all),
-        Cmd::Session(SessionCmd::Path { id, copy }) => path(&root, &id, copy),
-        Cmd::Session(SessionCmd::Show { id, stats }) => show(&root, &id, stats),
-        Cmd::Session(SessionCmd::Fork {
-            id,
-            into,
-            cwd,
-            no_launch,
-            prompt,
-            read_only,
-        }) => {
-            let opts = fork::ForkOptions {
-                cwd,
-                no_launch,
-                prompt,
-                read_only,
-                ..Default::default()
-            };
-            let outcome = fork::fork(&root, &id, into, &opts)?;
-            eprintln!("forked {} -> {}", id, outcome.path.display());
-            if no_launch {
-                println!(
-                    "launch with: (cd {} && {})",
-                    outcome.cwd.display(),
-                    outcome.launch.join(" ")
-                );
-                Ok(())
-            } else {
-                fork::launch(&outcome)
+        command => {
+            let root = vault::root(cli.vault.as_deref())?;
+            match command {
+                Cmd::Validate { json, strict } => {
+                    let code = validate::run(&root, json, strict)?;
+                    std::process::exit(code);
+                }
+                Cmd::Session(SessionCmd::List { all }) => list(&root, all),
+                Cmd::Session(SessionCmd::Path { id, copy }) => path(&root, &id, copy),
+                Cmd::Session(SessionCmd::Show { id, stats }) => show(&root, &id, stats),
+                Cmd::Session(SessionCmd::Fork {
+                    id,
+                    into,
+                    cwd,
+                    no_launch,
+                    prompt,
+                    read_only,
+                }) => {
+                    let opts = fork::ForkOptions {
+                        cwd,
+                        no_launch,
+                        prompt,
+                        read_only,
+                        ..Default::default()
+                    };
+                    let outcome = fork::fork(&root, &id, into, &opts)?;
+                    eprintln!("forked {} -> {}", id, outcome.path.display());
+                    if no_launch {
+                        println!(
+                            "launch with: (cd {} && {})",
+                            outcome.cwd.display(),
+                            outcome.launch.join(" ")
+                        );
+                        Ok(())
+                    } else {
+                        fork::launch(&outcome)
+                    }
+                }
+                Cmd::Scan(_) => unreachable!("scan is handled before the session root is resolved"),
             }
         }
     }

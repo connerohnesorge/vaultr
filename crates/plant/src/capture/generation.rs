@@ -17,62 +17,14 @@ pub(crate) struct SealedCapture {
     pub(crate) source_len: u64,
 }
 
-fn secret_regexes() -> Vec<regex::Regex> {
-    [
-        r"sk-ant-[A-Za-z0-9_-]{20,}",
-        // LiteLLM / OpenAI. The leading delimiter is load-bearing, not decor:
-        // inside a base64 run `sk-` is always preceded by a base64 byte, so
-        // demanding a non-base64 byte in front took this from 1254 of 3182
-        // committed seals down to 28, and every >=130-byte over-match to zero.
-        // It is a capture group because the replacement puts it back — it is
-        // often the quote closing a JSON field name.
-        // ponytail: the {,63} ceiling is what measured clean; a longer key
-        // (sk-proj-…) redacts its first 63 bytes and leaks the tail. Raise it
-        // only with the same over-match measurement behind it.
-        r"(^|[^A-Za-z0-9_/+-])sk-[A-Za-z0-9_-]{20,63}",
-        r"glpat-[A-Za-z0-9_-]{20,}",
-        r"glrt-[A-Za-z0-9_-]{20,}",
-        r"(?:AKIA|ASIA)[0-9A-Z]{16}",
-        // The 40-char AWS secret, keyed on the field name so it cannot
-        // over-match base64. Nothing else catches this shape: the pre-push
-        // gate never reads a seal, and detect-aws-credentials only matches
-        // keys already in ~/.aws/credentials, which is empty on this host.
-        r#"(?i)aws_secret_access_key["']?\s*[:=]\s*["']?[A-Za-z0-9+/]{40}"#,
-        r"gh[posru]_[A-Za-z0-9]{36,}",
-        r"xox[baprs]-[A-Za-z0-9-]{10,}",
-        r"https://hooks\.slack\.com/services/[A-Za-z0-9/]+",
-        r"AIza[0-9A-Za-z_-]{35}",
-        r"ya29\.[0-9A-Za-z_-]{20,}",
-        r"(?s)-----BEGIN[A-Z ]*PRIVATE KEY-----.*?-----END[A-Z ]*PRIVATE KEY-----",
-    ]
-    .iter()
-    .filter_map(|pattern| regex::Regex::new(pattern).ok())
-    .collect()
-}
-
-fn redact_line(
-    mut line: String,
-    needles: &HashSet<String>,
-    patterns: &[regex::Regex],
-) -> (String, usize) {
-    let mut hits = 0;
-    for needle in needles {
-        let count = line.matches(needle.as_str()).count();
-        if count > 0 {
-            hits += count;
-            line = line.replace(needle.as_str(), "[REDACTED]");
-        }
-    }
-    for pattern in patterns {
-        if pattern.is_match(&line) {
-            hits += pattern.find_iter(&line).count();
-            // `${1}` is the delimiter the `sk-` guard had to consume for lack
-            // of look-behind; every other pattern has no group 1, and regex
-            // expands a missing group to "".
-            line = pattern.replace_all(&line, "${1}[REDACTED]").into_owned();
-        }
-    }
-    (line, hits)
+fn secrets_policy(directory: &SessionDirectory) -> Result<vaultr::secrets::Policy, String> {
+    let root = directory
+        .path()
+        .ancestors()
+        .find(|path| path.join(".secretsignore").is_file())
+        .unwrap_or_else(|| directory.path());
+    vaultr::secrets::policy_for(root)
+        .map_err(|error| format!("load secret policy from {}: {error:#}", root.display()))
 }
 
 fn scrub_entry(directory: &SessionDirectory, name: &str) -> Result<(File, usize), String> {
@@ -100,7 +52,7 @@ fn scrub_entry(directory: &SessionDirectory, name: &str) -> Result<(File, usize)
             }
         }
     }
-    let patterns = secret_regexes();
+    let policy = secrets_policy(directory)?;
     let (temporary_name, temporary) = directory.create_temp(name, "scrub")?;
     let scrubbed = (|| -> Result<usize, String> {
         let reader = BufReader::new(clone_at_start(&source)?);
@@ -111,11 +63,17 @@ fn scrub_entry(directory: &SessionDirectory, name: &str) -> Result<(File, usize)
         );
         let mut hits = 0;
         for line in reader.lines() {
-            let (line, count) = redact_line(
-                line.map_err(|error| format!("read session capture: {error}"))?,
-                &needles,
-                &patterns,
-            );
+            let mut line = line.map_err(|error| format!("read session capture: {error}"))?;
+            let mut count = 0;
+            for needle in &needles {
+                let needle_hits = line.matches(needle).count();
+                if needle_hits > 0 {
+                    count += needle_hits;
+                    line = line.replace(needle, "[REDACTED]");
+                }
+            }
+            let (line, pattern_hits) = vaultr::secrets::redact_line(&line, &policy);
+            count += pattern_hits;
             hits += count;
             writeln!(writer, "{line}")
                 .map_err(|error| format!("write scrubbed session capture: {error}"))?;

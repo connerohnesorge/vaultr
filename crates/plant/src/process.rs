@@ -199,6 +199,22 @@ pub(crate) async fn run30(cmd: &[&str]) -> RunResult {
     run(cmd, Duration::from_secs(30)).await
 }
 
+/// Spawn a child whose lifetime does not belong to the caller's Tokio task.
+///
+/// The caller must close or redirect all standard streams before calling this
+/// function. The reaper task prevents ordinary workers from becoming zombies.
+/// A worker remains alive if the scheduler task or the proxy daemon exits.
+pub(crate) fn spawn_detached(command: &mut tokio::process::Command) -> std::io::Result<()> {
+    command.kill_on_drop(false);
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut child = command.spawn()?;
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
+    Ok(())
+}
+
 pub(crate) fn which(bin: &str) -> bool {
     augmented_path()
         .split(':')
@@ -209,6 +225,41 @@ pub(crate) fn which(bin: &str) -> bool {
 mod tests {
     use super::*;
     use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+    #[tokio::test]
+    async fn detached_child_survives_owner_task_cancellation() {
+        let root = std::env::temp_dir().join(format!(
+            "plant-detached-worker-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let marker = root.join("completed");
+        let marker_text = marker.display().to_string();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+
+        let owner = tokio::spawn(async move {
+            let mut command = tokio::process::Command::new("/bin/sh");
+            command
+                .args([
+                    "-c",
+                    &format!("/bin/sleep 0.2; printf done > '{}'", marker_text),
+                ])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            spawn_detached(&mut command).unwrap();
+            started_tx.send(()).unwrap();
+            tokio::time::sleep(Duration::from_secs(30)).await;
+        });
+        started_rx.await.unwrap();
+        owner.abort();
+        let _ = owner.await;
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), "done");
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[tokio::test]
     async fn timeout_kills_and_reaps_direct_child_before_returning() {

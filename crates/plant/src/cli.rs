@@ -2,6 +2,7 @@ use crate::domain::Harness;
 use crate::herdr::WorkspaceCleanup;
 use crate::jobs;
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::time::Duration;
 
 #[derive(Debug, PartialEq, Eq)]
@@ -15,6 +16,7 @@ pub enum Command {
     CompressOnce(Duration),
     JobsRun(String),
     JobsUnblock(String),
+    JobsWorker(ScheduledWorkerArgs),
     AgentRun(AgentRunArgs),
 }
 
@@ -36,6 +38,15 @@ pub struct AgentRunArgs {
     pub timeout: Duration,
     pub cwd: Option<String>,
     pub idempotency_key: Option<String>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct ScheduledWorkerArgs {
+    pub name: String,
+    pub path: PathBuf,
+    pub every: Duration,
+    pub capacity: usize,
+    pub timeout: Duration,
 }
 
 pub fn parse_command(argv: &[String]) -> Result<Command, String> {
@@ -72,6 +83,9 @@ pub fn parse_command(argv: &[String]) -> Result<Command, String> {
         }
         [group, action, name] if group == "jobs" && action == "unblock" && !name.is_empty() => {
             Ok(Command::JobsUnblock(name.clone()))
+        }
+        [group, action, rest @ ..] if group == "jobs" && action == "worker" => {
+            parse_worker(rest).map(Command::JobsWorker)
         }
         [group, action, rest @ ..] if group == "sessions" && action == "eligible" => {
             parse_eligible(rest).map(Command::SessionsEligible)
@@ -205,6 +219,42 @@ fn parse_agent(args: &[String]) -> Result<AgentRunArgs, String> {
     })
 }
 
+fn parse_worker(args: &[String]) -> Result<ScheduledWorkerArgs, String> {
+    let [name, path, every, capacity, timeout] = args else {
+        return Err(
+            "jobs worker: expected <name> <path> <every-seconds> <capacity> <timeout-seconds>"
+                .to_string(),
+        );
+    };
+    if name.is_empty() || path.is_empty() {
+        return Err("jobs worker: name and path are required".to_string());
+    }
+    let every = every
+        .parse::<u64>()
+        .map(Duration::from_secs)
+        .map_err(|_| "jobs worker: invalid every-seconds".to_string())?;
+    if every.is_zero() {
+        return Err("jobs worker: every-seconds must be positive".to_string());
+    }
+    let capacity = capacity
+        .parse::<usize>()
+        .map_err(|_| "jobs worker: invalid capacity".to_string())?;
+    if capacity == 0 {
+        return Err("jobs worker: capacity must be positive".to_string());
+    }
+    let timeout = timeout
+        .parse::<u64>()
+        .map(Duration::from_secs)
+        .map_err(|_| "jobs worker: invalid timeout-seconds".to_string())?;
+    Ok(ScheduledWorkerArgs {
+        name: name.clone(),
+        path: PathBuf::from(path),
+        every,
+        capacity,
+        timeout,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -311,9 +361,32 @@ mod tests {
             vec!["sessions", "eligible", "--learner", "other"],
             vec!["agent", "run", "--cli", "other"],
             vec!["agent", "run", "--cli", "claude", "--cleanup", "sometimes"],
+            vec!["jobs", "worker", "name", "path", "0", "1", "10"],
             vec!["--self-test", "extra"],
         ] {
             assert!(parse_command(&argv(&args)).is_err(), "{args:?}");
         }
+    }
+
+    #[test]
+    fn parses_internal_scheduled_worker_arguments() {
+        assert_eq!(
+            parse_command(&argv(&[
+                "jobs",
+                "worker",
+                "reconcile",
+                "/tmp/reconcile.1h.sh",
+                "3600",
+                "2",
+                "10800",
+            ])),
+            Ok(Command::JobsWorker(ScheduledWorkerArgs {
+                name: "reconcile".to_string(),
+                path: PathBuf::from("/tmp/reconcile.1h.sh"),
+                every: Duration::from_secs(3600),
+                capacity: 2,
+                timeout: Duration::from_secs(10800),
+            }))
+        );
     }
 }

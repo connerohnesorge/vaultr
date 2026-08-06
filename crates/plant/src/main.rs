@@ -44,7 +44,7 @@ fn usage(error: &str) -> i32 {
     eprintln!("plant: {error}");
     eprintln!(
         "usage: plant [--self-test | server stop | sessions eligible|coverage|stuck ... | \
-         compress once ... | jobs run|unblock <name> | agent run --cli claude|codex ...]"
+         compress once ... | jobs run|unblock <name>|worker ... | agent run --cli claude|codex ...]"
     );
     2
 }
@@ -237,6 +237,7 @@ async fn dispatch(command: Command) -> i32 {
                 1
             }
         },
+        Command::JobsWorker(args) => jobs::run_scheduled_worker(args).await,
         Command::AgentRun(args) => {
             // No nesting: a job-spawned agent must never spawn another (jobs spawning jobs).
             // launch_line stamps PLANT_AGENT=1 into every agent plant starts; if it's set here

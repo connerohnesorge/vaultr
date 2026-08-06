@@ -6,6 +6,8 @@ pub mod normalize;
 pub mod pi_writer;
 pub mod recon;
 pub mod render;
+pub mod scan;
+pub mod secrets;
 pub mod translate;
 pub mod validate;
 pub mod vault;

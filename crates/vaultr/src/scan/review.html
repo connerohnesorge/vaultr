@@ -1,0 +1,28 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>vaultr secret review</title>
+<style>
+body{font:16px system-ui,sans-serif;max-width:1100px;margin:2rem auto;padding:0 1rem;background:#f7f7f5;color:#20201e}
+article{background:white;border:1px solid #d6d6d0;border-radius:10px;padding:1rem;margin:1rem 0;box-shadow:0 2px 8px #0000000d}
+code{display:block;white-space:pre-wrap;overflow-wrap:anywhere;background:#f0f0ec;padding:.8rem;border-radius:6px;margin:.6rem 0}
+mark{background:#ffcc66;padding:.1rem .2rem;border-radius:3px}
+button{border:0;border-radius:6px;padding:.55rem .8rem;margin-right:.5rem;cursor:pointer;font-weight:600}
+.real{background:#f5b5b5}.false{background:#b8e0c0}.done{background:#20201e;color:white}.meta{color:#666;font-size:.9rem}
+#status{min-height:1.5rem;font-weight:600}
+</style>
+<main>
+<h1>Secret review</h1>
+<p>Real findings remain blocking. False positives append only a path and digest to the repository allowlist.</p>
+<p id="status">Loading findings...</p>
+<section id="findings"></section>
+<button class="done" id="done">Done and re-scan</button>
+</main>
+<script>
+const root=document.querySelector('#findings'),status=document.querySelector('#status');let items=[];
+function line(item){const code=document.createElement('code');code.append(document.createTextNode(item.text.slice(0,item.span_start)));const mark=document.createElement('mark');mark.textContent=item.text.slice(item.span_start,item.span_end);code.append(mark,document.createTextNode(item.text.slice(item.span_end)));return code}
+function render(){root.replaceChildren();items.forEach((item,index)=>{const card=document.createElement('article');const meta=document.createElement('div');meta.className='meta';meta.textContent=`${item.file}:${item.line} · ${item.rule}`;card.append(meta,line(item));const real=document.createElement('button');real.className='real';real.textContent=item.decision==='real'?'Real (selected)':'Real';real.onclick=()=>judge(index,'real');const falseButton=document.createElement('button');falseButton.className='false';falseButton.textContent=item.decision==='false-positive'?'False positive (saved)':'False positive';falseButton.onclick=()=>judge(index,'false-positive');card.append(real,falseButton);root.append(card)})}
+async function load(){const response=await fetch('/api/findings');items=await response.json();render();status.textContent=items.length?`${items.length} finding(s) require a decision.`:'No findings remain.'}
+async function judge(index,decision){const response=await fetch('/api/action',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({action:'judge',index,decision})});const data=await response.json();status.textContent=data.ok?(decision==='false-positive'?'Allowlist entry saved without plaintext.':'Marked real; it remains blocking.'):data.message;await load()}
+document.querySelector('#done').onclick=async()=>{status.textContent='Re-scanning committed blobs...';const response=await fetch('/api/action',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({action:'done'})});const data=await response.json();if(data.exit===0){status.textContent='Clean after re-scan. You can close this page.';root.replaceChildren()}else if(data.exit===1){status.textContent='Real findings remain blocking. You can close this page.';await load()}else{status.textContent=data.message||'Unresolved findings remain.';await load()}};
+load();
+</script>

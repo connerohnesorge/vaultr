@@ -31,6 +31,84 @@ async fn capacity_wait_cancellation_leaves_no_attempt_fence() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn cross_process_capacity_lease_is_bounded() {
+    let root = std::env::temp_dir().join(format!("plant-worker-capacity-{}", uuid::Uuid::new_v4()));
+    let state = root.join("state");
+    let _state = crate::state::use_test_dir(state.clone());
+
+    let first = try_acquire_worker_capacity(1).unwrap().unwrap();
+    assert!(
+        try_acquire_worker_capacity(1).unwrap().is_none(),
+        "a second process cannot acquire the occupied capacity slot"
+    );
+    drop(first);
+    let second = try_acquire_worker_capacity(1)
+        .unwrap()
+        .expect("the slot is reusable after the worker releases it");
+    drop(second);
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn worker_without_capacity_publishes_no_attempt_fence() {
+    let root =
+        std::env::temp_dir().join(format!("plant-worker-no-capacity-{}", uuid::Uuid::new_v4()));
+    let state = root.join("state");
+    let sessions = root.join("vault/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let _state = crate::state::use_test_dir(state.clone());
+    let job = Job {
+        name: "waiting".to_string(),
+        path: root.join("waiting.1m.sh"),
+        every: Duration::from_secs(60),
+        action: JobAction::Script,
+    };
+    let occupied = try_acquire_worker_capacity(1).unwrap().unwrap();
+
+    assert_eq!(
+        dispatch_scheduled_worker(&job, &sessions, 1, SCRIPT_BACKSTOP).await,
+        ScheduledDispatch::Blocked
+    );
+    assert!(!state.join("job-attempts/waiting.json").exists());
+    drop(occupied);
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn same_job_workers_share_one_attempt_flock() {
+    let root = std::env::temp_dir().join(format!("plant-worker-same-job-{}", uuid::Uuid::new_v4()));
+    let state = root.join("state");
+    let sessions = root.join("vault/sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let _state = crate::state::use_test_dir(state.clone());
+    let job = Job {
+        name: "same-job".to_string(),
+        path: root.join("same-job.1m.sh"),
+        every: Duration::from_secs(60),
+        action: JobAction::Script,
+    };
+    let capacity = try_acquire_worker_capacity(2).unwrap().unwrap();
+    let first = match begin_scheduled_attempt(&job).unwrap() {
+        ScheduledAttemptStart::Ready(attempt) => attempt,
+        ScheduledAttemptStart::NotDue | ScheduledAttemptStart::Blocked(_) => {
+            panic!("the first worker must admit the due job")
+        }
+    };
+
+    assert_eq!(
+        dispatch_scheduled_worker(&job, &sessions, 2, SCRIPT_BACKSTOP).await,
+        ScheduledDispatch::Blocked
+    );
+    assert!(!state.join("jobs/same-job.jsonl").exists());
+    drop(first);
+    drop(capacity);
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn concurrent_schedulers_execute_one_due_period() {
     let root = std::env::temp_dir().join(format!("plant-scheduled-race-{}", uuid::Uuid::new_v4()));
     let sessions = root.join("vault/sessions");
@@ -189,16 +267,9 @@ async fn dispatch_holds_one_guard_across_capacity_and_typed_execution() {
         every: Duration::from_secs(60),
         action: JobAction::Script,
     };
-    let hanging_semaphore = tokio::sync::Semaphore::new(1);
     let started = std::time::Instant::now();
     assert_eq!(
-        dispatch_scheduled(
-            &hanging,
-            &sessions,
-            &hanging_semaphore,
-            Duration::from_millis(100),
-        )
-        .await,
+        dispatch_scheduled_worker(&hanging, &sessions, 1, Duration::from_millis(100),).await,
         ScheduledDispatch::Finished(1)
     );
     assert!(started.elapsed() < Duration::from_secs(2));
@@ -435,9 +506,8 @@ async fn conclusive_receipts_reconcile_fences_the_scheduler_never_recorded() {
     };
 
     // The script sees the published attempt ID, so it can key its agent run.
-    let semaphore = tokio::sync::Semaphore::new(1);
     assert_eq!(
-        dispatch_scheduled(&job, &sessions, &semaphore, SCRIPT_BACKSTOP).await,
+        dispatch_scheduled_worker(&job, &sessions, 1, SCRIPT_BACKSTOP).await,
         ScheduledDispatch::Finished(0)
     );
     let ledger = std::fs::read_to_string(state.join("jobs/audit.jsonl")).unwrap();
@@ -521,7 +591,7 @@ async fn conclusive_receipts_reconcile_fences_the_scheduler_never_recorded() {
             before
         );
         assert_eq!(
-            dispatch_scheduled(&job, &sessions, &semaphore, SCRIPT_BACKSTOP).await,
+            dispatch_scheduled_worker(&job, &sessions, 1, SCRIPT_BACKSTOP).await,
             ScheduledDispatch::Blocked
         );
     }
@@ -532,6 +602,39 @@ async fn conclusive_receipts_reconcile_fences_the_scheduler_never_recorded() {
             .count(),
         1
     );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn incomplete_pending_identity_retains_the_attempt_fence() {
+    let root = std::env::temp_dir().join(format!(
+        "plant-pending-identity-fence-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let sessions = root.join("vault/sessions");
+    let state = root.join("state");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let _state = crate::state::use_test_dir(state.clone());
+    let job = Job {
+        name: "identity".to_string(),
+        path: root.join("identity.1m.sh"),
+        every: Duration::from_secs(60),
+        action: JobAction::Script,
+    };
+    strand_fence(&state, "identity", "pending-identity");
+    write_receipt(
+        &state,
+        "pending-identity",
+        r#"{"state":"in_progress","key":"pending-identity","identity":{"workspace_id":"w1","pane_id":"w1:p1","terminal_id":"t1","stage":"working"}}"#,
+    );
+
+    assert_eq!(
+        dispatch_scheduled_worker(&job, &sessions, 1, SCRIPT_BACKSTOP).await,
+        ScheduledDispatch::Blocked
+    );
+    assert!(state.join("job-attempts/identity.json").exists());
+    assert!(!state.join("jobs/identity.jsonl").exists());
 
     std::fs::remove_dir_all(root).unwrap();
 }

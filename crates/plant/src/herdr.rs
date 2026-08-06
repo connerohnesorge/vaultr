@@ -140,6 +140,418 @@ pub struct AgentRun {
     pub env: Vec<(String, String)>,
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct AgentRunTarget {
+    pub(crate) workspace_id: String,
+    pub(crate) pane_id: String,
+}
+
+impl AgentRunTarget {
+    fn new(workspace_id: &str, pane_id: &str) -> Self {
+        Self {
+            workspace_id: workspace_id.to_string(),
+            pane_id: pane_id.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum AgentRunPaneIdentity {
+    TerminalOnly {
+        terminal_id: String,
+    },
+    SessionBound {
+        terminal_id: String,
+        session_id: String,
+    },
+}
+
+impl AgentRunPaneIdentity {
+    fn from_pane_identity(identity: &PaneIdentity) -> Self {
+        match &identity.agent_session {
+            Some(session_id) => Self::SessionBound {
+                terminal_id: identity.terminal_id.clone(),
+                session_id: session_id.clone(),
+            },
+            None => Self::TerminalOnly {
+                terminal_id: identity.terminal_id.clone(),
+            },
+        }
+    }
+
+    fn terminal_id(&self) -> &str {
+        match self {
+            Self::TerminalOnly { terminal_id } | Self::SessionBound { terminal_id, .. } => {
+                terminal_id
+            }
+        }
+    }
+
+    fn session_id(&self) -> Option<&str> {
+        match self {
+            Self::TerminalOnly { .. } => None,
+            Self::SessionBound { session_id, .. } => Some(session_id),
+        }
+    }
+
+    fn to_pane_identity(&self) -> PaneIdentity {
+        PaneIdentity {
+            terminal_id: self.terminal_id().to_string(),
+            agent_session: self.session_id().map(str::to_string),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub(crate) struct AgentRunSessionIdentity {
+    terminal_id: String,
+    session_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "stage", rename_all = "snake_case")]
+pub(crate) enum AgentRunCheckpoint {
+    WorkspaceCreated {
+        target: AgentRunTarget,
+    },
+    Launched {
+        target: AgentRunTarget,
+    },
+    Ready {
+        target: AgentRunTarget,
+        pane: AgentRunPaneIdentity,
+    },
+    Submitting {
+        target: AgentRunTarget,
+        pane: AgentRunPaneIdentity,
+    },
+    Working {
+        target: AgentRunTarget,
+        pane: AgentRunPaneIdentity,
+    },
+    TerminalObserved {
+        target: AgentRunTarget,
+        pane: AgentRunPaneIdentity,
+    },
+    Captured {
+        target: AgentRunTarget,
+        pane: AgentRunSessionIdentity,
+    },
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "stage", rename_all = "snake_case")]
+enum AgentRunCheckpointWire {
+    WorkspaceCreated {
+        target: AgentRunTarget,
+    },
+    Launched {
+        target: AgentRunTarget,
+    },
+    Ready {
+        target: AgentRunTarget,
+        pane: AgentRunPaneIdentity,
+    },
+    Submitting {
+        target: AgentRunTarget,
+        pane: AgentRunPaneIdentity,
+    },
+    Working {
+        target: AgentRunTarget,
+        pane: AgentRunPaneIdentity,
+    },
+    TerminalObserved {
+        target: AgentRunTarget,
+        pane: AgentRunPaneIdentity,
+    },
+    Captured {
+        target: AgentRunTarget,
+        pane: AgentRunSessionIdentity,
+    },
+}
+
+impl From<AgentRunCheckpointWire> for AgentRunCheckpoint {
+    fn from(checkpoint: AgentRunCheckpointWire) -> Self {
+        match checkpoint {
+            AgentRunCheckpointWire::WorkspaceCreated { target } => {
+                Self::WorkspaceCreated { target }
+            }
+            AgentRunCheckpointWire::Launched { target } => Self::Launched { target },
+            AgentRunCheckpointWire::Ready { target, pane } => Self::Ready { target, pane },
+            AgentRunCheckpointWire::Submitting { target, pane } => {
+                Self::Submitting { target, pane }
+            }
+            AgentRunCheckpointWire::Working { target, pane } => Self::Working { target, pane },
+            AgentRunCheckpointWire::TerminalObserved { target, pane } => {
+                Self::TerminalObserved { target, pane }
+            }
+            AgentRunCheckpointWire::Captured { target, pane } => Self::Captured { target, pane },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LegacyAgentRunStage {
+    WorkspaceCreated,
+    Launched,
+    Ready,
+    Submitting,
+    Working,
+    Terminal,
+}
+
+#[derive(Deserialize)]
+struct LegacyAgentRunIdentity {
+    workspace_id: String,
+    pane_id: String,
+    #[serde(default)]
+    terminal_id: Option<String>,
+    #[serde(default)]
+    session_id: Option<String>,
+    stage: LegacyAgentRunStage,
+}
+
+impl AgentRunCheckpoint {
+    fn from_legacy(identity: LegacyAgentRunIdentity) -> Result<Self, String> {
+        let target = AgentRunTarget::new(&identity.workspace_id, &identity.pane_id);
+        match identity.stage {
+            LegacyAgentRunStage::WorkspaceCreated => Ok(Self::WorkspaceCreated { target }),
+            LegacyAgentRunStage::Launched => Ok(Self::Launched { target }),
+            LegacyAgentRunStage::Ready => Ok(Self::Ready {
+                target,
+                pane: legacy_pane_identity(identity.terminal_id, identity.session_id)?,
+            }),
+            LegacyAgentRunStage::Submitting => Ok(Self::Submitting {
+                target,
+                pane: legacy_pane_identity(identity.terminal_id, identity.session_id)?,
+            }),
+            LegacyAgentRunStage::Working => Ok(Self::Working {
+                target,
+                pane: legacy_pane_identity(identity.terminal_id, identity.session_id)?,
+            }),
+            LegacyAgentRunStage::Terminal => Ok(Self::TerminalObserved {
+                target,
+                pane: legacy_pane_identity(identity.terminal_id, identity.session_id)?,
+            }),
+        }
+    }
+
+    fn workspace_created(workspace_id: &str, pane_id: &str) -> Self {
+        Self::WorkspaceCreated {
+            target: AgentRunTarget::new(workspace_id, pane_id),
+        }
+    }
+
+    fn launched(workspace_id: &str, pane_id: &str) -> Self {
+        Self::Launched {
+            target: AgentRunTarget::new(workspace_id, pane_id),
+        }
+    }
+
+    fn ready(workspace_id: &str, pane_id: &str, identity: &PaneIdentity) -> Self {
+        Self::Ready {
+            target: AgentRunTarget::new(workspace_id, pane_id),
+            pane: AgentRunPaneIdentity::from_pane_identity(identity),
+        }
+    }
+
+    fn submitting(workspace_id: &str, pane_id: &str, identity: &PaneIdentity) -> Self {
+        Self::Submitting {
+            target: AgentRunTarget::new(workspace_id, pane_id),
+            pane: AgentRunPaneIdentity::from_pane_identity(identity),
+        }
+    }
+
+    fn working(workspace_id: &str, pane_id: &str, identity: &PaneIdentity) -> Self {
+        Self::Working {
+            target: AgentRunTarget::new(workspace_id, pane_id),
+            pane: AgentRunPaneIdentity::from_pane_identity(identity),
+        }
+    }
+
+    fn terminal_observed(workspace_id: &str, pane_id: &str, identity: &PaneIdentity) -> Self {
+        Self::TerminalObserved {
+            target: AgentRunTarget::new(workspace_id, pane_id),
+            pane: AgentRunPaneIdentity::from_pane_identity(identity),
+        }
+    }
+
+    fn captured(
+        workspace_id: &str,
+        pane_id: &str,
+        identity: &PaneIdentity,
+        session_id: &str,
+    ) -> Self {
+        Self::Captured {
+            target: AgentRunTarget::new(workspace_id, pane_id),
+            pane: AgentRunSessionIdentity {
+                terminal_id: identity.terminal_id.clone(),
+                session_id: session_id.to_string(),
+            },
+        }
+    }
+
+    pub(crate) fn target(&self) -> &AgentRunTarget {
+        match self {
+            Self::WorkspaceCreated { target }
+            | Self::Launched { target }
+            | Self::Ready { target, .. }
+            | Self::Submitting { target, .. }
+            | Self::Working { target, .. }
+            | Self::TerminalObserved { target, .. }
+            | Self::Captured { target, .. } => target,
+        }
+    }
+
+    fn pane_identity(&self) -> Option<AgentRunPaneIdentity> {
+        match self {
+            Self::WorkspaceCreated { .. } | Self::Launched { .. } => None,
+            Self::Ready { pane, .. }
+            | Self::Submitting { pane, .. }
+            | Self::Working { pane, .. }
+            | Self::TerminalObserved { pane, .. } => Some(pane.clone()),
+            Self::Captured { pane, .. } => Some(AgentRunPaneIdentity::SessionBound {
+                terminal_id: pane.terminal_id.clone(),
+                session_id: pane.session_id.clone(),
+            }),
+        }
+    }
+
+    pub(crate) fn session_id(&self) -> Option<&str> {
+        match self {
+            Self::WorkspaceCreated { .. } | Self::Launched { .. } => None,
+            Self::Ready { pane, .. }
+            | Self::Submitting { pane, .. }
+            | Self::Working { pane, .. }
+            | Self::TerminalObserved { pane, .. } => pane.session_id(),
+            Self::Captured { pane, .. } => Some(&pane.session_id),
+        }
+    }
+
+    pub(crate) fn rank(&self) -> u8 {
+        match self {
+            Self::WorkspaceCreated { .. } => 0,
+            Self::Launched { .. } => 1,
+            Self::Ready { .. } => 2,
+            Self::Submitting { .. } => 3,
+            Self::Working { .. } => 4,
+            Self::TerminalObserved { .. } => 5,
+            Self::Captured { .. } => 6,
+        }
+    }
+
+    fn has_submitted_work(&self) -> bool {
+        matches!(
+            self,
+            Self::Working { .. } | Self::TerminalObserved { .. } | Self::Captured { .. }
+        )
+    }
+
+    pub(crate) fn can_follow(&self, next: &Self) -> bool {
+        if self.target() != next.target() {
+            return false;
+        }
+        if self.rank() == next.rank() {
+            return same_pane_checkpoint(self.pane_identity(), next.pane_identity());
+        }
+        match (self.pane_identity(), next.pane_identity()) {
+            (None, _) => true,
+            (Some(current), Some(next)) => pane_can_follow(&current, &next),
+            (Some(_), None) => self.rank() > next.rank(),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentRunCheckpoint {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        if value.get("target").is_some() {
+            serde_json::from_value::<AgentRunCheckpointWire>(value)
+                .map(Into::into)
+                .map_err(|error| serde::de::Error::custom(error.to_string()))
+        } else {
+            let legacy = serde_json::from_value::<LegacyAgentRunIdentity>(value)
+                .map_err(|error| serde::de::Error::custom(error.to_string()))?;
+            Self::from_legacy(legacy).map_err(serde::de::Error::custom)
+        }
+    }
+}
+
+fn legacy_pane_identity(
+    terminal_id: Option<String>,
+    session_id: Option<String>,
+) -> Result<AgentRunPaneIdentity, String> {
+    let Some(terminal_id) = terminal_id else {
+        return Err("pending Agent Run has no terminal identity".to_string());
+    };
+    Ok(match session_id {
+        Some(session_id) => AgentRunPaneIdentity::SessionBound {
+            terminal_id,
+            session_id,
+        },
+        None => AgentRunPaneIdentity::TerminalOnly { terminal_id },
+    })
+}
+
+fn same_pane_checkpoint(
+    current: Option<AgentRunPaneIdentity>,
+    next: Option<AgentRunPaneIdentity>,
+) -> bool {
+    match (current, next) {
+        (None, None) => true,
+        (Some(current), Some(next)) => pane_can_follow(&current, &next),
+        _ => false,
+    }
+}
+
+fn pane_can_follow(current: &AgentRunPaneIdentity, next: &AgentRunPaneIdentity) -> bool {
+    match (current, next) {
+        (
+            AgentRunPaneIdentity::TerminalOnly {
+                terminal_id: current,
+            },
+            AgentRunPaneIdentity::TerminalOnly { terminal_id: next },
+        ) => current == next,
+        (
+            AgentRunPaneIdentity::TerminalOnly {
+                terminal_id: current,
+            },
+            AgentRunPaneIdentity::SessionBound {
+                terminal_id: next, ..
+            },
+        ) => current == next,
+        (
+            AgentRunPaneIdentity::SessionBound {
+                terminal_id: current_terminal,
+                session_id: current_session,
+            },
+            AgentRunPaneIdentity::SessionBound {
+                terminal_id: next_terminal,
+                session_id: next_session,
+            },
+        ) => current_terminal == next_terminal && current_session == next_session,
+        (AgentRunPaneIdentity::SessionBound { .. }, AgentRunPaneIdentity::TerminalOnly { .. }) => {
+            false
+        }
+    }
+}
+
+pub(crate) trait AgentRunProgress: Send + Sync {
+    fn update(&self, checkpoint: AgentRunCheckpoint) -> Result<(), String>;
+}
+
+fn update_progress(
+    progress: Option<&dyn AgentRunProgress>,
+    checkpoint: AgentRunCheckpoint,
+) -> Result<(), String> {
+    progress.map_or(Ok(()), |progress| progress.update(checkpoint))
+}
+
 /// The agent_session id herdr reports for `pane_id`, if any. herdr surfaces the same
 /// value the wireproxy files the capture under (see `maybe_snapshot` correlation), so
 /// registering it as a job sid matches the capture in learn eligibility.
@@ -163,6 +575,13 @@ pub enum AgentRunOutcome {
     Unavailable,
     Succeeded(String),
     Failed(String),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AgentRunObservation {
+    Terminal,
+    Absent,
+    Retain(String),
 }
 
 fn socket_path() -> PathBuf {
@@ -199,7 +618,7 @@ fn pane_accepts_prompt(panes: &[Pane], pane: &str) -> bool {
     ready_pane_identity(panes, pane).is_some()
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct PaneIdentity {
     terminal_id: String,
     agent_session: Option<String>,
@@ -380,18 +799,35 @@ async fn subscribe_agent_start(
 }
 
 impl AgentStartSubscription {
-    async fn wait(self, identity: &PaneIdentity, timeout: Duration) -> Result<(), String> {
+    async fn wait(
+        self,
+        identity: &PaneIdentity,
+        timeout: Duration,
+        initial_working: bool,
+        progress: Option<&dyn AgentRunProgress>,
+    ) -> Result<(), String> {
         tokio::time::timeout(timeout, async {
             let mut reader = self.reader;
-            let mut working = false;
+            let mut working = initial_working;
             let mut snapshots = tokio::time::interval(Duration::from_millis(250));
             snapshots.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
                     _ = snapshots.tick() => {
                         let Some(panes) = pane_list().await else { continue };
+                        let was_working = working;
                         if snapshot_completed(identity, &panes, &self.pane_id, &mut working)? {
                             return Ok(());
+                        }
+                        if !was_working && working {
+                            update_progress(
+                                progress,
+                                AgentRunCheckpoint::working(
+                                    &self.workspace_id,
+                                    &self.pane_id,
+                                    identity,
+                                ),
+                            )?;
                         }
                     }
                     line = async {
@@ -415,7 +851,19 @@ impl AgentStartSubscription {
                             continue;
                         }
                         match event.pointer("/data/agent_status").and_then(Value::as_str) {
-                            Some("working") => working = true,
+                            Some("working") => {
+                                if !working {
+                                    update_progress(
+                                        progress,
+                                        AgentRunCheckpoint::working(
+                                            &self.workspace_id,
+                                            &self.pane_id,
+                                            identity,
+                                        ),
+                                    )?;
+                                }
+                                working = true;
+                            }
                             Some("done" | "idle") if working => return Ok(()),
                             _ => {}
                         }
@@ -532,46 +980,180 @@ async fn register_discovered_session_id(
     None
 }
 
-fn capture_has_completed_envelope(path: &Path) -> Result<bool, String> {
-    let mut completed = false;
-    vaultr::recon::for_each_envelope(path, |envelope| {
-        completed |= envelope
-            .pointer("/response/complete")
-            .and_then(Value::as_bool)
-            == Some(true);
-        Ok(())
-    })
-    .map_err(|error| error.to_string())?;
-    Ok(completed)
-}
-
-fn session_has_completed_envelope(vault: &Path, session_id: &str) -> Result<bool, String> {
-    let session =
-        vaultr::vault::resolve_id(vault, session_id).map_err(|error| error.to_string())?;
-    let directory =
-        vaultr::vault::session_dir(vault, &session).map_err(|error| error.to_string())?;
-    let capture = vaultr::vault::capture_file(&directory).map_err(|error| error.to_string())?;
-    capture_has_completed_envelope(&capture)
-}
-
-async fn wait_for_completed_envelope(vault: &Path, session_id: &str) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match session_has_completed_envelope(vault, session_id) {
-            Ok(true) => return Ok(()),
-            Ok(false) if Instant::now() >= deadline => {
-                return Err(format!(
-                    "session {session_id} produced no completed capture envelope"
-                ));
-            }
-            Err(error) if Instant::now() >= deadline => {
-                return Err(format!(
-                    "could not inspect capture for session {session_id}: {error}"
-                ));
-            }
-            _ => tokio::time::sleep(Duration::from_millis(100)).await,
-        }
+fn recovery_pane_identity(checkpoint: &AgentRunCheckpoint) -> Result<PaneIdentity, String> {
+    let Some(pane) = checkpoint.pane_identity() else {
+        return Err("pending Agent Run has no terminal identity".to_string());
+    };
+    if pane.session_id().is_none() {
+        return Err("pending Agent Run has no captured session identity".to_string());
     }
+    Ok(pane.to_pane_identity())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RecordedPane {
+    Working,
+    Terminal,
+    Absent,
+}
+
+fn classify_recorded_pane(
+    panes: &[Pane],
+    checkpoint: &AgentRunCheckpoint,
+    expected: &PaneIdentity,
+) -> Result<RecordedPane, String> {
+    let exact = panes.iter().find(|pane| {
+        pane.workspace_id == checkpoint.target().workspace_id
+            && pane.pane_id == checkpoint.target().pane_id
+    });
+    let Some(pane) = exact else {
+        if panes.iter().any(|pane| {
+            pane.pane_id == checkpoint.target().pane_id
+                || pane.workspace_id == checkpoint.target().workspace_id
+        }) {
+            return Err(
+                "recorded workspace or pane identity conflicts with live Herdr state".to_string(),
+            );
+        }
+        return Ok(RecordedPane::Absent);
+    };
+    if !matches!(pane.agent.as_deref(), Some("claude" | "codex")) {
+        return Err("recorded pane is no longer a native Claude or Codex pane".to_string());
+    }
+    if pane.terminal_id != expected.terminal_id
+        || pane.agent_session.as_ref().map(|session| &session.value)
+            != expected.agent_session.as_ref()
+    {
+        return Err("recorded pane terminal or session identity conflicts".to_string());
+    }
+    if pane.agent_status == "working" {
+        return Ok(RecordedPane::Working);
+    }
+    if matches!(pane.agent_status.as_str(), "idle" | "done") && checkpoint.has_submitted_work() {
+        return Ok(RecordedPane::Terminal);
+    }
+    if matches!(pane.agent_status.as_str(), "idle" | "done") {
+        return Err("recorded Agent Run has no observed submitted work".to_string());
+    }
+    Err(format!(
+        "recorded pane has unrecognized lifecycle state {}",
+        pane.agent_status
+    ))
+}
+
+/// Observe a pending keyed Agent Run without creating a workspace.
+///
+/// The exact workspace, pane, terminal, and captured session identity is the
+/// recovery boundary. Missing, conflicting, or unavailable evidence remains
+/// pending. This function reports only Herdr execution evidence. The Agent Run
+/// coordinator decides whether the matching Vault capture makes that evidence
+/// conclusive.
+pub(crate) async fn observe_agent_run(
+    checkpoint: &AgentRunCheckpoint,
+    progress: Option<&dyn AgentRunProgress>,
+) -> AgentRunObservation {
+    let expected = match recovery_pane_identity(checkpoint) {
+        Ok(expected) => expected,
+        Err(detail) => return AgentRunObservation::Retain(detail),
+    };
+    let Some(panes) = pane_list().await else {
+        return AgentRunObservation::Retain("Herdr pane identity is unavailable".to_string());
+    };
+    match classify_recorded_pane(&panes, checkpoint, &expected) {
+        Ok(RecordedPane::Working) => {
+            if let Err(detail) = update_progress(
+                progress,
+                AgentRunCheckpoint::working(
+                    &checkpoint.target().workspace_id,
+                    &checkpoint.target().pane_id,
+                    &expected,
+                ),
+            ) {
+                return AgentRunObservation::Retain(detail);
+            }
+            let subscription = match subscribe_agent_start(
+                &checkpoint.target().pane_id,
+                &checkpoint.target().workspace_id,
+            )
+            .await
+            {
+                Ok(subscription) => subscription,
+                Err(detail) => return AgentRunObservation::Retain(detail),
+            };
+            if let Err(detail) = subscription
+                .wait(&expected, Duration::from_secs(3 * 3600), true, progress)
+                .await
+            {
+                return AgentRunObservation::Retain(format!(
+                    "recorded pane observation did not complete ({detail})"
+                ));
+            }
+            let Some(current) = pane_list().await else {
+                return AgentRunObservation::Retain(
+                    "Herdr pane identity is unavailable after completion".to_string(),
+                );
+            };
+            let Some(current) = current.iter().find(|pane| {
+                pane.workspace_id == checkpoint.target().workspace_id
+                    && pane.pane_id == checkpoint.target().pane_id
+            }) else {
+                return AgentRunObservation::Retain(
+                    "recorded pane disappeared before terminal identity verification".to_string(),
+                );
+            };
+            if current.terminal_id != expected.terminal_id
+                || current.agent_session.as_ref().map(|session| &session.value)
+                    != expected.agent_session.as_ref()
+            {
+                return AgentRunObservation::Retain(
+                    "recorded pane terminal or session identity changed".to_string(),
+                );
+            }
+            if let Err(detail) = update_progress(
+                progress,
+                AgentRunCheckpoint::terminal_observed(
+                    &checkpoint.target().workspace_id,
+                    &checkpoint.target().pane_id,
+                    &expected,
+                ),
+            ) {
+                return AgentRunObservation::Retain(detail);
+            }
+            return AgentRunObservation::Terminal;
+        }
+        Ok(RecordedPane::Terminal) => {
+            if let Err(detail) = update_progress(
+                progress,
+                AgentRunCheckpoint::terminal_observed(
+                    &checkpoint.target().workspace_id,
+                    &checkpoint.target().pane_id,
+                    &expected,
+                ),
+            ) {
+                return AgentRunObservation::Retain(detail);
+            }
+            return AgentRunObservation::Terminal;
+        }
+        Ok(RecordedPane::Absent) => {}
+        Err(detail) => return AgentRunObservation::Retain(detail),
+    }
+    let Some(workspaces) = workspaces().await else {
+        return AgentRunObservation::Retain("Herdr workspace identity is unavailable".to_string());
+    };
+    if workspaces
+        .iter()
+        .any(|workspace| workspace.workspace_id == checkpoint.target().workspace_id)
+    {
+        return AgentRunObservation::Retain(
+            "recorded workspace remains but its pane identity is unavailable".to_string(),
+        );
+    }
+    if !checkpoint.has_submitted_work() {
+        return AgentRunObservation::Retain(
+            "recorded Agent Run has no observed submitted work".to_string(),
+        );
+    }
+    AgentRunObservation::Absent
 }
 
 /// Reclaim inactive workspaces left by interrupted or intentionally retained runs.
@@ -603,6 +1185,13 @@ fn should_cleanup(cleanup: WorkspaceCleanup, outcome: &AgentRunOutcome) -> bool 
 /// Create an unfocused Herdr workspace, run and verify an agent, deliver one
 /// prompt, wait for completion, and apply the requested best-effort cleanup.
 pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
+    run_agent_with_progress(agent_run, None).await
+}
+
+pub(crate) async fn run_agent_with_progress(
+    agent_run: AgentRun,
+    progress: Option<&dyn AgentRunProgress>,
+) -> AgentRunOutcome {
     let probe = run30(&["herdr", "workspace", "list"]).await;
     if !probe.ok {
         println!(
@@ -665,6 +1254,14 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
                 "workspace create failed".to_string()
             });
         };
+        if let Err(detail) = update_progress(
+            progress,
+            AgentRunCheckpoint::workspace_created(workspace, pane),
+        ) {
+            return AgentRunOutcome::Failed(format!(
+                "could not persist workspace identity ({detail})"
+            ));
+        }
         let launched = run30(&["herdr", "pane", "run", pane, &agent_run.launch]).await;
         if !launched.ok {
             return AgentRunOutcome::Failed(format!(
@@ -672,7 +1269,14 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
                 launched.failure_detail()
             ));
         }
-        let identity = match wait_for_prompt_ready(pane, Duration::from_secs(60)).await {
+        if let Err(detail) =
+            update_progress(progress, AgentRunCheckpoint::launched(workspace, pane))
+        {
+            return AgentRunOutcome::Failed(format!(
+                "could not persist launched identity ({detail})"
+            ));
+        }
+        let mut identity = match wait_for_prompt_ready(pane, Duration::from_secs(60)).await {
             Ok(identity) => identity,
             Err(detail) => {
                 eprintln!(
@@ -682,6 +1286,15 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
                 return AgentRunOutcome::Failed(format!("agent never became ready ({detail})"));
             }
         };
+        if identity.agent_session.is_none() {
+            identity.agent_session = agent_run.preset_session_id.clone();
+        }
+        if let Err(detail) = update_progress(
+            progress,
+            AgentRunCheckpoint::ready(workspace, pane, &identity),
+        ) {
+            return AgentRunOutcome::Failed(format!("could not persist ready identity ({detail})"));
+        }
         // Arm the status observer BEFORE typing so even a fast working→done turn
         // is buffered on this pane/workspace cursor. Herdr `pane run` only TYPES
         // the prompt: a running Claude TUI needs an explicit Enter to submit,
@@ -699,6 +1312,14 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
                 ));
             }
         };
+        if let Err(detail) = update_progress(
+            progress,
+            AgentRunCheckpoint::submitting(workspace, pane, &identity),
+        ) {
+            return AgentRunOutcome::Failed(format!(
+                "could not persist submission identity ({detail})"
+            ));
+        }
         let typed = run30(&["herdr", "pane", "run", pane, &agent_run.prompt]).await;
         if let Err(detail) = require_command(&typed, "prompt typing") {
             return AgentRunOutcome::Failed(detail);
@@ -734,7 +1355,12 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
             }
         }
         if let Err(detail) = lifecycle
-            .wait(&identity, agent_run.timeout + Duration::from_secs(60))
+            .wait(
+                &identity,
+                agent_run.timeout + Duration::from_secs(60),
+                false,
+                progress,
+            )
             .await
         {
             return AgentRunOutcome::Failed(format!(
@@ -748,6 +1374,14 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
             return AgentRunOutcome::Failed(
                 "pane terminal/session identity changed during submitted turn".to_string(),
             );
+        }
+        if let Err(detail) = update_progress(
+            progress,
+            AgentRunCheckpoint::terminal_observed(workspace, pane, &identity),
+        ) {
+            return AgentRunOutcome::Failed(format!(
+                "could not persist terminal identity ({detail})"
+            ));
         }
         let tail = run30(&[
             "herdr", "pane", "read", pane, "--source", "recent", "--lines", "15",
@@ -779,9 +1413,41 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
         .preset_session_id
         .clone()
         .or(discovered_session_id);
+    let mut outcome = outcome;
+    if matches!(outcome, AgentRunOutcome::Succeeded(_)) {
+        if let (Some(progress), Some(workspace), Some(pane), Some(session_id)) = (
+            progress,
+            workspace_id.as_deref(),
+            pane_id.as_deref(),
+            session_id.as_deref(),
+        ) {
+            let pane_identity = pane_list()
+                .await
+                .and_then(|panes| ready_pane_identity(&panes, pane));
+            match pane_identity {
+                Some(pane_identity) => {
+                    let captured =
+                        AgentRunCheckpoint::captured(workspace, pane, &pane_identity, session_id);
+                    if let Err(detail) = progress.update(captured) {
+                        outcome = AgentRunOutcome::Failed(format!(
+                            "could not persist captured session identity ({detail})"
+                        ));
+                    }
+                }
+                None => {
+                    outcome = AgentRunOutcome::Failed(
+                        "could not persist captured session identity: terminal identity unavailable"
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
     let outcome = match (outcome, session_id) {
         (AgentRunOutcome::Succeeded(_), Some(session_id)) => {
-            match wait_for_completed_envelope(&crate::vault_root(), &session_id).await {
+            match crate::agent_run::wait_for_completed_envelope(&crate::vault_root(), &session_id)
+                .await
+            {
                 Ok(()) => AgentRunOutcome::Succeeded("agent done".to_string()),
                 Err(detail) => AgentRunOutcome::Failed(detail),
             }
@@ -1007,6 +1673,101 @@ mod tests {
         assert_eq!(created.result.root_pane.pane_id, "w2:p1");
     }
 
+    fn recovery_checkpoint(stage: &str) -> AgentRunCheckpoint {
+        serde_json::from_value(serde_json::json!({
+            "stage": stage,
+            "target": {"workspace_id": "w1", "pane_id": "w1:p1"},
+            "pane": {
+                "kind": "session_bound",
+                "terminal_id": "t1",
+                "session_id": "session-1"
+            }
+        }))
+        .unwrap()
+    }
+
+    fn recovered_pane(status: &str, session: &str) -> Pane {
+        let mut pane = codex_pane(status);
+        pane.agent_session = Some(AgentSession {
+            value: session.to_string(),
+        });
+        pane
+    }
+
+    #[test]
+    fn recovery_requires_the_exact_live_execution_identity() {
+        let working = recovery_checkpoint("working");
+        let expected = recovery_pane_identity(&working).unwrap();
+        assert_eq!(
+            classify_recorded_pane(
+                &[recovered_pane("working", "session-1")],
+                &working,
+                &expected
+            ),
+            Ok(RecordedPane::Working)
+        );
+        assert_eq!(
+            classify_recorded_pane(&[recovered_pane("done", "session-1")], &working, &expected),
+            Ok(RecordedPane::Terminal)
+        );
+        assert!(classify_recorded_pane(
+            &[recovered_pane("working", "other-session")],
+            &working,
+            &expected
+        )
+        .unwrap_err()
+        .contains("conflicts"));
+        assert_eq!(
+            classify_recorded_pane(&[], &working, &expected),
+            Ok(RecordedPane::Absent)
+        );
+
+        let ready = recovery_checkpoint("ready");
+        let expected = recovery_pane_identity(&ready).unwrap();
+        assert!(
+            classify_recorded_pane(&[recovered_pane("idle", "session-1")], &ready, &expected)
+                .unwrap_err()
+                .contains("submitted work")
+        );
+    }
+
+    #[test]
+    fn tagged_checkpoints_encode_phase_specific_identity() {
+        let terminal_only = serde_json::from_value::<AgentRunCheckpoint>(serde_json::json!({
+            "stage": "working",
+            "target": {"workspace_id": "w1", "pane_id": "w1:p1"},
+            "pane": {"kind": "terminal_only", "terminal_id": "t1"}
+        }))
+        .unwrap();
+        assert_eq!(terminal_only.session_id(), None);
+        assert!(recovery_pane_identity(&terminal_only).is_err());
+
+        let captured = serde_json::from_value::<AgentRunCheckpoint>(serde_json::json!({
+            "stage": "captured",
+            "target": {"workspace_id": "w1", "pane_id": "w1:p1"},
+            "pane": {"terminal_id": "t1", "session_id": "session-1"}
+        }))
+        .unwrap();
+        assert_eq!(captured.session_id(), Some("session-1"));
+        assert!(recovery_pane_identity(&captured).is_ok());
+        assert!(terminal_only.can_follow(&captured));
+
+        let replaced_session = serde_json::from_value::<AgentRunCheckpoint>(serde_json::json!({
+            "stage": "captured",
+            "target": {"workspace_id": "w1", "pane_id": "w1:p1"},
+            "pane": {"terminal_id": "t1", "session_id": "other-session"}
+        }))
+        .unwrap();
+        assert!(!captured.can_follow(&replaced_session));
+
+        let legacy = serde_json::from_str::<AgentRunCheckpoint>(
+            r#"{"workspace_id":"w1","pane_id":"w1:p1","terminal_id":"t1","session_id":"session-1","stage":"working"}"#,
+        )
+        .unwrap();
+        assert!(matches!(legacy, AgentRunCheckpoint::Working { .. }));
+        assert_eq!(legacy.session_id(), Some("session-1"));
+    }
+
     #[test]
     fn prompt_readiness_requires_native_idle_or_done_agent() {
         let pane = |agent: Option<&str>, status: &str| Pane {
@@ -1147,21 +1908,6 @@ mod tests {
     }
 
     #[test]
-    fn capture_completion_requires_a_completed_envelope() {
-        let path =
-            std::env::temp_dir().join(format!("plant-capture-{}.jsonl", uuid::Uuid::new_v4()));
-        std::fs::write(&path, "{\"response\":{\"complete\":false}}\n").unwrap();
-        assert!(!capture_has_completed_envelope(&path).unwrap());
-        std::fs::write(
-            &path,
-            "{\"response\":{\"complete\":false}}\n{\"response\":{\"complete\":true}}\n",
-        )
-        .unwrap();
-        assert!(capture_has_completed_envelope(&path).unwrap());
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
     fn cleanup_follows_policy_and_outcome() {
         let succeeded = AgentRunOutcome::Succeeded("done".into());
         let failed = AgentRunOutcome::Failed("timeout".into());
@@ -1201,7 +1947,7 @@ mod tests {
             .await
             .unwrap();
         let error = subscription
-            .wait(&identity, Duration::from_millis(100))
+            .wait(&identity, Duration::from_millis(100), false, None)
             .await
             .unwrap_err();
         assert_eq!(
@@ -1224,7 +1970,26 @@ mod tests {
             .await
             .unwrap();
         subscription
-            .wait(&identity, Duration::from_millis(100))
+            .wait(&identity, Duration::from_millis(100), false, None)
+            .await
+            .unwrap();
+        server.await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn resumed_working_pane_accepts_the_next_terminal_event() {
+        let identity = PaneIdentity {
+            terminal_id: "t1".to_string(),
+            agent_session: Some("session-1".to_string()),
+        };
+        let path = PathBuf::from("/tmp").join(format!("ph-{}.sock", uuid::Uuid::new_v4()));
+        let server = subscription_server(path.clone(), vec!["done"]).await;
+        let subscription = subscribe_agent_start_at(&path, "w1:p1", "w1")
+            .await
+            .unwrap();
+        subscription
+            .wait(&identity, Duration::from_millis(100), true, None)
             .await
             .unwrap();
         server.await.unwrap();
@@ -1245,7 +2010,7 @@ mod tests {
             .await
             .unwrap();
         subscription
-            .wait(&identity, Duration::from_millis(100))
+            .wait(&identity, Duration::from_millis(100), false, None)
             .await
             .unwrap();
         server.await.unwrap();

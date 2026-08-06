@@ -19,13 +19,13 @@
 
 #[cfg(test)]
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+#[cfg(test)]
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::domain::Harness;
@@ -323,6 +323,43 @@ fn attempt_path(name: &str) -> PathBuf {
     attempt_dir().join(format!("{name}.json"))
 }
 
+fn worker_lease_dir() -> PathBuf {
+    state_dir().join("job-workers")
+}
+
+struct WorkerCapacityLease {
+    _slot: File,
+}
+
+/// Acquire one durable scheduler-capacity slot without waiting.
+///
+/// The slot file is only a stable inode. The ownership boundary is the
+/// cross-process flock held by the worker until its final ledger transition.
+fn try_acquire_worker_capacity(capacity: usize) -> io::Result<Option<WorkerCapacityLease>> {
+    if capacity == 0 {
+        return Ok(None);
+    }
+    let dir = worker_lease_dir();
+    ensure_dir_durable(&dir)?;
+    for slot in 0..capacity {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(dir.join(format!("capacity-{slot}.lock")))?;
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Ok(Some(WorkerCapacityLease { _slot: file }));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::WouldBlock {
+            return Err(error);
+        }
+    }
+    Ok(None)
+}
+
 fn write_fence(path: &Path, fence: &AttemptFence) -> io::Result<()> {
     let mut bytes =
         serde_json::to_vec(fence).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -458,7 +495,7 @@ where
                     existing.id
                 )))
             }
-            Ok(crate::agent_run::ReceiptLookup::Pending) => {
+            Ok(crate::agent_run::ReceiptLookup::Pending { .. }) => {
                 return Ok(FenceReconcile::Blocked(format!(
                     "attempt {} claimed an agent run that never finished; \
                      if its agent is gone, run `plant jobs unblock {name}`",
@@ -489,6 +526,36 @@ fn reconcile_fence(name: &str) -> io::Result<FenceReconcile> {
         ledger.parent().expect("job ledger has a parent"),
         File::sync_all,
     )
+}
+
+async fn reconcile_fence_live(name: &str) -> io::Result<FenceReconcile> {
+    let result = reconcile_fence(name)?;
+    if !matches!(result, FenceReconcile::Blocked(_)) {
+        return Ok(result);
+    }
+    let fence_path = attempt_path(name);
+    let text = match std::fs::read_to_string(&fence_path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(result),
+        Err(error) => return Err(error),
+    };
+    let fence: AttemptFence = serde_json::from_str(&text)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    if fence.retryable || fence.action == Some(JobAction::InProcessCompression) {
+        return Ok(result);
+    }
+    let checkpoint = match crate::agent_run::lookup_receipt(&fence.id)? {
+        crate::agent_run::ReceiptLookup::Pending {
+            checkpoint: Some(checkpoint),
+        } => checkpoint,
+        _ => return Ok(result),
+    };
+    match crate::agent_run::recover_pending(&fence.id, &checkpoint).await? {
+        crate::agent_run::PendingRecovery::Recovered => reconcile_fence(name),
+        crate::agent_run::PendingRecovery::Retained(detail) => Ok(FenceReconcile::Blocked(
+            format!("attempt {} recovery retained: {detail}", fence.id),
+        )),
+    }
 }
 
 /// Outcome of an operator unblock request.
@@ -586,6 +653,7 @@ fn publish_attempt(name: &str, action: JobAction, lock: File) -> io::Result<Atte
     })
 }
 
+#[cfg(test)]
 fn begin_attempt_locked(name: &str, lock: File) -> io::Result<AttemptStart> {
     verify_ledger_writable(name)?;
     match reconcile_fence(name)? {
@@ -600,10 +668,29 @@ fn begin_attempt_locked(name: &str, lock: File) -> io::Result<AttemptStart> {
     }
 }
 
+#[cfg(test)]
 fn begin_attempt(name: &str) -> io::Result<AttemptStart> {
     match acquire_attempt_lock(name)? {
         AttemptLockStart::Ready(lock) => begin_attempt_locked(name, lock),
         AttemptLockStart::Blocked(detail) => Ok(AttemptStart::Blocked(detail)),
+    }
+}
+
+async fn begin_attempt_live(name: &str) -> io::Result<AttemptStart> {
+    let lock = match acquire_attempt_lock(name)? {
+        AttemptLockStart::Ready(lock) => lock,
+        AttemptLockStart::Blocked(detail) => return Ok(AttemptStart::Blocked(detail)),
+    };
+    verify_ledger_writable(name)?;
+    match reconcile_fence_live(name).await? {
+        FenceReconcile::Ready => {
+            publish_attempt(name, JobAction::Script, lock).map(AttemptStart::Ready)
+        }
+        FenceReconcile::ResumableCompression(fence) => Ok(AttemptStart::Blocked(format!(
+            "attempt {} awaits in-process compression resume",
+            fence.id
+        ))),
+        FenceReconcile::Blocked(detail) => Ok(AttemptStart::Blocked(detail)),
     }
 }
 
@@ -613,6 +700,7 @@ enum ScheduledAttemptStart {
     Blocked(String),
 }
 
+#[cfg(test)]
 fn begin_scheduled_attempt(job: &Job) -> io::Result<ScheduledAttemptStart> {
     let lock = match acquire_attempt_lock(&job.name)? {
         AttemptLockStart::Ready(lock) => lock,
@@ -620,6 +708,30 @@ fn begin_scheduled_attempt(job: &Job) -> io::Result<ScheduledAttemptStart> {
     };
     verify_ledger_writable(&job.name)?;
     match reconcile_fence(&job.name)? {
+        FenceReconcile::Ready => {}
+        FenceReconcile::ResumableCompression(fence) => {
+            return Ok(ScheduledAttemptStart::Ready(AttemptGuard {
+                name: job.name.clone(),
+                fence,
+                _lock: lock,
+            }))
+        }
+        FenceReconcile::Blocked(detail) => return Ok(ScheduledAttemptStart::Blocked(detail)),
+    }
+    let due = record_is_due(last_record_ts(&job.name)?, job.every, epoch_now());
+    if !due {
+        return Ok(ScheduledAttemptStart::NotDue);
+    }
+    publish_attempt(&job.name, job.action, lock).map(ScheduledAttemptStart::Ready)
+}
+
+async fn begin_scheduled_attempt_live(job: &Job) -> io::Result<ScheduledAttemptStart> {
+    let lock = match acquire_attempt_lock(&job.name)? {
+        AttemptLockStart::Ready(lock) => lock,
+        AttemptLockStart::Blocked(detail) => return Ok(ScheduledAttemptStart::Blocked(detail)),
+    };
+    verify_ledger_writable(&job.name)?;
+    match reconcile_fence_live(&job.name).await? {
         FenceReconcile::Ready => {}
         FenceReconcile::ResumableCompression(fence) => {
             return Ok(ScheduledAttemptStart::Ready(AttemptGuard {
@@ -887,7 +999,7 @@ fn finish_execution(
 }
 
 pub async fn run_job(job: &Job) -> i32 {
-    let attempt = match begin_attempt(&job.name) {
+    let attempt = match begin_attempt_live(&job.name).await {
         Ok(AttemptStart::Ready(attempt)) => attempt,
         Ok(AttemptStart::Blocked(detail)) => {
             eprintln!("[job:{}] dispatch blocked: {detail}", job.name);
@@ -912,18 +1024,11 @@ enum ScheduledDispatch {
     Blocked,
 }
 
-async fn dispatch_scheduled(
-    job: &Job,
-    vault: &Path,
-    semaphore: &tokio::sync::Semaphore,
-    script_timeout: Duration,
-) -> ScheduledDispatch {
-    let Ok(_permit) = semaphore.acquire().await else {
-        return ScheduledDispatch::Blocked;
-    };
-    // Once capacity is admitted, hold the per-job cross-process flock across
-    // the durable cadence recheck, fence, execution, and final transition.
-    let attempt = match begin_scheduled_attempt(job) {
+async fn dispatch_admitted(job: &Job, vault: &Path, script_timeout: Duration) -> ScheduledDispatch {
+    // The caller holds the cross-process capacity lease. Keep the per-job flock
+    // in the attempt guard through the durable cadence recheck, execution, and
+    // final transition.
+    let attempt = match begin_scheduled_attempt_live(job).await {
         Ok(ScheduledAttemptStart::Ready(attempt)) => attempt,
         Ok(ScheduledAttemptStart::NotDue) => return ScheduledDispatch::NotDue,
         Ok(ScheduledAttemptStart::Blocked(detail)) => {
@@ -946,6 +1051,100 @@ async fn dispatch_scheduled(
     let execution = execute_scheduled(job, action, vault, script_timeout, &attempt.fence.id).await;
     ScheduledDispatch::Finished(finish_execution(job, attempt, started, execution))
 }
+
+#[cfg(test)]
+async fn dispatch_scheduled(
+    job: &Job,
+    vault: &Path,
+    semaphore: &tokio::sync::Semaphore,
+    script_timeout: Duration,
+) -> ScheduledDispatch {
+    let Ok(_permit) = semaphore.acquire().await else {
+        return ScheduledDispatch::Blocked;
+    };
+    dispatch_admitted(job, vault, script_timeout).await
+}
+
+async fn dispatch_scheduled_worker(
+    job: &Job,
+    vault: &Path,
+    capacity: usize,
+    script_timeout: Duration,
+) -> ScheduledDispatch {
+    let Ok(lease) = try_acquire_worker_capacity(capacity) else {
+        eprintln!("[job:{}] scheduled worker capacity lease failed", job.name);
+        return ScheduledDispatch::Blocked;
+    };
+    let Some(_lease) = lease else {
+        return ScheduledDispatch::Blocked;
+    };
+    dispatch_admitted(job, vault, script_timeout).await
+}
+
+/// Execute one scheduled script in the restart-independent worker process.
+/// Compression remains in the listener-owning daemon and never enters this
+/// worker boundary.
+pub async fn run_scheduled_worker(args: crate::cli::ScheduledWorkerArgs) -> i32 {
+    let job = Job {
+        name: args.name,
+        path: args.path,
+        every: args.every,
+        action: JobAction::Script,
+    };
+    let vault = PathBuf::new();
+    match dispatch_scheduled_worker(&job, &vault, args.capacity, args.timeout).await {
+        ScheduledDispatch::Finished(code) => code,
+        ScheduledDispatch::NotDue => 0,
+        ScheduledDispatch::Blocked => 75,
+    }
+}
+
+fn spawn_scheduled_worker(job: &Job, capacity: usize, timeout: Duration) -> io::Result<()> {
+    let executable = std::env::current_exe()?;
+    let lease_dir = worker_lease_dir();
+    ensure_dir_durable(&lease_dir)?;
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(lease_dir.join(format!("{}.log", job.name)))?;
+    let error_log = log.try_clone()?;
+    let path = job.path.to_str().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("job {} path is not valid UTF-8", job.name),
+        )
+    })?;
+    let every = job.every.as_secs().to_string();
+    let capacity = capacity.to_string();
+    let timeout = timeout.as_secs().to_string();
+    let mut command = tokio::process::Command::new(executable);
+    command
+        .args([
+            "jobs",
+            "worker",
+            job.name.as_str(),
+            path,
+            every.as_str(),
+            capacity.as_str(),
+            timeout.as_str(),
+        ])
+        .env("PATH", crate::process::augmented_path())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log))
+        .stderr(std::process::Stdio::from(error_log));
+    crate::process::spawn_detached(&mut command)
+}
+
+fn attempt_lock_held(name: &str) -> io::Result<bool> {
+    match acquire_attempt_lock(name)? {
+        AttemptLockStart::Ready(lock) => {
+            drop(lock);
+            Ok(false)
+        }
+        AttemptLockStart::Blocked(_) => Ok(true),
+    }
+}
+
 pub async fn scheduler(cfg: Cfg, vault: PathBuf) {
     if cfg.get("PLANT_JOBS").as_deref() == Some("0") {
         println!("[jobs] disabled (PLANT_JOBS=0)");
@@ -955,8 +1154,6 @@ pub async fn scheduler(cfg: Cfg, vault: PathBuf) {
         .get("PLANT_JOBS_MAX_CONCURRENT")
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
-    let sem = Arc::new(tokio::sync::Semaphore::new(cap));
-    let running: Arc<Mutex<HashSet<String>>> = Default::default();
     let mut last_seen: Option<Vec<String>> = None;
     tokio::time::sleep(Duration::from_secs(15)).await; // startup settle
     loop {
@@ -979,8 +1176,13 @@ pub async fn scheduler(cfg: Cfg, vault: PathBuf) {
             last_seen = Some(names);
         }
         for job in jobs {
-            if running.lock().unwrap().contains(&job.name) {
-                continue;
+            match attempt_lock_held(&job.name) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => {
+                    eprintln!("[job:{}] worker lease check failed: {error}", job.name);
+                    continue;
+                }
             }
             let due = match last_record_ts(&job.name) {
                 Ok(last) => record_is_due(last, job.every, epoch_now()),
@@ -992,13 +1194,14 @@ pub async fn scheduler(cfg: Cfg, vault: PathBuf) {
             if !due {
                 continue;
             }
-            running.lock().unwrap().insert(job.name.clone());
-            let (sem, running) = (sem.clone(), running.clone());
-            let vault = vault.clone();
-            tokio::spawn(async move {
-                let _ = dispatch_scheduled(&job, &vault, &sem, SCRIPT_BACKSTOP).await;
-                running.lock().unwrap().remove(&job.name);
-            });
+            if job.action == JobAction::InProcessCompression {
+                let vault = vault.clone();
+                tokio::spawn(async move {
+                    let _ = dispatch_scheduled_worker(&job, &vault, cap, SCRIPT_BACKSTOP).await;
+                });
+            } else if let Err(error) = spawn_scheduled_worker(&job, cap, SCRIPT_BACKSTOP) {
+                eprintln!("[job:{}] worker spawn failed: {error}", job.name);
+            }
         }
         tokio::time::sleep(Duration::from_secs(60)).await;
     }

@@ -652,6 +652,76 @@ fn exclude_from_commit(vault: &Path, sealed: &Path, size: u64) {
     );
 }
 
+fn scan_session_text(vault: &Path, repository: &Path) -> Result<(), String> {
+    let policy = vaultr::secrets::policy_for(repository)
+        .map_err(|error| format!("load secret policy: {error:#}"))?;
+    let mut pending = vec![vault.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let entries = std::fs::read_dir(&path)
+            .map_err(|error| format!("read session scan directory {}: {error}", path.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("read session scan entry: {error}"))?;
+            let entry_path = entry.path();
+            let file_type = entry.file_type().map_err(|error| {
+                format!(
+                    "inspect session scan entry {}: {error}",
+                    entry_path.display()
+                )
+            })?;
+            if file_type.is_dir() {
+                pending.push(entry_path);
+                continue;
+            }
+            if !file_type.is_file() {
+                return Err(format!(
+                    "secret scan refused non-regular session entry: {}",
+                    entry_path.display()
+                ));
+            }
+            let relative = entry_path.strip_prefix(repository).map_err(|_| {
+                format!(
+                    "session scan path leaves repository: {}",
+                    entry_path.display()
+                )
+            })?;
+            let status = std::process::Command::new("git")
+                .arg("-C")
+                .arg(repository)
+                .args(["check-ignore", "-q", "--"])
+                .arg(relative)
+                .status()
+                .map_err(|error| {
+                    format!("check session scan path {}: {error}", relative.display())
+                })?;
+            let ignored = match status.code() {
+                Some(0) => true,
+                Some(1) => false,
+                _ => {
+                    return Err(format!(
+                        "git check-ignore failed for {}",
+                        relative.display()
+                    ))
+                }
+            };
+            if ignored {
+                continue;
+            }
+            let bytes = std::fs::read(&entry_path).map_err(|error| {
+                format!("read session scan file {}: {error}", entry_path.display())
+            })?;
+            if let Some(hit) = vaultr::secrets::scan_bytes(&bytes, relative, &policy).first() {
+                return Err(format!(
+                    "secret finding: {}:{}:{}",
+                    relative.display(),
+                    hit.line,
+                    hit.rule
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub async fn compress_sweep(vault: &Path, idle: Duration) -> Result<(), CompressError> {
     let (pending, _learn) = pending_generations(vault).map_err(CompressError::Inventory)?;
     if !which("zstd") {
@@ -697,7 +767,7 @@ pub async fn compress_sweep(vault: &Path, idle: Duration) -> Result<(), Compress
         println!("[compress] nothing to seal");
         return Ok(());
     }
-    let repository = match vaultr::validate::content_root(vault) {
+    let repository_path = match vaultr::validate::content_root(vault) {
         Ok(path) if path.as_os_str().is_empty() => ".".to_string(),
         Ok(path) => path.to_str().unwrap_or(".").to_string(),
         Err(_) => {
@@ -705,6 +775,13 @@ pub async fn compress_sweep(vault: &Path, idle: Duration) -> Result<(), Compress
             return Ok(());
         }
     };
+    let repository_path = PathBuf::from(&repository_path);
+    if let Err(error) = scan_session_text(vault, &repository_path) {
+        return Err(CompressError::Operational(format!(
+            "secret scan failed, commit skipped: {error}"
+        )));
+    }
+    let repository = repository_path.to_str().unwrap_or(".").to_string();
     run30(&["git", "-C", &repository, "add", "-A", "sessions"]).await;
     let message = format!("chore: seal {sealed} session(s) (scrubbed + zstd)");
     run30(&["git", "-C", &repository, "commit", "-m", &message]).await;
