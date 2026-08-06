@@ -8,6 +8,7 @@ mod ca;
 mod capture;
 mod cli;
 mod coverage;
+mod credentials;
 mod domain;
 mod fsutil;
 mod herdr;
@@ -44,9 +45,25 @@ fn usage(error: &str) -> i32 {
     eprintln!("plant: {error}");
     eprintln!(
         "usage: plant [--self-test | server stop | sessions eligible|coverage|stuck ... | \
-         compress once ... | jobs run|unblock <name>|worker ... | agent run --cli claude|codex ...]"
+         compress once ... | jobs run|unblock <name>|worker ... | agent run --cli claude|codex ... | \
+         credentials reconcile [--once | --interval <dur>] [--source <dir>]]"
     );
     2
+}
+
+fn credentials_usage() {
+    println!(
+        "usage: plant credentials reconcile [--once | --interval <dur>] [--source <dir>]\n\
+         \n\
+         Reconciles projected Kubernetes credentials into guest credential files,\n\
+         rewriting the configs derived from them (git-credentials, glab config.yml).\n\
+         \n\
+           --once            apply a single pass and exit; non-zero if any entry failed\n\
+           --interval <dur>  poll the source for changes (default 30s)\n\
+           --source <dir>    projected credential directory (default {}, \n\
+                            overridable with COMPUTERS_CREDENTIAL_DIR)",
+        credentials::DEFAULT_SOURCE
+    );
 }
 
 async fn dispatch(command: Command) -> i32 {
@@ -238,6 +255,19 @@ async fn dispatch(command: Command) -> i32 {
             }
         },
         Command::JobsWorker(args) => jobs::run_scheduled_worker(args).await,
+        Command::CredentialsHelp => {
+            credentials_usage();
+            0
+        }
+        Command::CredentialsReconcile(args) => {
+            if args.once {
+                credentials::reconcile_once(&args.source)
+            } else {
+                // Diverges: a supervised reconciler that returns is a box that
+                // silently stopped refreshing.
+                credentials::reconcile_loop(&args.source, args.interval)
+            }
+        }
         Command::AgentRun(args) => {
             // No nesting: a job-spawned agent must never spawn another (jobs spawning jobs).
             // launch_line stamps PLANT_AGENT=1 into every agent plant starts; if it's set here

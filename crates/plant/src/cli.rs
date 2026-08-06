@@ -1,3 +1,4 @@
+use crate::credentials::ReconcileArgs;
 use crate::domain::Harness;
 use crate::herdr::WorkspaceCleanup;
 use crate::jobs;
@@ -18,6 +19,12 @@ pub enum Command {
     JobsUnblock(String),
     JobsWorker(ScheduledWorkerArgs),
     AgentRun(AgentRunArgs),
+    CredentialsReconcile(ReconcileArgs),
+    /// `credentials reconcile --help` exists so a guest can cheaply probe
+    /// whether the plant it shipped with has the reconciler at all. The image
+    /// degrades loudly on absence rather than crashlooping, and that probe is
+    /// how it tells.
+    CredentialsHelp,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -92,6 +99,12 @@ pub fn parse_command(argv: &[String]) -> Result<Command, String> {
         }
         [group, action, rest @ ..] if group == "agent" && action == "run" => {
             parse_agent(rest).map(Command::AgentRun)
+        }
+        [group, action, rest @ ..] if group == "credentials" && action == "reconcile" => {
+            if rest.iter().any(|arg| arg == "--help") {
+                return Ok(Command::CredentialsHelp);
+            }
+            parse_reconcile(rest).map(Command::CredentialsReconcile)
         }
         _ => Err("unrecognized command".to_string()),
     }
@@ -255,6 +268,44 @@ fn parse_worker(args: &[String]) -> Result<ScheduledWorkerArgs, String> {
     })
 }
 
+fn parse_reconcile(args: &[String]) -> Result<ReconcileArgs, String> {
+    let mut parsed = ReconcileArgs::with_defaults();
+    let mut seen = HashSet::new();
+    let mut i = 0;
+    while i < args.len() {
+        let flag = args[i].as_str();
+        if !seen.insert(flag) {
+            return Err(format!("duplicate credentials reconcile flag {flag}"));
+        }
+        match flag {
+            "--once" => {
+                parsed.once = true;
+                i += 1;
+            }
+            "--interval" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or("credentials reconcile: --interval requires a duration")?;
+                parsed.interval = jobs::parse_duration(value)
+                    .ok_or("credentials reconcile: invalid --interval duration")?;
+                i += 2;
+            }
+            "--source" => {
+                let value = args
+                    .get(i + 1)
+                    .ok_or("credentials reconcile: --source requires a path")?;
+                parsed.source = PathBuf::from(value);
+                i += 2;
+            }
+            _ => return Err(format!("unknown credentials reconcile flag {flag}")),
+        }
+    }
+    if parsed.once && seen.contains("--interval") {
+        return Err("credentials reconcile: --once and --interval are exclusive".to_string());
+    }
+    Ok(parsed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,9 +402,52 @@ mod tests {
     }
 
     #[test]
+    fn parses_both_reconciler_modes() {
+        assert_eq!(
+            parse_command(&argv(&["credentials", "reconcile", "--once"])),
+            Ok(Command::CredentialsReconcile(ReconcileArgs {
+                once: true,
+                interval: Duration::from_secs(30),
+                source: ReconcileArgs::with_defaults().source,
+            }))
+        );
+        assert_eq!(
+            parse_command(&argv(&[
+                "credentials",
+                "reconcile",
+                "--interval",
+                "45s",
+                "--source",
+                "/run/creds",
+            ])),
+            Ok(Command::CredentialsReconcile(ReconcileArgs {
+                once: false,
+                interval: Duration::from_secs(45),
+                source: PathBuf::from("/run/creds"),
+            }))
+        );
+    }
+
+    /// The guest image probes with `--help` to decide whether this plant build
+    /// can reconcile at all, so the probe must exit 0 and not parse as a run.
+    #[test]
+    fn help_probe_is_recognised_rather_than_rejected() {
+        assert_eq!(
+            parse_command(&argv(&["credentials", "reconcile", "--help"])),
+            Ok(Command::CredentialsHelp)
+        );
+    }
+
+    #[test]
     fn rejects_every_unmatched_or_invalid_nonempty_form() {
         for args in [
             vec!["--help"],
+            vec!["credentials"],
+            vec!["credentials", "refresh"],
+            vec!["credentials", "reconcile", "--interval"],
+            vec!["credentials", "reconcile", "--interval", "soon"],
+            vec!["credentials", "reconcile", "--once", "--interval", "30s"],
+            vec!["credentials", "reconcile", "--nope"],
             vec!["server"],
             vec!["server", "start"],
             vec!["sessions"],
