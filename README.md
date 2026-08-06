@@ -1,6 +1,6 @@
 # vaultr
 
-Stay on top of life and work with Vault session utilities and Plant's local capture service.
+Stay on top of life and work with Vault session utilities and Plant's local capture and scheduling service.
 
 ## NixOS
 
