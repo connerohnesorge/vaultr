@@ -320,14 +320,16 @@ lifecycle during reconciliation.
 
 ### Requirement: Recoverable keyed Agent Run identity
 
-Plant MUST persist recoverable execution identity in each keyed Agent Run receipt.
-The identity MUST include the Herdr workspace, pane, captured session, and observed lifecycle stage.
-Plant MUST reconcile a pending receipt against that exact identity.
-Plant MUST NOT use receipt age as execution evidence.
-Plant MUST NOT create another workspace while the recorded execution can still finish.
-Plant MUST retain the fence when Herdr or identity evidence is unavailable.
-Legacy pending receipts MUST require verified operator recovery.
-The Codex Learn wrapper and 15-minute cadence MUST remain unchanged.
+Plant MUST persist a tagged phase-specific checkpoint in each keyed Agent Run
+receipt. The checkpoint MUST preserve the immutable Herdr workspace and pane
+identity. The checkpoint MUST represent terminal-only and session-bound pane
+identity as distinct states. A captured checkpoint MUST include the captured
+session. Plant MUST reconcile a pending receipt against the exact checkpoint
+identity. Plant MUST NOT use receipt age as execution evidence. Plant MUST NOT
+create another workspace while the recorded execution can still finish. Plant
+MUST retain the fence when Herdr or identity evidence is unavailable. Legacy
+pending receipts MUST require verified operator recovery. The Codex Learn
+wrapper and 15-minute cadence MUST remain unchanged.
 
 #### Scenario: The recorded pane remains working
 
@@ -340,7 +342,7 @@ The Codex Learn wrapper and 15-minute cadence MUST remain unchanged.
 #### Scenario: The recorded session completed
 
 - GIVEN Plant restarts with a pending keyed Agent Run receipt
-- AND matching lifecycle identity proves submitted work
+- AND a captured checkpoint proves submitted work
 - AND the matching captured session contains a terminal response
 - WHEN Plant reconciles the receipt
 - THEN Plant persists one conclusive successful receipt
@@ -371,6 +373,20 @@ The Codex Learn wrapper and 15-minute cadence MUST remain unchanged.
 - WHEN Plant reconciles the receipt
 - THEN Plant retains the attempt fence
 - AND Plant names `plant jobs unblock <name>` as the operator recovery
+
+#### Scenario: A terminal-only checkpoint awaits session discovery
+
+- GIVEN a pending keyed Agent Run receipt stores a terminal-only checkpoint
+- WHEN the captured session identifier is not available
+- THEN Plant retains the pending receipt
+- AND Plant does not infer a capture session
+
+#### Scenario: Checkpoint identity is stable
+
+- GIVEN a pending keyed Agent Run receipt stores a checkpoint
+- WHEN a later progress update supplies a different workspace, pane, terminal, or session identity
+- THEN Plant rejects the update
+- AND Plant retains the existing checkpoint
 
 #### Scenario: The current Codex Learn attempt is recovered
 
