@@ -292,6 +292,36 @@ pub(super) fn staging_dir(root: &str, sid: &str) -> PathBuf {
         .join(sid)
 }
 
+fn recovery_index_dir(root: &str) -> PathBuf {
+    crate::state::dir()
+        .join("capture-recovery")
+        .join(vaultr::vault::sha256_hex(root.as_bytes()))
+}
+
+fn pending_marker(root: &str, sid: &str) -> PathBuf {
+    recovery_index_dir(root).join("pending").join(sid)
+}
+
+fn mark_pending(root: &str, sid: &str) -> Result<(), String> {
+    let path = pending_marker(root, sid);
+    let body = serde_json::to_vec(&json!({ "root": root, "session_id": sid }))
+        .map_err(|error| error.to_string())?;
+    crate::state::atomic_write(&path, &body)
+        .map_err(|error| format!("capture recovery: write marker {}: {error}", path.display()))
+}
+
+fn clear_pending(root: &str, sid: &str) -> Result<(), String> {
+    let path = pending_marker(root, sid);
+    match fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "capture recovery: remove marker {}: {error}",
+            path.display()
+        )),
+    }
+}
+
 #[derive(Clone)]
 struct Stage {
     path: PathBuf,
@@ -493,6 +523,7 @@ fn drain(root: &str, sid: &str, journal: &mut Journal) -> Result<(), String> {
     loop {
         let sequence = journal.require_order()?.next_to_drain;
         if sequence >= journal.require_order()?.next_sequence {
+            clear_pending(root, sid)?;
             break;
         }
         let Some(stage) = stages.remove(&sequence) else {
@@ -518,6 +549,7 @@ pub(super) async fn reserve(
     let (request, state) = build(&prior);
     let sequence = journal.reserve(root, request.clone())?;
     journal.replace_state(state);
+    mark_pending(root, sid)?;
     journal.persist()?;
     Ok((sequence, request, register_active(root, sid, sequence)))
 }
@@ -704,7 +736,7 @@ impl RecoverySession {
                 }
             }
         }
-        Ok(())
+        clear_pending(&self.root, &self.sid)
     }
 }
 
@@ -717,6 +749,109 @@ pub(crate) fn recover_all(vault: &Path) -> Result<(), String> {
 pub(crate) fn recover_live(vault: &Path, min_age: std::time::Duration) -> Result<(), String> {
     let cutoff = super::iso_at(std::time::SystemTime::now() - min_age);
     recover(vault, Some(cutoff.as_str()))
+}
+
+fn initialize_recovery_index(
+    root: &str,
+    directories: &BTreeMap<String, PathBuf>,
+) -> Result<(), String> {
+    let index = recovery_index_dir(root).join("indexed-v1");
+    match fs::read(&index) {
+        Ok(contents) if contents == root.as_bytes() => return Ok(()),
+        Ok(_) => {
+            return Err(format!(
+                "capture recovery: index identity mismatch at {}",
+                index.display()
+            ))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "capture recovery: read index {}: {error}",
+                index.display()
+            ))
+        }
+    }
+    for (sid, directory) in directories {
+        if !directory.join("state.json").exists() {
+            continue;
+        }
+        let journal = Journal::load(directory, sid)?;
+        if journal
+            .order
+            .as_ref()
+            .is_some_and(|order| order.next_to_drain < order.next_sequence)
+        {
+            mark_pending(root, sid)?;
+        }
+        drop(journal);
+        super::release_memory();
+    }
+    crate::state::atomic_write(&index, root.as_bytes())
+        .map_err(|error| format!("capture recovery: write index {}: {error}", index.display()))
+}
+
+fn indexed_pending_sessions(root: &str) -> Result<BTreeSet<String>, String> {
+    let directory = recovery_index_dir(root).join("pending");
+    let entries = match fs::read_dir(&directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
+        Err(error) => {
+            return Err(format!(
+                "capture recovery: read marker directory {}: {error}",
+                directory.display()
+            ))
+        }
+    };
+    let mut sessions = BTreeSet::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "capture recovery: read marker under {}: {error}",
+                directory.display()
+            )
+        })?;
+        let path = entry.path();
+        if !entry
+            .file_type()
+            .map_err(|error| {
+                format!(
+                    "capture recovery: inspect marker {}: {error}",
+                    path.display()
+                )
+            })?
+            .is_file()
+        {
+            return Err(format!(
+                "capture recovery: unexpected marker entry at {}",
+                path.display()
+            ));
+        }
+        let sid = entry
+            .file_name()
+            .to_str()
+            .ok_or_else(|| {
+                format!(
+                    "capture recovery: invalid marker name at {}",
+                    path.display()
+                )
+            })?
+            .to_string();
+        let marker: Value = serde_json::from_slice(&fs::read(&path).map_err(|error| {
+            format!("capture recovery: read marker {}: {error}", path.display())
+        })?)
+        .map_err(|error| format!("capture recovery: parse marker {}: {error}", path.display()))?;
+        if marker.get("root").and_then(Value::as_str) != Some(root)
+            || marker.get("session_id").and_then(Value::as_str) != Some(sid.as_str())
+        {
+            return Err(format!(
+                "capture recovery: marker identity mismatch at {}",
+                path.display()
+            ));
+        }
+        sessions.insert(sid);
+    }
+    Ok(sessions)
 }
 
 fn recover(vault: &Path, live_cutoff: Option<&str>) -> Result<(), String> {
@@ -747,30 +882,18 @@ fn recover(vault: &Path, live_cutoff: Option<&str>) -> Result<(), String> {
     }
     let root = canonical_root(vault);
     let mut directories = BTreeMap::new();
-    let mut journals = BTreeMap::new();
-    let mut sessions = BTreeSet::new();
     for (sid, directory) in
         vaultr::vault::walk_session_dirs(vault).map_err(|error| error.to_string())?
     {
-        if directories.insert(sid.clone(), directory.clone()).is_some() {
+        if directories.insert(sid.clone(), directory).is_some() {
             return Err(format!(
                 "capture recovery: duplicate session {sid} under {}",
                 vault.display()
             ));
         }
-        if !directory.join("state.json").exists() {
-            continue;
-        }
-        let journal = Journal::load(&directory, &sid)?;
-        if journal
-            .order
-            .as_ref()
-            .is_some_and(|order| order.next_to_drain < order.next_sequence)
-        {
-            sessions.insert(sid.clone());
-        }
-        journals.insert(sid, journal);
     }
+    initialize_recovery_index(&root, &directories)?;
+    let mut sessions = indexed_pending_sessions(&root)?;
 
     let hash_dir = staging_base().join(vaultr::vault::sha256_hex(root.as_bytes()));
     if hash_dir.exists() {
@@ -837,29 +960,59 @@ fn recover(vault: &Path, live_cutoff: Option<&str>) -> Result<(), String> {
 
     let mut inventory = Vec::new();
     for sid in sessions {
-        let directory = directories.get(&sid).ok_or_else(|| {
-            format!(
-                "capture recovery: staged session {sid} has no discovered directory under {}",
-                vault.display()
-            )
-        })?;
-        journals.remove(&sid).ok_or_else(|| {
-            format!(
-                "capture recovery: staged session {sid} has no journal at {}",
-                directory.display()
-            )
-        })?;
+        let Some(directory) = directories.get(&sid) else {
+            let stage_directory = staging_dir(&root, &sid);
+            let has_stages = match fs::read_dir(&stage_directory) {
+                Ok(mut entries) => entries
+                    .next()
+                    .transpose()
+                    .map_err(|error| {
+                        format!(
+                            "capture recovery: read staged session {}: {error}",
+                            stage_directory.display()
+                        )
+                    })?
+                    .is_some(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => {
+                    return Err(format!(
+                        "capture recovery: read staged session {}: {error}",
+                        stage_directory.display()
+                    ))
+                }
+            };
+            if has_stages {
+                return Err(format!(
+                    "capture recovery: staged session {sid} has no discovered directory under {}",
+                    vault.display()
+                ));
+            }
+            clear_pending(&root, &sid)?;
+            continue;
+        };
+        let state = directory.join("state.json");
+        if !state.exists() {
+            clear_pending(&root, &sid)?;
+            continue;
+        }
         let directory_lock = SessionDirectory::open(directory)?;
         directory_lock.lock_exclusive()?;
         let journal = Journal::load(directory, &sid)?;
-        let order = journal.require_order()?;
+        let Some(order) = journal.order.as_ref() else {
+            clear_pending(&root, &sid)?;
+            continue;
+        };
         if order.root != root {
             return Err(format!(
                 "capture recovery: journal vault identity mismatch at {}",
-                directory.join("state.json").display()
+                state.display()
             ));
         }
         let stages = read_stages(&root, &sid, &journal, true)?;
+        if order.next_to_drain >= order.next_sequence && stages.is_empty() {
+            clear_pending(&root, &sid)?;
+            continue;
+        }
         inventory.push(RecoverySession {
             sid,
             root: root.clone(),
