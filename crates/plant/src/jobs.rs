@@ -948,9 +948,19 @@ async fn execute_script_with_timeout(
 }
 
 async fn execute_compression(vault: &Path) -> JobExecution {
-    match crate::sweep::compress_sweep(vault, Duration::from_secs(3600)).await {
-        Ok(()) => JobExecution::Succeeded("in-process compression complete".to_string()),
-        Err(error) => JobExecution::Failed(format!("in-process compression failed: {error}")),
+    let vault = vault.to_path_buf();
+    let runtime = tokio::runtime::Handle::current();
+    match tokio::task::spawn_blocking(move || {
+        runtime.block_on(crate::sweep::compress_sweep(
+            &vault,
+            Duration::from_secs(3600),
+        ))
+    })
+    .await
+    {
+        Ok(Ok(())) => JobExecution::Succeeded("in-process compression complete".to_string()),
+        Ok(Err(error)) => JobExecution::Failed(format!("in-process compression failed: {error}")),
+        Err(error) => JobExecution::Failed(format!("compression task failed: {error}")),
     }
 }
 
