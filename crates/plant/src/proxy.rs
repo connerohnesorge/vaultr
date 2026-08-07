@@ -412,33 +412,16 @@ async fn handle_origin(
     let capturing = adapter.captures(&method, &path) && raw.is_some();
     let pending: Option<capture::PendingCapture> = if capturing {
         let _permit = DOM_GATE.acquire().await;
-        let raw = raw.as_ref().unwrap();
-        let content_encoding = req_headers
-            .get("content-encoding")
-            .and_then(|v| v.to_str().ok())
-            .map(String::from);
-        let prepared = decode_bytes(raw, content_encoding.as_deref())
-            .map_err(|e| e.to_string())
-            .and_then(|decoded| {
-                let body: Value = serde_json::from_slice(&decoded).map_err(|e| e.to_string())?;
-                let ids = adapter.identity(&req_headers, &body);
-                let req_info = CapturedRequest {
-                    method,
-                    path,
-                    content_encoding,
-                    body_sha256: vaultr::vault::sha256_hex(&decoded),
-                    ids,
-                    started_at,
-                };
-                drop(decoded);
-                Ok((req_info, body))
-            });
-        let prepared = match prepared {
-            Ok((req_info, body)) => {
-                capture::prepare_capture(&ctx.vault, adapter, req_info, body).await
-            }
-            Err(e) => Err(e),
-        };
+        let prepared = prepare_http_capture(
+            ctx.vault.clone(),
+            adapter.clone(),
+            req_headers,
+            raw.as_ref().unwrap().clone(),
+            method,
+            path,
+            started_at,
+        )
+        .await;
         capture::release_memory();
         match prepared {
             Ok(p) => Some(p),
@@ -526,7 +509,14 @@ async fn handle_origin(
             capture::release_memory();
             return;
         }
-        if let Err(e) = capture::finish_capture(&ctx2.vault, &ctx2.adapter, pending, &resp).await {
+        if let Err(e) = capture::finish_capture_offloaded(
+            ctx2.vault.clone(),
+            ctx2.adapter.clone(),
+            pending,
+            resp,
+        )
+        .await
+        {
             eprintln!("capture failed: {e}");
         }
         capture::release_memory();
@@ -536,6 +526,39 @@ async fn handle_origin(
     resp_builder
         .body(BodyExt::boxed(StreamBody::new(stream)))
         .unwrap()
+}
+
+async fn prepare_http_capture(
+    vault: PathBuf,
+    adapter: Adapter,
+    headers: hyper::HeaderMap,
+    raw: Bytes,
+    method: String,
+    path: String,
+    started_at: SystemTime,
+) -> Result<capture::PendingCapture, String> {
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        let content_encoding = headers
+            .get("content-encoding")
+            .and_then(|value| value.to_str().ok())
+            .map(String::from);
+        let decoded = decode_bytes(&raw, content_encoding.as_deref()).map_err(|e| e.to_string())?;
+        let body: Value = serde_json::from_slice(&decoded).map_err(|e| e.to_string())?;
+        let ids = adapter.identity(&headers, &body);
+        let req_info = CapturedRequest {
+            method,
+            path,
+            content_encoding,
+            body_sha256: vaultr::vault::sha256_hex(&decoded),
+            ids,
+            started_at,
+        };
+        drop(decoded);
+        runtime.block_on(capture::prepare_capture(&vault, &adapter, req_info, body))
+    })
+    .await
+    .map_err(|error| format!("capture preparation task failed: {error}"))?
 }
 
 fn http_upstream_url(adapter: &Adapter, base: &str, path: &str, query: &str) -> String {

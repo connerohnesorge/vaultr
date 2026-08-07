@@ -276,6 +276,20 @@ pub async fn prepare_capture(
     prepare_capture_with_free(vault, adapter, req, body, free).await
 }
 
+pub async fn prepare_capture_offloaded(
+    vault: PathBuf,
+    adapter: Adapter,
+    req: CapturedRequest,
+    body: Value,
+) -> Result<PendingCapture, String> {
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        runtime.block_on(prepare_capture(&vault, &adapter, req, body))
+    })
+    .await
+    .map_err(|error| format!("capture preparation task failed: {error}"))?
+}
+
 async fn prepare_capture_with_free(
     vault: &Path,
     adapter: &Adapter,
@@ -346,6 +360,20 @@ async fn prepare_capture_with_free(
 /// (finish succeeds here even if an earlier live sequence blocks draining), run
 /// the Session Index / Herdr side effects at durable stage acceptance, then
 /// drain every eligible sequence into `turns.jsonl` in preparation order.
+pub async fn finish_capture_offloaded(
+    vault: PathBuf,
+    adapter: Adapter,
+    pending: PendingCapture,
+    response: CapturedResponse,
+) -> Result<(), String> {
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        runtime.block_on(finish_capture(&vault, &adapter, pending, &response))
+    })
+    .await
+    .map_err(|error| format!("capture completion task failed: {error}"))?
+}
+
 pub async fn finish_capture(
     vault: &Path,
     adapter: &Adapter,
