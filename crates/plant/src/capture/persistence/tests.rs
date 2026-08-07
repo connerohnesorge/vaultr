@@ -524,6 +524,72 @@ fn recovery_ignores_an_empty_stage_directory_without_a_journal() {
 }
 
 #[tokio::test]
+async fn pending_index_tracks_a_reservation_until_its_stage_commits() {
+    let state = test_dir("pending-index-state");
+    let _guard = crate::state::use_test_dir(state.clone());
+    let dir = test_dir("pending-index-session");
+    let sid = "00000000-0000-4000-8000-000000000062";
+    let root = "/vault";
+    let mut request = envelope(sid);
+    request.as_object_mut().unwrap().remove("response");
+    let next_state = json!({
+        "schema_version": 1,
+        "harness": "claude-code",
+        "session_id": sid,
+        "request_body": {}
+    })
+    .as_object()
+    .unwrap()
+    .clone();
+
+    let (sequence, mut request, _active) = reserve(&dir, root, sid, |_| (request, next_state))
+        .await
+        .unwrap();
+    assert!(pending_marker(root, sid).exists());
+
+    request["response"] = json!({"complete": true});
+    commit_completed(&dir, root, sid, sequence, request, || {})
+        .await
+        .unwrap();
+
+    assert!(!pending_marker(root, sid).exists());
+    fs::remove_dir_all(dir).unwrap();
+    fs::remove_dir_all(state).unwrap();
+}
+
+#[test]
+fn initialized_recovery_index_does_not_reload_clean_journals() {
+    let state = test_dir("clean-index-state");
+    let _guard = crate::state::use_test_dir(state.clone());
+    let root = test_dir("clean-index-vault");
+    let sessions = root.join("sessions");
+    let sid = "00000000-0000-4000-8000-000000000063";
+    let dir = sessions.join("2026/07/20").join(sid);
+    fs::create_dir_all(&dir).unwrap();
+    let root_identity = canonical_root(&sessions);
+    let mut completed = envelope(sid);
+    completed.as_object_mut().unwrap().remove("response");
+    write_ordered_journal(&dir, sid, &root_identity, &completed);
+    {
+        let mut journal = Journal::load(&dir, sid).unwrap();
+        journal.require_order_mut().unwrap().next_to_drain = 1;
+        journal.require_order_mut().unwrap().pending.clear();
+        journal.persist().unwrap();
+    }
+
+    recover_all(&sessions).unwrap();
+    assert!(recovery_index_dir(&root_identity)
+        .join("indexed-v1")
+        .exists());
+
+    fs::write(dir.join("state.json"), b"{corrupt clean journal").unwrap();
+    recover_all(&sessions).unwrap();
+
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(state).unwrap();
+}
+
+#[tokio::test]
 async fn recovery_reloads_the_journal_after_a_concurrent_reservation() {
     let state = test_dir("recovery-reload-state");
     let _guard = crate::state::use_test_dir(state.clone());
