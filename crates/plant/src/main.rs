@@ -648,8 +648,13 @@ async fn run_daemon() {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
-                if let Err(error) = capture::recover_live(&vault, min_age) {
-                    eprintln!("[plant] drain sweep failed: {error}");
+                let vault = vault.clone();
+                match tokio::task::spawn_blocking(move || capture::recover_live(&vault, min_age))
+                    .await
+                {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => eprintln!("[plant] drain sweep failed: {error}"),
+                    Err(error) => eprintln!("[plant] drain sweep task failed: {error}"),
                 }
             }
         });
