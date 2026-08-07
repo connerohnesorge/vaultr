@@ -18,6 +18,7 @@ pub struct TokenUsage {
     pub cache_creation: u64,
 }
 
+#[derive(Clone)]
 pub struct Adapter {
     pub harness: Harness,
     pub port: u16,

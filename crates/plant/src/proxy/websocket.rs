@@ -553,7 +553,9 @@ async fn prepare_turn(
         ids,
         started_at: SystemTime::now(),
     };
-    let prepared = capture::prepare_capture(&ctx.vault, &ctx.adapter, request, body).await;
+    let prepared =
+        capture::prepare_capture_offloaded(ctx.vault.clone(), ctx.adapter.clone(), request, body)
+            .await;
     match prepared {
         Ok(pending) => Some(ActiveTurn {
             pending,
@@ -629,8 +631,13 @@ async fn finish_turn(ctx: &Arc<ProxyCtx>, active: ActiveTurn, transport_complete
         &events,
     );
     drop(events);
-    if let Err(error) =
-        capture::finish_capture(&ctx.vault, &ctx.adapter, active.pending, &response).await
+    if let Err(error) = capture::finish_capture_offloaded(
+        ctx.vault.clone(),
+        ctx.adapter.clone(),
+        active.pending,
+        response,
+    )
+    .await
     {
         eprintln!("WebSocket capture failed: {error}");
     }
