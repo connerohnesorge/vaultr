@@ -2,7 +2,7 @@ use std::fs;
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Child, Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 fn write_job(path: &Path, body: &str) {
@@ -21,6 +21,36 @@ fn run_args(home: &Path, sessions: &Path, args: &[&str]) -> Output {
         .env("VAULT_SESSIONS", sessions)
         .output()
         .unwrap()
+}
+
+fn worker(home: &Path, sessions: &Path, name: &str, path: &Path, capacity: &str) -> Child {
+    let jobs = sessions.parent().unwrap().join("jobs/shared");
+    fs::create_dir_all(&jobs).unwrap();
+    let active_path = jobs.join(format!("{name}.1m.sh"));
+    fs::copy(path, &active_path).unwrap();
+    let path = path.to_str().unwrap();
+    Command::new(env!("CARGO_BIN_EXE_plant"))
+        .args(["jobs", "worker", name, path, "60", capacity, "30"])
+        .env("HOME", home)
+        .env("VAULT_SESSIONS", sessions)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap()
+}
+
+fn wait_for(path: &Path) {
+    for _ in 0..500 {
+        if path.exists() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    panic!("{} did not appear", path.display());
+}
+
+fn signal(child: &Child, signal: i32) {
+    assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
 }
 
 #[test]
@@ -213,6 +243,119 @@ fn manual_compression_command_publishes_a_script_fence() {
         "successful manual completion clears the fence"
     );
 
+    fs::remove_dir_all(tmp).unwrap();
+}
+
+#[test]
+fn terminated_worker_retains_an_unresolved_fence() {
+    let tmp = std::env::temp_dir().join(format!(
+        "plant-worker-fence-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let home = tmp.join("home");
+    let sessions = tmp.join("vault/sessions");
+    let script = tmp.join("stranded.1m.sh");
+    fs::create_dir_all(home.join(".dotfiles")).unwrap();
+    fs::create_dir_all(&sessions).unwrap();
+    write_job(
+        &script,
+        "#!/bin/sh\n touch \"$HOME/worker-started\"\n while [ ! -e \"$HOME/release-worker\" ]; do sleep 0.01; done\n",
+    );
+
+    let mut child = worker(&home, &sessions, "stranded", &script, "1");
+    let fence = home.join(".local/state/plant/job-attempts/stranded.json");
+    wait_for(&home.join("worker-started"));
+    wait_for(&fence);
+    signal(&child, libc::SIGKILL);
+    let status = child.wait().unwrap();
+    assert!(!status.success());
+    assert!(fence.exists());
+    assert!(!home.join(".local/state/plant/jobs/stranded.jsonl").exists());
+
+    fs::write(home.join("release-worker"), "release\n").unwrap();
+    fs::remove_dir_all(tmp).unwrap();
+}
+
+#[test]
+fn worker_capacity_is_shared_across_processes() {
+    let tmp = std::env::temp_dir().join(format!(
+        "plant-worker-capacity-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let home = tmp.join("home");
+    let sessions = tmp.join("vault/sessions");
+    let first_script = tmp.join("first.1m.sh");
+    let second_script = tmp.join("second.1m.sh");
+    fs::create_dir_all(home.join(".dotfiles")).unwrap();
+    fs::create_dir_all(&sessions).unwrap();
+    write_job(
+        &first_script,
+        "#!/bin/sh\n touch \"$HOME/first-started\"\n while [ ! -e \"$HOME/release-first\" ]; do sleep 0.01; done\n",
+    );
+    write_job(&second_script, "#!/bin/sh\n touch \"$HOME/second-ran\"\n");
+
+    let mut first = worker(&home, &sessions, "first", &first_script, "1");
+    wait_for(&home.join("first-started"));
+    let mut second = worker(&home, &sessions, "second", &second_script, "1");
+    assert_eq!(second.wait().unwrap().code(), Some(75));
+    assert!(!home
+        .join(".local/state/plant/job-attempts/second.json")
+        .exists());
+    assert!(!home.join("second-ran").exists());
+
+    fs::write(home.join("release-first"), "release\n").unwrap();
+    assert_eq!(first.wait().unwrap().code(), Some(0));
+    assert!(home.join(".local/state/plant/jobs/first.jsonl").exists());
+    fs::remove_dir_all(tmp).unwrap();
+}
+
+#[test]
+fn same_job_workers_record_one_execution() {
+    let tmp = std::env::temp_dir().join(format!(
+        "plant-worker-same-job-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let home = tmp.join("home");
+    let sessions = tmp.join("vault/sessions");
+    let script = tmp.join("same-job.1m.sh");
+    fs::create_dir_all(home.join(".dotfiles")).unwrap();
+    fs::create_dir_all(&sessions).unwrap();
+    write_job(
+        &script,
+        "#!/bin/sh\n echo called >> \"$HOME/calls\"\n sleep 1\n",
+    );
+
+    let mut first = worker(&home, &sessions, "same-job", &script, "2");
+    wait_for(&home.join(".local/state/plant/job-attempts/same-job.json"));
+    let mut second = worker(&home, &sessions, "same-job", &script, "2");
+    assert_eq!(second.wait().unwrap().code(), Some(75));
+    assert_eq!(first.wait().unwrap().code(), Some(0));
+    assert_eq!(
+        fs::read_to_string(home.join("calls"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert_eq!(
+        fs::read_to_string(home.join(".local/state/plant/jobs/same-job.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
     fs::remove_dir_all(tmp).unwrap();
 }
 
