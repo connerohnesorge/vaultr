@@ -19,6 +19,7 @@
 
 #[cfg(test)]
 use std::collections::HashMap;
+use std::collections::{HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::AsRawFd;
@@ -165,6 +166,19 @@ pub fn load_jobs() -> Vec<Job> {
     load_jobs_at(&dir, short_hostname)
 }
 
+fn active_job_at(dir: &Path, short_hostname: &str, name: &str) -> Option<Job> {
+    load_jobs_at(dir, short_hostname)
+        .into_iter()
+        .find(|job| job.name == name)
+}
+
+fn active_job(name: &str) -> Option<Job> {
+    let dir = jobs_dir()?;
+    let hostname = crate::otel::hostname();
+    let short_hostname = hostname.split('.').next().unwrap_or(&hostname);
+    active_job_at(&dir, short_hostname, name)
+}
+
 /// Panes are kept open by default so failed agent runs stay inspectable; setting
 /// PLANT_KEEP_PANES=0 opts into auto-close honoring the requested cleanup.
 /// Keep-by-default is a recorded product decision (commit 3f9d55e) — do not invert it.
@@ -295,6 +309,36 @@ fn record_is_due(last: Option<u64>, every: Duration, now: u64) -> bool {
     last.is_none_or(|ts| now.saturating_sub(ts) >= every.as_secs())
 }
 
+#[derive(Default)]
+struct DueJobAdmission {
+    pending: VecDeque<String>,
+}
+
+impl DueJobAdmission {
+    fn refresh(&mut self, due: &[String]) {
+        let due_names: HashSet<&str> = due.iter().map(String::as_str).collect();
+        self.pending
+            .retain(|name| due_names.contains(name.as_str()));
+        for name in due {
+            if !self.pending.iter().any(|queued| queued == name) {
+                self.pending.push_back(name.clone());
+            }
+        }
+    }
+
+    fn take(&mut self, turns: usize) -> Vec<String> {
+        (0..turns)
+            .filter_map(|_| self.pending.pop_front())
+            .collect()
+    }
+
+    fn requeue(&mut self, name: String) {
+        if !self.pending.iter().any(|queued| queued == &name) {
+            self.pending.push_back(name);
+        }
+    }
+}
+
 #[derive(Debug, serde::Deserialize, serde::Serialize)]
 struct AttemptFence {
     id: String,
@@ -327,8 +371,34 @@ fn worker_lease_dir() -> PathBuf {
     state_dir().join("job-workers")
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkerClass {
+    Ordinary,
+    Supervisory,
+}
+
+fn worker_class(name: &str) -> WorkerClass {
+    if name == "health" {
+        WorkerClass::Supervisory
+    } else {
+        WorkerClass::Ordinary
+    }
+}
+
 struct WorkerCapacityLease {
     _slot: File,
+}
+
+fn try_acquire_capacity_file(file: File) -> io::Result<Option<WorkerCapacityLease>> {
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(Some(WorkerCapacityLease { _slot: file }));
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::WouldBlock {
+        Ok(None)
+    } else {
+        Err(error)
+    }
 }
 
 /// Acquire one durable scheduler-capacity slot without waiting.
@@ -349,15 +419,38 @@ fn try_acquire_worker_capacity(capacity: usize) -> io::Result<Option<WorkerCapac
             .truncate(false)
             .custom_flags(libc::O_NOFOLLOW)
             .open(dir.join(format!("capacity-{slot}.lock")))?;
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            return Ok(Some(WorkerCapacityLease { _slot: file }));
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::WouldBlock {
-            return Err(error);
+        if let Some(lease) = try_acquire_capacity_file(file)? {
+            return Ok(Some(lease));
         }
     }
     Ok(None)
+}
+
+/// Acquire the single bounded lease reserved for supervisory scheduled work.
+///
+/// This lease is deliberately separate from `capacity-0.lock`, so a health
+/// escalation cannot consume the configured ordinary worker capacity.
+fn try_acquire_supervisory_capacity() -> io::Result<Option<WorkerCapacityLease>> {
+    let dir = worker_lease_dir();
+    ensure_dir_durable(&dir)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dir.join("supervisory.lock"))?;
+    try_acquire_capacity_file(file)
+}
+
+fn try_acquire_job_capacity(
+    job: &Job,
+    normal_capacity: usize,
+) -> io::Result<Option<WorkerCapacityLease>> {
+    match worker_class(&job.name) {
+        WorkerClass::Ordinary => try_acquire_worker_capacity(normal_capacity),
+        WorkerClass::Supervisory => try_acquire_supervisory_capacity(),
+    }
 }
 
 fn write_fence(path: &Path, fence: &AttemptFence) -> io::Result<()> {
@@ -1081,13 +1174,27 @@ async fn dispatch_scheduled_worker(
     capacity: usize,
     script_timeout: Duration,
 ) -> ScheduledDispatch {
-    let Ok(lease) = try_acquire_worker_capacity(capacity) else {
-        eprintln!("[job:{}] scheduled worker capacity lease failed", job.name);
-        return ScheduledDispatch::Blocked;
+    let lease = match try_acquire_job_capacity(job, capacity) {
+        Ok(Some(lease)) => {
+            eprintln!("[job:{}] scheduled worker capacity admitted", job.name);
+            lease
+        }
+        Ok(None) => {
+            eprintln!(
+                "[job:{}] scheduled worker capacity rejected: no available capacity",
+                job.name
+            );
+            return ScheduledDispatch::Blocked;
+        }
+        Err(error) => {
+            eprintln!(
+                "[job:{}] scheduled worker capacity lease failed: {error}",
+                job.name
+            );
+            return ScheduledDispatch::Blocked;
+        }
     };
-    let Some(_lease) = lease else {
-        return ScheduledDispatch::Blocked;
-    };
+    let _lease = lease;
     dispatch_admitted(job, vault, script_timeout).await
 }
 
@@ -1095,11 +1202,12 @@ async fn dispatch_scheduled_worker(
 /// Compression remains in the listener-owning daemon and never enters this
 /// worker boundary.
 pub async fn run_scheduled_worker(args: crate::cli::ScheduledWorkerArgs) -> i32 {
-    let job = Job {
-        name: args.name,
-        path: args.path,
-        every: args.every,
-        action: JobAction::Script,
+    let Some(job) = active_job(&args.name) else {
+        eprintln!(
+            "[job:{}] scheduled worker skipped: no active job definition",
+            args.name
+        );
+        return 0;
     };
     let vault = PathBuf::new();
     match dispatch_scheduled_worker(&job, &vault, args.capacity, args.timeout).await {
@@ -1165,6 +1273,7 @@ pub async fn scheduler(cfg: Cfg, vault: PathBuf) {
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
     let mut last_seen: Option<Vec<String>> = None;
+    let mut admission = DueJobAdmission::default();
     tokio::time::sleep(Duration::from_secs(15)).await; // startup settle
     loop {
         let jobs = load_jobs();
@@ -1185,15 +1294,8 @@ pub async fn scheduler(cfg: Cfg, vault: PathBuf) {
             }
             last_seen = Some(names);
         }
+        let mut due_jobs = Vec::new();
         for job in jobs {
-            match attempt_lock_held(&job.name) {
-                Ok(true) => continue,
-                Ok(false) => {}
-                Err(error) => {
-                    eprintln!("[job:{}] worker lease check failed: {error}", job.name);
-                    continue;
-                }
-            }
             let due = match last_record_ts(&job.name) {
                 Ok(last) => record_is_due(last, job.every, epoch_now()),
                 Err(e) => {
@@ -1204,6 +1306,26 @@ pub async fn scheduler(cfg: Cfg, vault: PathBuf) {
             if !due {
                 continue;
             }
+            due_jobs.push(job);
+        }
+        let due_names: Vec<String> = due_jobs.iter().map(|job| job.name.clone()).collect();
+        admission.refresh(&due_names);
+        for name in admission.take(cap) {
+            let Some(job) = due_jobs.iter().find(|job| job.name == name).cloned() else {
+                continue;
+            };
+            match attempt_lock_held(&job.name) {
+                Ok(true) => {
+                    admission.requeue(name);
+                    continue;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    eprintln!("[job:{}] worker lease check failed: {error}", job.name);
+                    admission.requeue(name);
+                    continue;
+                }
+            }
             if job.action == JobAction::InProcessCompression {
                 let vault = vault.clone();
                 tokio::spawn(async move {
@@ -1211,6 +1333,7 @@ pub async fn scheduler(cfg: Cfg, vault: PathBuf) {
                 });
             } else if let Err(error) = spawn_scheduled_worker(&job, cap, SCRIPT_BACKSTOP) {
                 eprintln!("[job:{}] worker spawn failed: {error}", job.name);
+                admission.requeue(name);
             }
         }
         tokio::time::sleep(Duration::from_secs(60)).await;
@@ -1471,6 +1594,31 @@ mod tests {
             .unwrap();
         assert_eq!(mac_health.every, Duration::from_secs(900));
 
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn active_job_resolves_replacement_and_rejects_removed_path() {
+        let root = std::env::temp_dir().join(format!("plant-job-active-{}", uuid::Uuid::new_v4()));
+        let shared = root.join("shared");
+        let host = root.join("CB14957");
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::create_dir_all(&host).unwrap();
+        let stale = shared.join("verify.5m.sh");
+        let replacement = host.join("verify.30m.sh");
+        std::fs::write(&stale, "").unwrap();
+
+        let discovered = active_job_at(&root, "CB14957", "verify").unwrap();
+        assert_eq!(discovered.path, stale);
+
+        std::fs::remove_file(&stale).unwrap();
+        std::fs::write(&replacement, "").unwrap();
+        let resolved = active_job_at(&root, "CB14957", "verify").unwrap();
+        assert_eq!(resolved.path, replacement);
+        assert_eq!(resolved.every, Duration::from_secs(30 * 60));
+
+        std::fs::remove_file(&replacement).unwrap();
+        assert!(active_job_at(&root, "CB14957", "verify").is_none());
         std::fs::remove_dir_all(root).unwrap();
     }
 

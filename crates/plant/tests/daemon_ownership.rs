@@ -379,3 +379,75 @@ fn daemon_scheduler_runs_compression_in_process_and_records_conflicts() {
     stop(&mut daemon);
     fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn scheduled_worker_survives_daemon_termination() {
+    let root = temp_root("scheduled-worker-lifetime");
+    let home = root.join("home");
+    let sessions = root.join("vault/sessions");
+    let jobs = root.join("vault/jobs/shared");
+    let script = jobs.join("worker-lifetime.1m.sh");
+    let started = root.join("worker-started");
+    let release = root.join("release-worker");
+    let finished = root.join("worker-finished");
+    fs::create_dir_all(home.join(".dotfiles")).unwrap();
+    fs::create_dir_all(&jobs).unwrap();
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ntouch '{}'\nwhile [ ! -e '{}' ]; do sleep 0.01; done\ntouch '{}'\n",
+            started.display(),
+            release.display(),
+            finished.display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (claude_port, codex_port) = free_ports();
+    let mut daemon = command(&home, &sessions, claude_port, codex_port)
+        .env("PLANT_JOBS", "1")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_healthy(claude_port, codex_port);
+
+    for _ in 0..300 {
+        if started.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(started.exists(), "scheduled worker did not start");
+    assert_eq!(unsafe { libc::kill(daemon.id() as i32, libc::SIGTERM) }, 0);
+    let daemon_status = daemon.wait().unwrap();
+    assert!(daemon_status.success(), "daemon: {daemon_status}");
+
+    fs::write(&release, "release\n").unwrap();
+    for _ in 0..100 {
+        if finished.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(
+        finished.exists(),
+        "worker did not outlive daemon termination"
+    );
+    let fence = home.join(".local/state/plant/job-attempts/worker-lifetime.json");
+    for _ in 0..100 {
+        if !fence.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let ledger = home.join(".local/state/plant/jobs/worker-lifetime.jsonl");
+    let record: serde_json::Value =
+        serde_json::from_str(fs::read_to_string(&ledger).unwrap().lines().next().unwrap()).unwrap();
+    assert_eq!(record["outcome"], "success");
+    assert!(!fence.exists());
+
+    fs::remove_dir_all(root).unwrap();
+}

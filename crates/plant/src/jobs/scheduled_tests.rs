@@ -1,6 +1,57 @@
 use super::*;
 use std::os::unix::fs::PermissionsExt;
 
+#[test]
+fn one_slot_admission_gives_door_teams_the_next_turn() {
+    let due = [
+        "compress".to_string(),
+        "door-teams".to_string(),
+        "outbox-alert".to_string(),
+    ];
+    let mut admission = DueJobAdmission::default();
+    admission.refresh(&due);
+
+    assert_eq!(admission.take(1), vec!["compress"]);
+    admission.requeue("compress".to_string());
+    assert_eq!(admission.take(1), vec!["door-teams"]);
+}
+
+#[test]
+fn repeated_capacity_rejection_rotates_due_jobs() {
+    let due = ["door-teams".to_string(), "outbox-alert".to_string()];
+    let mut admission = DueJobAdmission::default();
+    admission.refresh(&due);
+
+    for expected in ["door-teams", "outbox-alert", "door-teams"] {
+        let selected = admission.take(1);
+        assert_eq!(selected, vec![expected]);
+        admission.requeue(expected.to_string());
+    }
+}
+
+#[test]
+fn restart_rebuilds_admission_from_due_jobs() {
+    let due = ["door-teams".to_string(), "outbox-alert".to_string()];
+    let mut admission = DueJobAdmission::default();
+    admission.refresh(&due);
+    assert_eq!(admission.take(1), vec!["door-teams"]);
+
+    let mut restarted = DueJobAdmission::default();
+    restarted.refresh(&due);
+    assert_eq!(restarted.take(1), vec!["door-teams"]);
+}
+
+#[test]
+fn unresolved_fence_does_not_remove_door_teams_from_admission() {
+    let due = ["capture-audit".to_string(), "door-teams".to_string()];
+    let mut admission = DueJobAdmission::default();
+    admission.refresh(&due);
+
+    assert_eq!(admission.take(1), vec!["capture-audit"]);
+    admission.requeue("capture-audit".to_string());
+    assert_eq!(admission.take(1), vec!["door-teams"]);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn capacity_wait_cancellation_leaves_no_attempt_fence() {
     let root =
@@ -51,6 +102,223 @@ async fn cross_process_capacity_lease_is_bounded() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn supervisory_capacity_is_bounded_and_separate_from_normal_capacity() {
+    let root = std::env::temp_dir().join(format!(
+        "plant-supervisory-capacity-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let state = root.join("state");
+    let _state = crate::state::use_test_dir(state);
+
+    assert_eq!(worker_class("health"), WorkerClass::Supervisory);
+    assert_eq!(worker_class("teams-sync"), WorkerClass::Ordinary);
+
+    let supervisory = try_acquire_supervisory_capacity().unwrap().unwrap();
+    assert!(
+        try_acquire_supervisory_capacity().unwrap().is_none(),
+        "a second health worker cannot acquire the supervisory lease"
+    );
+    let ordinary = try_acquire_worker_capacity(1)
+        .unwrap()
+        .expect("health must not consume normal capacity");
+
+    drop(ordinary);
+    drop(supervisory);
+    assert!(try_acquire_supervisory_capacity().unwrap().is_some());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn health_escalation_does_not_block_sync_jobs() {
+    let root = std::env::temp_dir().join(format!(
+        "plant-health-teams-capacity-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let sessions = root.join("vault/sessions");
+    let state = root.join("state");
+    let health_started = root.join("health-started");
+    let release_health = root.join("release-health");
+    let teams_called = root.join("teams-called");
+    let outlook_called = root.join("outlook-called");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let _state = crate::state::use_test_dir(state.clone());
+    let _cwd = use_test_script_cwd(root.clone());
+
+    let health_path = root.join("health.15m.sh");
+    std::fs::write(
+        &health_path,
+        format!(
+            "#!/bin/sh\ntouch '{}'\nwhile [ ! -e '{}' ]; do sleep 0.01; done\n",
+            health_started.display(),
+            release_health.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&health_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let health = Job {
+        name: "health".to_string(),
+        path: health_path,
+        every: Duration::from_secs(900),
+        action: JobAction::Script,
+    };
+
+    let teams_path = root.join("teams-sync.30m.ts");
+    std::fs::write(
+        &teams_path,
+        format!("#!/bin/sh\ntouch '{}'\n", teams_called.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&teams_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let teams = Job {
+        name: "teams-sync".to_string(),
+        path: teams_path,
+        every: Duration::from_secs(1800),
+        action: JobAction::Script,
+    };
+
+    let outlook_path = root.join("outlook-sync.30m.sh");
+    std::fs::write(
+        &outlook_path,
+        format!("#!/bin/sh\ntouch '{}'\n", outlook_called.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&outlook_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let outlook = Job {
+        name: "outlook-sync".to_string(),
+        path: outlook_path,
+        every: Duration::from_secs(1800),
+        action: JobAction::Script,
+    };
+
+    let second_health = health.clone();
+    let health_task = tokio::spawn(async move {
+        dispatch_scheduled_worker(&health, &sessions, 1, Duration::from_secs(5)).await
+    });
+    for _ in 0..100 {
+        if health_started.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(health_started.exists(), "health escalation did not start");
+    assert_eq!(
+        dispatch_scheduled_worker(
+            &second_health,
+            &root.join("vault/sessions"),
+            1,
+            Duration::from_secs(5)
+        )
+        .await,
+        ScheduledDispatch::Blocked
+    );
+
+    assert_eq!(
+        dispatch_scheduled_worker(
+            &teams,
+            &root.join("vault/sessions"),
+            1,
+            Duration::from_secs(5)
+        )
+        .await,
+        ScheduledDispatch::Finished(0)
+    );
+    assert!(
+        teams_called.exists(),
+        "teams-sync must execute during health escalation"
+    );
+    let teams_ledger = std::fs::read_to_string(state.join("jobs/teams-sync.jsonl")).unwrap();
+    assert!(teams_ledger.contains("\"outcome\":\"success\""));
+
+    assert_eq!(
+        dispatch_scheduled_worker(
+            &outlook,
+            &root.join("vault/sessions"),
+            1,
+            Duration::from_secs(5)
+        )
+        .await,
+        ScheduledDispatch::Finished(0)
+    );
+    assert!(
+        outlook_called.exists(),
+        "outlook-sync must execute during health escalation"
+    );
+    let outlook_ledger = std::fs::read_to_string(state.join("jobs/outlook-sync.jsonl")).unwrap();
+    assert!(outlook_ledger.contains("\"outcome\":\"success\""));
+
+    std::fs::write(&release_health, b"release").unwrap();
+    assert_eq!(health_task.await.unwrap(), ScheduledDispatch::Finished(0));
+    assert!(state.join("jobs/health.jsonl").exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn failed_health_escalation_releases_supervisory_capacity() {
+    let root = std::env::temp_dir().join(format!(
+        "plant-health-capacity-release-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let sessions = root.join("vault/sessions");
+    let state = root.join("state");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let _state = crate::state::use_test_dir(state.clone());
+    let _cwd = use_test_script_cwd(root.clone());
+
+    let health_path = root.join("health.15m.sh");
+    std::fs::write(&health_path, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&health_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let health = Job {
+        name: "health".to_string(),
+        path: health_path,
+        every: Duration::from_secs(900),
+        action: JobAction::Script,
+    };
+
+    assert_eq!(
+        dispatch_scheduled_worker(&health, &sessions, 1, Duration::from_secs(5)).await,
+        ScheduledDispatch::Finished(1)
+    );
+    let ledger = std::fs::read_to_string(state.join("jobs/health.jsonl")).unwrap();
+    assert!(ledger.contains("\"outcome\":\"failed\""));
+    assert!(!state.join("job-attempts/health.json").exists());
+    assert!(
+        try_acquire_supervisory_capacity().unwrap().is_some(),
+        "health failure must release supervisory capacity"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn failed_compression_releases_normal_capacity() {
+    let root = std::env::temp_dir().join(format!(
+        "plant-compression-capacity-release-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let sessions = root.join("vault/sessions");
+    let state = root.join("state");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let _state = crate::state::use_test_dir(state.clone());
+    let job = Job {
+        name: "compress".to_string(),
+        path: root.join("compress.30m.sh"),
+        every: Duration::from_secs(1800),
+        action: JobAction::InProcessCompression,
+    };
+
+    assert_eq!(
+        dispatch_scheduled_worker(&job, &root.join("missing-vault"), 1, SCRIPT_BACKSTOP).await,
+        ScheduledDispatch::Finished(1)
+    );
+    let ledger = std::fs::read_to_string(state.join("jobs/compress.jsonl")).unwrap();
+    assert!(ledger.contains("\"outcome\":\"failed\""));
+    assert!(
+        try_acquire_worker_capacity(1).unwrap().is_some(),
+        "compression failure must release normal capacity"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn worker_without_capacity_publishes_no_attempt_fence() {
     let root =
         std::env::temp_dir().join(format!("plant-worker-no-capacity-{}", uuid::Uuid::new_v4()));
@@ -58,10 +326,14 @@ async fn worker_without_capacity_publishes_no_attempt_fence() {
     let sessions = root.join("vault/sessions");
     std::fs::create_dir_all(&sessions).unwrap();
     let _state = crate::state::use_test_dir(state.clone());
+    let _cwd = use_test_script_cwd(root.clone());
+    let script = root.join("door-teams.30m.ts");
+    std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
     let job = Job {
-        name: "waiting".to_string(),
-        path: root.join("waiting.1m.sh"),
-        every: Duration::from_secs(60),
+        name: "door-teams".to_string(),
+        path: script,
+        every: Duration::from_secs(1800),
         action: JobAction::Script,
     };
     let occupied = try_acquire_worker_capacity(1).unwrap().unwrap();
@@ -70,8 +342,17 @@ async fn worker_without_capacity_publishes_no_attempt_fence() {
         dispatch_scheduled_worker(&job, &sessions, 1, SCRIPT_BACKSTOP).await,
         ScheduledDispatch::Blocked
     );
-    assert!(!state.join("job-attempts/waiting.json").exists());
+    assert!(!state.join("job-attempts/door-teams.json").exists());
+    assert!(!state.join("jobs/door-teams.jsonl").exists());
     drop(occupied);
+
+    assert_eq!(
+        dispatch_scheduled_worker(&job, &sessions, 1, SCRIPT_BACKSTOP).await,
+        ScheduledDispatch::Finished(0)
+    );
+    assert!(std::fs::read_to_string(state.join("jobs/door-teams.jsonl"))
+        .unwrap()
+        .contains("\"outcome\":\"success\""));
 
     std::fs::remove_dir_all(root).unwrap();
 }
