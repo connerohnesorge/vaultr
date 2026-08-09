@@ -21,7 +21,7 @@ mod state;
 mod sweep;
 
 use cli::Command;
-use domain::Harness;
+use domain::AgentCli;
 use proxy::ProxyCtx;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -45,7 +45,8 @@ fn usage(error: &str) -> i32 {
     eprintln!("plant: {error}");
     eprintln!(
         "usage: plant [--self-test | server stop | sessions eligible|coverage|stuck ... | \
-         compress once ... | jobs run|unblock <name>|worker ... | agent run --cli claude|codex ... | \
+         compress once ... | jobs run|unblock <name>|worker ... | \
+         agent run --cli claude|codex|prime [--model <m>] [--effort <e>] ... | \
          credentials reconcile [--once | --interval <dur>] [--source <dir>]]"
     );
     2
@@ -286,14 +287,31 @@ async fn dispatch(command: Command) -> i32 {
                 return 1;
             }
 
-            let mut launch =
-                jobs::launch_line(args.cli, args.model.as_deref(), args.args.as_deref());
+            let mut launch = jobs::launch_line(
+                args.cli,
+                args.model.as_deref(),
+                args.effort,
+                args.args.as_deref(),
+            );
             let mut preset_session_id = None;
-            if args.cli == Harness::ClaudeCode {
+            if args.cli == AgentCli::ClaudeCode {
                 let session_id = uuid::Uuid::new_v4().to_string();
                 launch.push_str(&format!(" --session-id '{session_id}'"));
                 preset_session_id = Some(session_id);
             }
+            // prime-agent mints its own session id and publishes it nowhere Herdr can
+            // see, so scope the run to its own session dir and read the id back off
+            // disk once the pane finishes. Without an id plant cannot confirm the
+            // capture completed and reports the run failed, so this is load-bearing,
+            // not bookkeeping.
+            let prime_session_dir = (args.cli == AgentCli::Prime).then(|| {
+                let dir = state::dir()
+                    .join("agent-runs")
+                    .join("prime-sessions")
+                    .join(uuid::Uuid::new_v4().to_string());
+                launch.push_str(&format!(" --session-dir '{}'", dir.display()));
+                dir
+            });
             let vault = vault_root();
             let run = herdr::AgentRun {
                 label: args.label.unwrap_or_else(|| "agent".to_string()),
@@ -305,7 +323,10 @@ async fn dispatch(command: Command) -> i32 {
                 timeout: args.timeout,
                 cleanup: jobs::cleanup_policy(args.cleanup, &jobs::Cfg::load(&vault)),
                 preset_session_id,
-                discover_session_id: args.cli == Harness::Codex,
+                // Herdr-reported agent_session is a codex-only route: claude presets its
+                // own id above and prime reads one off disk (see prime_session_dir).
+                discover_session_id: args.cli == AgentCli::Codex,
+                prime_session_dir,
                 env: std::env::var("VAULT_PROJECT_DIGEST")
                     .map(|v| vec![("VAULT_PROJECT_DIGEST".to_string(), v)])
                     .unwrap_or_default(),

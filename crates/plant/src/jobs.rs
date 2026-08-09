@@ -29,7 +29,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::domain::Harness;
+use crate::domain::{AgentCli, Effort};
 use crate::herdr::WorkspaceCleanup;
 use crate::state::{atomic_write, dir as state_dir, ensure_dir_durable, sync_dir};
 
@@ -193,16 +193,28 @@ pub fn cleanup_policy(requested: WorkspaceCleanup, cfg: &Cfg) -> WorkspaceCleanu
 /// Launch line for an agent CLI inside a Herdr pane.
 /// `command` bypasses the user's interactive-shell aliases (a `codex='codex --yolo'`
 /// alias duplicated our flag, clap refused, and the prompt got typed into bare zsh).
-pub fn launch_line(harness: Harness, model: Option<&str>, args: Option<&str>) -> String {
+pub fn launch_line(
+    cli: AgentCli,
+    model: Option<&str>,
+    effort: Option<Effort>,
+    args: Option<&str>,
+) -> String {
     // Stamp PLANT_AGENT=1 into the spawned agent so a nested `plant agent run` (a job-spawned
     // agent that wanders into a job script and copies its dispatch line) is refused — see the
     // guard in the AgentRun handler. Claude's Bash tool inherits the pane env, so a var prefix
     // reaches it. Codex's shell tool uses inherit="core" and strips custom vars, so inject the
     // marker via a set-override (`-c`), which wins last and only applies to this plant launch.
-    let mut s = match harness {
-        Harness::ClaudeCode => {
+    let mut s = match cli {
+        AgentCli::ClaudeCode => {
             "PLANT_AGENT=1 command claude --dangerously-skip-permissions".to_string()
         }
+        // prime-agent has no approval gate to bypass — it never prompts for tool
+        // permission or hook trust — so it needs neither of codex's dangerous-bypass
+        // flags. It also inherits the pane env like Claude, so the marker rides a
+        // plain var prefix. The provider is pinned because `--model` alone is
+        // ambiguous: the same id can exist under more than one provider, and the
+        // machine default provider is not guaranteed to be the one that has it.
+        AgentCli::Prime => "PLANT_AGENT=1 command prime-agent --provider openai-codex".to_string(),
         // sandboxed codex blocks on its first approval prompt — background panes can't answer.
         // --dangerously-bypass-hook-trust is the same problem by a second mechanism: codex
         // requires persisted per-hook trust and prompts "Press t to trust" for any hook it has
@@ -212,17 +224,36 @@ pub fn launch_line(harness: Harness, model: Option<&str>, args: Option<&str>) ->
         // developed on had answered the prompt by hand months earlier, so it only ever appears
         // on a newly provisioned host. The hooks are the box's own dotfiles, which is precisely
         // the "automation that already vets hook sources" the flag documents.
-        Harness::Codex => "command codex --dangerously-bypass-approvals-and-sandbox \
+        AgentCli::Codex => "command codex --dangerously-bypass-approvals-and-sandbox \
              --dangerously-bypass-hook-trust \
-             -c 'shell_environment_policy.set.PLANT_AGENT=\"1\"' \
-             -c model_reasoning_effort=xhigh"
+             -c 'shell_environment_policy.set.PLANT_AGENT=\"1\"'"
             .to_string(),
     };
     if let Some(m) = model {
-        match harness {
-            Harness::ClaudeCode => s.push_str(&format!(" --model='{m}'")),
-            Harness::Codex => s.push_str(&format!(" -m '{m}'")),
+        match cli {
+            AgentCli::ClaudeCode => s.push_str(&format!(" --model='{m}'")),
+            AgentCli::Codex => s.push_str(&format!(" -m '{m}'")),
+            AgentCli::Prime => s.push_str(&format!(" --model '{m}'")),
         }
+    }
+    // Both reasoning CLIs default to something weaker than plant wants and read it
+    // from ambient config (codex from ~/.codex/config.toml, prime-agent from
+    // settings.json — `low` as shipped). Pin it on every launch so a job's effort is
+    // a property of the job, not of whatever the box was last set to by hand.
+    // xhigh rather than max is the floor on purpose: gpt-5.3-codex-spark rejects
+    // max outright, so an unqualified default of max would fail closed on that model.
+    match cli {
+        AgentCli::Codex => s.push_str(&format!(
+            " -c model_reasoning_effort={}",
+            effort.unwrap_or(Effort::XHigh).label()
+        )),
+        AgentCli::Prime => s.push_str(&format!(
+            " --thinking {}",
+            effort.unwrap_or(Effort::XHigh).label()
+        )),
+        // Claude picks reasoning depth per turn; there is no launch-time effort flag,
+        // so an --effort here was rejected during parsing rather than silently dropped.
+        AgentCli::ClaudeCode => {}
     }
     if let Some(a) = args {
         s.push(' ');
@@ -2018,20 +2049,79 @@ mod tests {
     fn launch_line_bypasses_shell_aliases() {
         assert_eq!(
             launch_line(
-                Harness::Codex,
+                AgentCli::Codex,
                 Some("gpt-5.6-sol"),
-                Some("-c model_reasoning_effort=high")
+                Some(Effort::High),
+                None
             ),
             "command codex --dangerously-bypass-approvals-and-sandbox \
              --dangerously-bypass-hook-trust \
              -c 'shell_environment_policy.set.PLANT_AGENT=\"1\"' \
-             -c model_reasoning_effort=xhigh -m 'gpt-5.6-sol' \
-             -c model_reasoning_effort=high"
+             -m 'gpt-5.6-sol' -c model_reasoning_effort=high"
         );
         assert_eq!(
-            launch_line(Harness::ClaudeCode, Some("opus[1m]"), None),
+            launch_line(AgentCli::ClaudeCode, Some("opus[1m]"), None, None),
             "PLANT_AGENT=1 command claude --dangerously-skip-permissions --model='opus[1m]'"
         );
+    }
+
+    /// The whole point of `--effort`: the effort a job asks for is the effort on the
+    /// launch line exactly once. The old `--args '-c model_reasoning_effort=max'`
+    /// idiom emitted the pinned default AND the override and relied on codex's
+    /// last-wins parsing, which reads as a bug every time someone re-derives it.
+    #[test]
+    fn effort_is_rendered_once_in_each_cli_own_spelling() {
+        let codex = launch_line(
+            AgentCli::Codex,
+            Some("gpt-5.6-luna"),
+            Some(Effort::Max),
+            None,
+        );
+        assert!(codex.contains("-c model_reasoning_effort=max"), "{codex}");
+        assert_eq!(
+            codex.matches("model_reasoning_effort").count(),
+            1,
+            "{codex}"
+        );
+
+        let prime = launch_line(
+            AgentCli::Prime,
+            Some("gpt-5.6-luna"),
+            Some(Effort::Max),
+            None,
+        );
+        assert_eq!(
+            prime,
+            "PLANT_AGENT=1 command prime-agent --provider openai-codex \
+             --model 'gpt-5.6-luna' --thinking max"
+        );
+
+        // Absent an explicit effort both CLIs are pinned to the xhigh floor rather
+        // than inheriting the box's ambient setting (prime-agent ships `low`).
+        assert!(launch_line(AgentCli::Codex, None, None, None)
+            .contains("-c model_reasoning_effort=xhigh"));
+        assert!(launch_line(AgentCli::Prime, None, None, None).contains("--thinking xhigh"));
+    }
+
+    /// prime-agent has no approval or hook-trust gate, so it must NOT inherit codex's
+    /// bypass flags — passing them would abort the launch on an unknown argument and
+    /// the pane would sit at a shell prompt that never makes an API call.
+    #[test]
+    fn prime_launch_carries_no_codex_only_bypasses() {
+        let line = launch_line(
+            AgentCli::Prime,
+            Some("gpt-5.6-luna"),
+            Some(Effort::Max),
+            None,
+        );
+        for flag in [
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--dangerously-bypass-hook-trust",
+            "--dangerously-skip-permissions",
+        ] {
+            assert!(!line.contains(flag), "{flag} leaked onto: {line}");
+        }
+        assert!(line.starts_with("PLANT_AGENT=1 "), "{line}");
     }
 
     /// Every prompt codex can raise before its first API call is fatal to a background pane:
@@ -2040,7 +2130,7 @@ mod tests {
     /// the bypasses are on the launch line rather than trusting local state.
     #[test]
     fn codex_launch_answers_every_prompt_a_background_pane_cannot() {
-        let line = launch_line(Harness::Codex, None, None);
+        let line = launch_line(AgentCli::Codex, None, None, None);
         for flag in [
             "--dangerously-bypass-approvals-and-sandbox",
             "--dangerously-bypass-hook-trust",

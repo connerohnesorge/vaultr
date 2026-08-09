@@ -149,9 +149,15 @@ impl Adapter {
                         .map(|s| Value::String(s.to_string()))
                         .or_else(|| client.get("x-codex-turn-metadata").cloned()),
                 );
+                // Two clients speak this Responses dialect and spell the identity headers
+                // differently: the codex CLI sends `session-id`/`thread-id`, prime-agent
+                // sends the same values as `session_id`/`x-client-request-id`. Accept the
+                // underscore spelling too, or every prime-agent turn is dropped with
+                // "codex request has no session identity" and never reaches the vault.
                 let pick = |hdr: &str, keys: [&str; 1]| -> Option<String> {
                     header_str(headers, hdr)
                         .filter(|s| is_uuid(s))
+                        .or_else(|| header_str(headers, keys[0]).filter(|s| is_uuid(s)))
                         .map(String::from)
                         .or_else(|| id_field(&turn, keys[0]))
                         .or_else(|| id_field(&client, keys[0]))
@@ -322,6 +328,40 @@ mod tests {
         assert_eq!(
             x.upstream_path("/prefix/codex/responses"),
             "/prefix/codex/responses"
+        );
+    }
+
+    #[test]
+    fn codex_identity_accepts_both_client_header_spellings() {
+        let codex = codex();
+        let sid = "019fe783-95e3-71fa-8d03-44b947a6c8f6";
+        let body = serde_json::json!({});
+
+        // codex CLI spelling
+        let mut hyphen = hyper::HeaderMap::new();
+        hyphen.insert("session-id", sid.parse().unwrap());
+        assert_eq!(
+            codex.identity(&hyphen, &body).session_id.as_deref(),
+            Some(sid)
+        );
+
+        // prime-agent spelling — without this the turn is dropped for want of identity
+        let mut underscore = hyper::HeaderMap::new();
+        underscore.insert("session_id", sid.parse().unwrap());
+        assert_eq!(
+            codex.identity(&underscore, &body).session_id.as_deref(),
+            Some(sid)
+        );
+
+        // a non-uuid in either spelling is still not an identity
+        let mut junk = hyper::HeaderMap::new();
+        junk.insert("session_id", "not-a-uuid".parse().unwrap());
+        assert_eq!(codex.identity(&junk, &body).session_id, None);
+
+        // neither spelling present stays absent rather than inventing one
+        assert_eq!(
+            codex.identity(&hyper::HeaderMap::new(), &body).session_id,
+            None
         );
     }
 
