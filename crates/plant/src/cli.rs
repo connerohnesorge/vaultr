@@ -234,6 +234,21 @@ fn parse_agent(args: &[String]) -> Result<AgentRunArgs, String> {
     if cli == AgentCli::ClaudeCode && effort.is_some() {
         return Err("agent run: --effort is not supported for --cli claude".to_string());
     }
+    // One way to set effort, not two. Hand-writing the agent's native effort flag into
+    // --args was the old idiom: it emitted the flag twice (plant pins its own default
+    // first) and leaned on the agent's last-wins parsing, so a typo silently ran at the
+    // box's ambient effort while the job read as configured. Refusing it here means the
+    // idiom cannot come back one job at a time.
+    if let Some(extra) = extra_args.as_deref() {
+        for needle in ["model_reasoning_effort", "--thinking"] {
+            if extra.contains(needle) {
+                return Err(format!(
+                    "agent run: --args carries {needle}; set reasoning effort with --effort \
+                     <minimal|low|medium|high|xhigh|max> instead"
+                ));
+            }
+        }
+    }
     Ok(AgentRunArgs {
         cli,
         model,
@@ -452,6 +467,39 @@ mod tests {
             "agent", "run", "--cli", "claude", "--effort", "max"
         ]))
         .is_err());
+    }
+
+    /// The dual idiom is gone, not merely discouraged: --args may still carry genuinely
+    /// CLI-specific extras, but not the effort flag, in either CLI's spelling.
+    #[test]
+    fn args_may_not_smuggle_the_effort_flag_back_in() {
+        for (cli, smuggled) in [
+            ("codex", "-c model_reasoning_effort=max"),
+            ("prime", "--thinking max"),
+        ] {
+            let err = parse_command(&argv(&["agent", "run", "--cli", cli, "--args", smuggled]))
+                .expect_err("effort in --args must be refused");
+            assert!(err.contains("--effort"), "{err}");
+        }
+
+        // unrelated --args still pass through untouched
+        let Ok(Command::AgentRun(args)) = parse_command(&argv(&[
+            "agent",
+            "run",
+            "--cli",
+            "codex",
+            "--effort",
+            "max",
+            "--args",
+            "--dangerously-bypass-hook-trust -c 'hooks.Stop=[]'",
+        ])) else {
+            panic!("non-effort --args must still parse");
+        };
+        assert_eq!(args.effort, Some(Effort::Max));
+        assert_eq!(
+            args.args.as_deref(),
+            Some("--dangerously-bypass-hook-trust -c 'hooks.Stop=[]'")
+        );
     }
 
     #[test]
