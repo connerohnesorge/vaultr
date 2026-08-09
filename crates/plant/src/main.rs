@@ -299,6 +299,19 @@ async fn dispatch(command: Command) -> i32 {
                 launch.push_str(&format!(" --session-id '{session_id}'"));
                 preset_session_id = Some(session_id);
             }
+            // prime-agent mints its own session id and publishes it nowhere Herdr can
+            // see, so scope the run to its own session dir and read the id back off
+            // disk once the pane finishes. Without an id plant cannot confirm the
+            // capture completed and reports the run failed, so this is load-bearing,
+            // not bookkeeping.
+            let prime_session_dir = (args.cli == AgentCli::Prime).then(|| {
+                let dir = state::dir()
+                    .join("agent-runs")
+                    .join("prime-sessions")
+                    .join(uuid::Uuid::new_v4().to_string());
+                launch.push_str(&format!(" --session-dir '{}'", dir.display()));
+                dir
+            });
             let vault = vault_root();
             let run = herdr::AgentRun {
                 label: args.label.unwrap_or_else(|| "agent".to_string()),
@@ -310,16 +323,10 @@ async fn dispatch(command: Command) -> i32 {
                 timeout: args.timeout,
                 cleanup: jobs::cleanup_policy(args.cleanup, &jobs::Cfg::load(&vault)),
                 preset_session_id,
-                // Only codex publishes a discoverable session id: Herdr reports it as the
-                // pane's agent_session and the wireproxy files the capture under the same
-                // value. Claude presets its own above. prime-agent can do neither — Herdr
-                // reports no agent_session for a prime pane, and prime's saved session id
-                // is a different UUID from the `session_id` it puts on the wire, so nothing
-                // on disk maps one to the other. Rather than infer the binding, a prime run
-                // leaves it unset and takes the "self-capture may reach learn" warning:
-                // guessing wrong would register a real interactive session as plant's own
-                // and drop it from learning entirely, which is the worse failure.
+                // Herdr-reported agent_session is a codex-only route: claude presets its
+                // own id above and prime reads one off disk (see prime_session_dir).
                 discover_session_id: args.cli == AgentCli::Codex,
+                prime_session_dir,
                 env: std::env::var("VAULT_PROJECT_DIGEST")
                     .map(|v| vec![("VAULT_PROJECT_DIGEST".to_string(), v)])
                     .unwrap_or_default(),
