@@ -23,6 +23,12 @@ pub const CONTENT_DIRS: &[&str] = &[
     "incidents",
     "conversations",
     "digests",
+    // vault/pit/ — one file per Height. Validated like any other content dir: its
+    // slugs join the wikilink target set, and its bodies are link-scanned. The
+    // schema is NOT enforced here (`required_keys` is a flat presence list that
+    // cannot express the status enum, exactly-one-of target/cadence, or
+    // height == filename) — Vault BUILD carries that as a hard gate.
+    "pit",
 ];
 
 const IGNORE_MARKER: &str = "<!-- vault-validate: ignore -->";
