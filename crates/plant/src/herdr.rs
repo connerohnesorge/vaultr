@@ -1,4 +1,5 @@
 use crate::capture::{append_herdr_snapshot, cached_session_ids, current_herdr_snapshot, iso_now};
+use crate::domain::AgentCli;
 use crate::process::{run30, RunResult};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -629,7 +630,7 @@ fn ready_pane_identity(panes: &[Pane], pane: &str) -> Option<PaneIdentity> {
         .iter()
         .find(|candidate| {
             candidate.pane_id == pane
-                && matches!(candidate.agent.as_deref(), Some("claude" | "codex"))
+                && AgentCli::is_known_herdr_agent(candidate.agent.as_deref())
                 && matches!(candidate.agent_status.as_str(), "idle" | "done")
         })
         .map(|candidate| PaneIdentity {
@@ -847,7 +848,7 @@ impl AgentStartSubscription {
                         if event.get("event").and_then(Value::as_str) != Some("pane.agent_status_changed")
                             || event.pointer("/data/pane_id").and_then(Value::as_str) != Some(self.pane_id.as_str())
                             || event.pointer("/data/workspace_id").and_then(Value::as_str) != Some(self.workspace_id.as_str())
-                            || !matches!(event.pointer("/data/agent").and_then(Value::as_str), Some("claude" | "codex")) {
+                            || !AgentCli::is_known_herdr_agent(event.pointer("/data/agent").and_then(Value::as_str)) {
                             continue;
                         }
                         match event.pointer("/data/agent_status").and_then(Value::as_str) {
@@ -1017,8 +1018,8 @@ fn classify_recorded_pane(
         }
         return Ok(RecordedPane::Absent);
     };
-    if !matches!(pane.agent.as_deref(), Some("claude" | "codex")) {
-        return Err("recorded pane is no longer a native Claude or Codex pane".to_string());
+    if !AgentCli::is_known_herdr_agent(pane.agent.as_deref()) {
+        return Err("recorded pane is no longer a native agent pane".to_string());
     }
     if pane.terminal_id != expected.terminal_id
         || pane.agent_session.as_ref().map(|session| &session.value)

@@ -21,7 +21,7 @@ mod state;
 mod sweep;
 
 use cli::Command;
-use domain::Harness;
+use domain::AgentCli;
 use proxy::ProxyCtx;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -45,7 +45,8 @@ fn usage(error: &str) -> i32 {
     eprintln!("plant: {error}");
     eprintln!(
         "usage: plant [--self-test | server stop | sessions eligible|coverage|stuck ... | \
-         compress once ... | jobs run|unblock <name>|worker ... | agent run --cli claude|codex ... | \
+         compress once ... | jobs run|unblock <name>|worker ... | \
+         agent run --cli claude|codex|prime [--model <m>] [--effort <e>] ... | \
          credentials reconcile [--once | --interval <dur>] [--source <dir>]]"
     );
     2
@@ -286,10 +287,14 @@ async fn dispatch(command: Command) -> i32 {
                 return 1;
             }
 
-            let mut launch =
-                jobs::launch_line(args.cli, args.model.as_deref(), args.args.as_deref());
+            let mut launch = jobs::launch_line(
+                args.cli,
+                args.model.as_deref(),
+                args.effort,
+                args.args.as_deref(),
+            );
             let mut preset_session_id = None;
-            if args.cli == Harness::ClaudeCode {
+            if args.cli == AgentCli::ClaudeCode {
                 let session_id = uuid::Uuid::new_v4().to_string();
                 launch.push_str(&format!(" --session-id '{session_id}'"));
                 preset_session_id = Some(session_id);
@@ -305,7 +310,16 @@ async fn dispatch(command: Command) -> i32 {
                 timeout: args.timeout,
                 cleanup: jobs::cleanup_policy(args.cleanup, &jobs::Cfg::load(&vault)),
                 preset_session_id,
-                discover_session_id: args.cli == Harness::Codex,
+                // Only codex publishes a discoverable session id: Herdr reports it as the
+                // pane's agent_session and the wireproxy files the capture under the same
+                // value. Claude presets its own above. prime-agent can do neither — Herdr
+                // reports no agent_session for a prime pane, and prime's saved session id
+                // is a different UUID from the `session_id` it puts on the wire, so nothing
+                // on disk maps one to the other. Rather than infer the binding, a prime run
+                // leaves it unset and takes the "self-capture may reach learn" warning:
+                // guessing wrong would register a real interactive session as plant's own
+                // and drop it from learning entirely, which is the worse failure.
+                discover_session_id: args.cli == AgentCli::Codex,
                 env: std::env::var("VAULT_PROJECT_DIGEST")
                     .map(|v| vec![("VAULT_PROJECT_DIGEST".to_string(), v)])
                     .unwrap_or_default(),

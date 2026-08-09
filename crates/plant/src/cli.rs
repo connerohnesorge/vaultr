@@ -1,5 +1,5 @@
 use crate::credentials::ReconcileArgs;
-use crate::domain::Harness;
+use crate::domain::{AgentCli, Effort, Harness};
 use crate::herdr::WorkspaceCleanup;
 use crate::jobs;
 use std::collections::HashSet;
@@ -37,8 +37,9 @@ pub struct EligibleArgs {
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct AgentRunArgs {
-    pub cli: Harness,
+    pub cli: AgentCli,
     pub model: Option<String>,
+    pub effort: Option<Effort>,
     pub args: Option<String>,
     pub label: Option<String>,
     pub cleanup: WorkspaceCleanup,
@@ -172,6 +173,7 @@ fn parse_eligible(args: &[String]) -> Result<EligibleArgs, String> {
 fn parse_agent(args: &[String]) -> Result<AgentRunArgs, String> {
     let mut cli = None;
     let mut model = None;
+    let mut effort = None;
     let mut extra_args = None;
     let mut label = None;
     let mut cwd = None;
@@ -191,11 +193,17 @@ fn parse_agent(args: &[String]) -> Result<AgentRunArgs, String> {
         match flag {
             "--cli" => {
                 cli = Some(
-                    Harness::parse_cli_label(value)
-                        .ok_or("agent run: --cli requires claude|codex")?,
+                    AgentCli::parse_cli_label(value)
+                        .ok_or("agent run: --cli requires claude|codex|prime")?,
                 );
             }
             "--model" => model = Some(value.clone()),
+            "--effort" => {
+                effort = Some(
+                    Effort::parse(value)
+                        .ok_or("agent run: --effort requires minimal|low|medium|high|xhigh|max")?,
+                );
+            }
             "--args" => extra_args = Some(value.clone()),
             "--label" => label = Some(value.clone()),
             "--cwd" => cwd = Some(value.clone()),
@@ -220,9 +228,16 @@ fn parse_agent(args: &[String]) -> Result<AgentRunArgs, String> {
         }
         i += 2;
     }
+    let cli = cli.ok_or("agent run: --cli claude|codex|prime is required")?;
+    // Claude has no launch-time reasoning flag. Accepting --effort there would drop it
+    // silently and the job would look configured while running at whatever Claude picks.
+    if cli == AgentCli::ClaudeCode && effort.is_some() {
+        return Err("agent run: --effort is not supported for --cli claude".to_string());
+    }
     Ok(AgentRunArgs {
-        cli: cli.ok_or("agent run: --cli claude|codex is required")?,
+        cli,
         model,
+        effort,
         args: extra_args,
         label,
         cleanup,
@@ -369,8 +384,9 @@ mod tests {
                 "10m",
             ])),
             Ok(Command::AgentRun(AgentRunArgs {
-                cli: Harness::Codex,
+                cli: AgentCli::Codex,
                 model: None,
+                effort: None,
                 args: None,
                 label: None,
                 cleanup: WorkspaceCleanup::OnSuccess,
@@ -389,8 +405,9 @@ mod tests {
                 "door-key",
             ])),
             Ok(Command::AgentRun(AgentRunArgs {
-                cli: Harness::ClaudeCode,
+                cli: AgentCli::ClaudeCode,
                 model: None,
+                effort: None,
                 args: None,
                 label: None,
                 cleanup: WorkspaceCleanup::Never,
@@ -399,6 +416,42 @@ mod tests {
                 idempotency_key: Some("door-key".to_string()),
             }))
         );
+    }
+
+    #[test]
+    fn parses_prime_dispatch_with_model_and_effort() {
+        let Ok(Command::AgentRun(args)) = parse_command(&argv(&[
+            "agent",
+            "run",
+            "--cli",
+            "prime",
+            "--model",
+            "gpt-5.6-luna",
+            "--effort",
+            "max",
+        ])) else {
+            panic!("prime dispatch must parse");
+        };
+        assert_eq!(args.cli, AgentCli::Prime);
+        assert_eq!(args.model.as_deref(), Some("gpt-5.6-luna"));
+        assert_eq!(args.effort, Some(Effort::Max));
+    }
+
+    /// A misspelled effort must fail the job loudly. Passed through as a raw string
+    /// it would reach the agent as an unknown value and the run would quietly
+    /// proceed at whatever the box's ambient effort happens to be.
+    #[test]
+    fn rejects_efforts_and_clis_that_would_silently_do_nothing() {
+        assert!(parse_command(&argv(&[
+            "agent", "run", "--cli", "prime", "--effort", "maximum"
+        ]))
+        .is_err());
+        assert!(parse_command(&argv(&["agent", "run", "--cli", "prime-agent"])).is_err());
+        // Claude has no launch-time effort flag, so accepting one would be a lie
+        assert!(parse_command(&argv(&[
+            "agent", "run", "--cli", "claude", "--effort", "max"
+        ]))
+        .is_err());
     }
 
     #[test]
