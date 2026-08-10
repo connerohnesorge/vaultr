@@ -204,6 +204,10 @@ pub fn launch_line(
     // guard in the AgentRun handler. Claude's Bash tool inherits the pane env, so a var prefix
     // reaches it. Codex's shell tool uses inherit="core" and strips custom vars, so inject the
     // marker via a set-override (`-c`), which wins last and only applies to this plant launch.
+    // Codex ALSO gets the var prefix: hooks (UserPromptSubmit etc.) are spawned from the codex
+    // process env, not the shell-tool env, so the `-c` override never reaches them — the pit
+    // route was injected into every plant codex capture until the 2026-08-10 soak caught it.
+    // Both are needed: the prefix for hooks, the `-c` for the shell tool.
     let mut s = match cli {
         AgentCli::ClaudeCode => {
             "PLANT_AGENT=1 command claude --dangerously-skip-permissions".to_string()
@@ -224,7 +228,7 @@ pub fn launch_line(
         // developed on had answered the prompt by hand months earlier, so it only ever appears
         // on a newly provisioned host. The hooks are the box's own dotfiles, which is precisely
         // the "automation that already vets hook sources" the flag documents.
-        AgentCli::Codex => "command codex --dangerously-bypass-approvals-and-sandbox \
+        AgentCli::Codex => "PLANT_AGENT=1 command codex --dangerously-bypass-approvals-and-sandbox \
              --dangerously-bypass-hook-trust \
              -c 'shell_environment_policy.set.PLANT_AGENT=\"1\"'"
             .to_string(),
@@ -2054,7 +2058,7 @@ mod tests {
                 Some(Effort::High),
                 None
             ),
-            "command codex --dangerously-bypass-approvals-and-sandbox \
+            "PLANT_AGENT=1 command codex --dangerously-bypass-approvals-and-sandbox \
              --dangerously-bypass-hook-trust \
              -c 'shell_environment_policy.set.PLANT_AGENT=\"1\"' \
              -m 'gpt-5.6-sol' -c model_reasoning_effort=high"
