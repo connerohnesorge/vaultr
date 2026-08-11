@@ -133,14 +133,9 @@ pub struct AgentRun {
     /// server-assigned, so for codex we read the id herdr reports for this pane once the
     /// run finishes and register it, keeping learn from dispatching on the self-capture.
     pub discover_session_id: bool,
-    /// prime-agent's run-scoped `--session-dir`. Herdr reports no agent_session for a
-    /// prime pane, so the id has to come off disk instead: prime writes exactly one
-    /// session file into this directory, and that file's first record carries the same
-    /// id prime puts in its `session_id` request header — which is the id the wireproxy
-    /// files the capture under. The directory is per-run so the file is unambiguous;
-    /// prime's own default session dir accumulates every session ever run.
-    /// Note the FILENAME is a different uuid from the record id — read the record.
-    pub prime_session_dir: Option<PathBuf>,
+    /// Run-scoped `--session-dir` for CLIs whose capture id must be read from the
+    /// first record of their sole JSONL session file. The filename is not the id.
+    pub session_record_dir: Option<PathBuf>,
     /// Forwarded to `herdr workspace create --env KEY=VALUE`. `plant agent run`
     /// runs as a short-lived client process; herdr's own env does not see
     /// vars the caller exported (e.g. `VAULT_PROJECT_DIGEST=0 plant agent run
@@ -216,6 +211,10 @@ impl AgentRunPaneIdentity {
 pub(crate) struct AgentRunSessionIdentity {
     terminal_id: String,
     session_id: String,
+    /// Herdr may report a pane identity that differs from the capture id. Pi
+    /// reports its session path, while its JSONL record supplies the wire id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_session_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -398,6 +397,10 @@ impl AgentRunCheckpoint {
             pane: AgentRunSessionIdentity {
                 terminal_id: identity.terminal_id.clone(),
                 session_id: session_id.to_string(),
+                agent_session_id: identity
+                    .agent_session
+                    .clone()
+                    .filter(|agent_session| agent_session != session_id),
             },
         }
     }
@@ -423,7 +426,10 @@ impl AgentRunCheckpoint {
             | Self::TerminalObserved { pane, .. } => Some(pane.clone()),
             Self::Captured { pane, .. } => Some(AgentRunPaneIdentity::SessionBound {
                 terminal_id: pane.terminal_id.clone(),
-                session_id: pane.session_id.clone(),
+                session_id: pane
+                    .agent_session_id
+                    .clone()
+                    .unwrap_or_else(|| pane.session_id.clone()),
             }),
         }
     }
@@ -620,8 +626,8 @@ pub(crate) async fn pane_list() -> Option<Vec<Pane>> {
     .flatten()
 }
 
-/// Herdr reports `idle` for a bare shell too. Only native Claude/Codex panes in
-/// a prompt-safe state may receive TUI input.
+/// Herdr reports `idle` for a bare shell too. Only supported native-agent panes
+/// in a prompt-safe state may receive TUI input.
 #[cfg(test)]
 fn pane_accepts_prompt(panes: &[Pane], pane: &str) -> bool {
     ready_pane_identity(panes, pane).is_some()
@@ -744,7 +750,7 @@ async fn wait_for_prompt_ready(pane: &str, timeout: Duration) -> Result<PaneIden
         }
     })
     .await
-    .map_err(|_| "native Claude/Codex pane did not reach idle or done".to_string())?
+    .map_err(|_| "supported native-agent pane did not reach idle or done".to_string())?
 }
 
 struct AgentStartSubscription {
@@ -964,13 +970,12 @@ async fn close_workspace(id: &str) {
     }
 }
 
-/// The capture session id prime-agent used, read from its run-scoped session dir.
+/// Read a capture session id from a CLI's run-scoped session directory.
 ///
-/// prime writes the session file as the run winds down, so this polls briefly rather
-/// than reading once. Returns None rather than guessing if the directory holds no
-/// session file or more than one — a wrong id here would be registered as plant's own
-/// self-capture and silently drop a real session from learning.
-fn prime_session_id(dir: &Path) -> Option<String> {
+/// The CLI writes the session file as the run winds down, so the caller polls briefly.
+/// Zero or multiple files remain ambiguous: registering the wrong id would silently
+/// exclude a real interactive session from learning.
+fn session_record_id(dir: &Path) -> Option<String> {
     let mut sessions = std::fs::read_dir(dir)
         .ok()?
         .filter_map(Result::ok)
@@ -995,11 +1000,11 @@ async fn register_discovered_session_id(
     label: &str,
     pane: Option<&str>,
     discover: bool,
-    prime_session_dir: Option<&Path>,
+    session_record_dir: Option<&Path>,
 ) -> Option<String> {
-    if let Some(dir) = prime_session_dir {
+    if let Some(dir) = session_record_dir {
         for _ in 0..5 {
-            let Some(sid) = prime_session_id(dir) else {
+            let Some(sid) = session_record_id(dir) else {
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 continue;
             };
@@ -1008,7 +1013,7 @@ async fn register_discovered_session_id(
             return Some(sid);
         }
         eprintln!(
-            "[herdr:{label}] no prime session file under {}; self-capture may reach learn",
+            "[herdr:{label}] no session record under {}; self-capture may reach learn",
             dir.display()
         );
         return None;
@@ -1460,7 +1465,7 @@ pub(crate) async fn run_agent_with_progress(
         &agent_run.label,
         pane_id.as_deref(),
         agent_run.discover_session_id,
-        agent_run.prime_session_dir.as_deref(),
+        agent_run.session_record_dir.as_deref(),
     )
     .await;
     let session_id = agent_run
@@ -1639,8 +1644,11 @@ mod tests {
     use super::*;
     use crate::process::RunEnd;
 
-    fn prime_session_fixture(name: &str, files: &[(&str, &str)]) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("plant-prime-{name}-{}", uuid::Uuid::new_v4()));
+    fn session_record_fixture(name: &str, files: &[(&str, &str)]) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "plant-session-record-{name}-{}",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         for (file, body) in files {
             std::fs::write(dir.join(file), body).unwrap();
@@ -1648,53 +1656,57 @@ mod tests {
         dir
     }
 
-    /// The id plant needs is the one in the session file's FIRST RECORD, not the one in
-    /// the filename — prime mints those separately and only the record id matches the
-    /// `session_id` header the wireproxy files the capture under. Reading the filename
-    /// would produce a plausible uuid that matches no capture, and plant would then call
-    /// every prime run failed for want of a completed envelope.
+    /// The capture id is in the first record, not the filename. Prime and Pi use
+    /// different record tags, but both put the wire session id in `id`.
     #[test]
-    fn prime_session_id_reads_the_record_not_the_filename() {
-        let dir = prime_session_fixture(
-            "record",
-            &[(
-                "019fe795-14e4-77ed-8917-b9b58fce1a9c.jsonl",
-                "{\"id\":\"019fe795-1bf1-746f-a76d-e273c683a524\",\"kind\":\"session\"}\n\
-                 {\"id\":\"later-record-ignored\"}\n",
-            )],
-        );
-        assert_eq!(
-            prime_session_id(&dir).as_deref(),
-            Some("019fe795-1bf1-746f-a76d-e273c683a524")
-        );
-        std::fs::remove_dir_all(dir).unwrap();
+    fn session_record_id_reads_prime_and_pi_first_records() {
+        for (name, first_record, expected) in [
+            (
+                "prime",
+                "{\"id\":\"019fe795-1bf1-746f-a76d-e273c683a524\",\"kind\":\"session\"}",
+                "019fe795-1bf1-746f-a76d-e273c683a524",
+            ),
+            (
+                "pi",
+                "{\"type\":\"session\",\"version\":3,\"id\":\"019fe795-29ec-7796-936d-0bedf25adf1a\"}",
+                "019fe795-29ec-7796-936d-0bedf25adf1a",
+            ),
+        ] {
+            let body = format!("{first_record}\n{{\"id\":\"later-record-ignored\"}}\n");
+            let dir = session_record_fixture(
+                name,
+                &[("019fe795-14e4-77ed-8917-b9b58fce1a9c.jsonl", &body)],
+            );
+            assert_eq!(session_record_id(&dir).as_deref(), Some(expected));
+            std::fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     /// Ambiguity must not be resolved by guessing: registering the wrong id marks a real
     /// interactive session as plant's own self-capture, and learn then skips it forever.
     #[test]
-    fn prime_session_id_refuses_an_ambiguous_or_empty_directory() {
-        let empty = prime_session_fixture("empty", &[]);
-        assert_eq!(prime_session_id(&empty), None);
+    fn session_record_id_refuses_an_ambiguous_or_empty_directory() {
+        let empty = session_record_fixture("empty", &[]);
+        assert_eq!(session_record_id(&empty), None);
         std::fs::remove_dir_all(empty).unwrap();
 
-        let two = prime_session_fixture(
+        let two = session_record_fixture(
             "two",
             &[
                 ("a.jsonl", "{\"id\":\"aaa\"}\n"),
                 ("b.jsonl", "{\"id\":\"bbb\"}\n"),
             ],
         );
-        assert_eq!(prime_session_id(&two), None);
+        assert_eq!(session_record_id(&two), None);
         std::fs::remove_dir_all(two).unwrap();
 
         // present but not yet flushed — caller retries rather than binding to nothing
-        let empty_file = prime_session_fixture("partial", &[("a.jsonl", "")]);
-        assert_eq!(prime_session_id(&empty_file), None);
+        let empty_file = session_record_fixture("partial", &[("a.jsonl", "")]);
+        assert_eq!(session_record_id(&empty_file), None);
         std::fs::remove_dir_all(empty_file).unwrap();
 
         assert_eq!(
-            prime_session_id(Path::new("/nonexistent/plant/prime")),
+            session_record_id(Path::new("/nonexistent/plant/session-record")),
             None
         );
     }
@@ -1866,6 +1878,30 @@ mod tests {
         assert!(recovery_pane_identity(&captured).is_ok());
         assert!(terminal_only.can_follow(&captured));
 
+        let pi_identity = PaneIdentity {
+            terminal_id: "t1".to_string(),
+            agent_session: Some("/tmp/pi-sessions/session.jsonl".to_string()),
+        };
+        let pi_terminal = AgentRunCheckpoint::terminal_observed("w1", "w1:p1", &pi_identity);
+        let pi_captured = AgentRunCheckpoint::captured(
+            "w1",
+            "w1:p1",
+            &pi_identity,
+            "019fe795-29ec-7796-936d-0bedf25adf1a",
+        );
+        assert!(pi_terminal.can_follow(&pi_captured));
+        assert_eq!(
+            pi_captured.session_id(),
+            Some("019fe795-29ec-7796-936d-0bedf25adf1a")
+        );
+        assert_eq!(
+            recovery_pane_identity(&pi_captured)
+                .unwrap()
+                .agent_session
+                .as_deref(),
+            Some("/tmp/pi-sessions/session.jsonl")
+        );
+
         let replaced_session = serde_json::from_value::<AgentRunCheckpoint>(serde_json::json!({
             "stage": "captured",
             "target": {"workspace_id": "w1", "pane_id": "w1:p1"},
@@ -1895,7 +1931,7 @@ mod tests {
             agent: agent.map(str::to_string),
             agent_session: None,
         };
-        for agent in ["claude", "codex"] {
+        for agent in ["claude", "codex", "prime-agent", "pi"] {
             for (status, expected) in [
                 ("idle", true),
                 ("done", true),
@@ -2167,7 +2203,7 @@ mod tests {
             cleanup: WorkspaceCleanup::Always,
             preset_session_id: None,
             discover_session_id: true,
-            prime_session_dir: None,
+            session_record_dir: None,
             env: Vec::new(),
         })
         .await;

@@ -44,11 +44,12 @@ pub enum AgentCli {
     ClaudeCode,
     Codex,
     Prime,
+    Pi,
 }
 
 impl AgentCli {
     pub fn parse_cli_label(value: &str) -> Option<Self> {
-        [Self::ClaudeCode, Self::Codex, Self::Prime]
+        [Self::ClaudeCode, Self::Codex, Self::Prime, Self::Pi]
             .into_iter()
             .find(|cli| cli.cli_label() == value)
     }
@@ -58,6 +59,7 @@ impl AgentCli {
             Self::ClaudeCode => "claude",
             Self::Codex => "codex",
             Self::Prime => "prime",
+            Self::Pi => "pi",
         }
     }
 
@@ -67,6 +69,7 @@ impl AgentCli {
             Self::ClaudeCode => "claude",
             Self::Codex => "codex",
             Self::Prime => "prime-agent",
+            Self::Pi => "pi",
         }
     }
 
@@ -81,7 +84,7 @@ impl AgentCli {
     }
 
     pub fn from_herdr_agent(value: &str) -> Option<Self> {
-        [Self::ClaudeCode, Self::Codex, Self::Prime]
+        [Self::ClaudeCode, Self::Codex, Self::Prime, Self::Pi]
             .into_iter()
             .find(|cli| cli.herdr_agent() == value)
     }
@@ -134,8 +137,7 @@ mod tests {
 
     #[test]
     fn agent_cli_separates_launch_identity_from_capture_identity() {
-        // `--cli prime` is the launch label; "prime-agent" is what Herdr calls the
-        // pane. Keeping them distinct is the whole reason this enum is not Harness.
+        // Launch labels and Herdr identities need not share a spelling.
         assert_eq!(AgentCli::parse_cli_label("prime"), Some(AgentCli::Prime));
         assert_eq!(AgentCli::parse_cli_label("prime-agent"), None);
         assert_eq!(AgentCli::Prime.herdr_agent(), "prime-agent");
@@ -143,11 +145,14 @@ mod tests {
             AgentCli::from_herdr_agent("prime-agent"),
             Some(AgentCli::Prime)
         );
+        assert_eq!(AgentCli::parse_cli_label("pi"), Some(AgentCli::Pi));
+        assert_eq!(AgentCli::Pi.herdr_agent(), "pi");
+        assert_eq!(AgentCli::from_herdr_agent("pi"), Some(AgentCli::Pi));
     }
 
     #[test]
     fn pane_gates_recognize_every_launchable_agent() {
-        for agent in ["claude", "codex", "prime-agent"] {
+        for agent in ["claude", "codex", "prime-agent", "pi"] {
             assert!(
                 AgentCli::is_known_herdr_agent(Some(agent)),
                 "{agent} pane would be gated out"

@@ -62,6 +62,24 @@ fn result(output: &Output) -> serde_json::Value {
 }
 
 #[test]
+fn agent_cli_error_and_usage_list_pi() {
+    let output = Command::new(env!("CARGO_BIN_EXE_plant"))
+        .args(["agent", "run", "--cli", "other"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("agent run: --cli requires claude|codex|prime|pi"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("agent run --cli claude|codex|prime|pi"),
+        "{stderr}"
+    );
+}
+
+#[test]
 fn unkeyed_agent_run_preserves_human_status() {
     let (tmp, home, sessions) = fixture("unkeyed");
     let output = run(&home, &sessions, None);
