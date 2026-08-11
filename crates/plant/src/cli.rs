@@ -194,7 +194,7 @@ fn parse_agent(args: &[String]) -> Result<AgentRunArgs, String> {
             "--cli" => {
                 cli = Some(
                     AgentCli::parse_cli_label(value)
-                        .ok_or("agent run: --cli requires claude|codex|prime")?,
+                        .ok_or("agent run: --cli requires claude|codex|prime|pi")?,
                 );
             }
             "--model" => model = Some(value.clone()),
@@ -228,7 +228,7 @@ fn parse_agent(args: &[String]) -> Result<AgentRunArgs, String> {
         }
         i += 2;
     }
-    let cli = cli.ok_or("agent run: --cli claude|codex|prime is required")?;
+    let cli = cli.ok_or("agent run: --cli claude|codex|prime|pi is required")?;
     // Claude has no launch-time reasoning flag. Accepting --effort there would drop it
     // silently and the job would look configured while running at whatever Claude picks.
     if cli == AgentCli::ClaudeCode && effort.is_some() {
@@ -452,6 +452,26 @@ mod tests {
         assert_eq!(args.effort, Some(Effort::Max));
     }
 
+    #[test]
+    fn parses_pi_dispatch_and_lists_it_in_cli_errors() {
+        let Ok(Command::AgentRun(args)) = parse_command(&argv(&[
+            "agent", "run", "--cli", "pi", "--model", "gpt-5.4", "--effort", "high",
+        ])) else {
+            panic!("pi dispatch must parse");
+        };
+        assert_eq!(args.cli, AgentCli::Pi);
+        assert_eq!(args.model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(args.effort, Some(Effort::High));
+        assert_eq!(
+            parse_command(&argv(&["agent", "run", "--cli", "other"])),
+            Err("agent run: --cli requires claude|codex|prime|pi".to_string())
+        );
+        assert_eq!(
+            parse_command(&argv(&["agent", "run"])),
+            Err("agent run: --cli claude|codex|prime|pi is required".to_string())
+        );
+    }
+
     /// A misspelled effort must fail the job loudly. Passed through as a raw string
     /// it would reach the agent as an unknown value and the run would quietly
     /// proceed at whatever the box's ambient effort happens to be.
@@ -476,6 +496,7 @@ mod tests {
         for (cli, smuggled) in [
             ("codex", "-c model_reasoning_effort=max"),
             ("prime", "--thinking max"),
+            ("pi", "--thinking max"),
         ] {
             let err = parse_command(&argv(&["agent", "run", "--cli", cli, "--args", smuggled]))
                 .expect_err("effort in --args must be refused");

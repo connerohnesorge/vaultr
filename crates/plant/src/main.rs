@@ -46,10 +46,25 @@ fn usage(error: &str) -> i32 {
     eprintln!(
         "usage: plant [--self-test | server stop | sessions eligible|coverage|stuck ... | \
          compress once ... | jobs run|unblock <name>|worker ... | \
-         agent run --cli claude|codex|prime [--model <m>] [--effort <e>] ... | \
+         agent run --cli claude|codex|prime|pi [--model <m>] [--effort <e>] ... | \
          credentials reconcile [--once | --interval <dur>] [--source <dir>]]"
     );
     2
+}
+
+fn append_run_session_dir(
+    cli: AgentCli,
+    plant_state: &std::path::Path,
+    launch: &mut String,
+) -> Option<PathBuf> {
+    matches!(cli, AgentCli::Prime | AgentCli::Pi).then(|| {
+        let dir = plant_state
+            .join("agent-runs")
+            .join("sessions")
+            .join(uuid::Uuid::new_v4().to_string());
+        launch.push_str(&format!(" --session-dir '{}'", dir.display()));
+        dir
+    })
 }
 
 fn credentials_usage() {
@@ -299,19 +314,10 @@ async fn dispatch(command: Command) -> i32 {
                 launch.push_str(&format!(" --session-id '{session_id}'"));
                 preset_session_id = Some(session_id);
             }
-            // prime-agent mints its own session id and publishes it nowhere Herdr can
-            // see, so scope the run to its own session dir and read the id back off
-            // disk once the pane finishes. Without an id plant cannot confirm the
-            // capture completed and reports the run failed, so this is load-bearing,
-            // not bookkeeping.
-            let prime_session_dir = (args.cli == AgentCli::Prime).then(|| {
-                let dir = state::dir()
-                    .join("agent-runs")
-                    .join("prime-sessions")
-                    .join(uuid::Uuid::new_v4().to_string());
-                launch.push_str(&format!(" --session-dir '{}'", dir.display()));
-                dir
-            });
+            // Prime and Pi mint their own capture ids outside Herdr's pane identity.
+            // Isolate each run so its sole JSONL record can supply that id after the
+            // turn. Without it Plant cannot prove capture completion.
+            let session_record_dir = append_run_session_dir(args.cli, &state::dir(), &mut launch);
             let vault = vault_root();
             let run = herdr::AgentRun {
                 label: args.label.unwrap_or_else(|| "agent".to_string()),
@@ -323,10 +329,10 @@ async fn dispatch(command: Command) -> i32 {
                 timeout: args.timeout,
                 cleanup: jobs::cleanup_policy(args.cleanup, &jobs::Cfg::load(&vault)),
                 preset_session_id,
-                // Herdr-reported agent_session is a codex-only route: claude presets its
-                // own id above and prime reads one off disk (see prime_session_dir).
+                // Herdr-reported agent_session is a codex-only route: Claude presets
+                // its id above, while Prime and Pi read one from their session directory.
                 discover_session_id: args.cli == AgentCli::Codex,
-                prime_session_dir,
+                session_record_dir,
                 env: std::env::var("VAULT_PROJECT_DIGEST")
                     .map(|v| vec![("VAULT_PROJECT_DIGEST".to_string(), v)])
                     .unwrap_or_default(),
@@ -738,6 +744,30 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prime_and_pi_receive_unique_run_scoped_session_directories() {
+        let state = PathBuf::from("/tmp/plant-state");
+        for cli in [AgentCli::Prime, AgentCli::Pi] {
+            let mut first_launch = String::new();
+            let first = append_run_session_dir(cli, &state, &mut first_launch).unwrap();
+            let mut second_launch = String::new();
+            let second = append_run_session_dir(cli, &state, &mut second_launch).unwrap();
+
+            assert_ne!(first, second);
+            assert!(first.starts_with(state.join("agent-runs/sessions")));
+            assert_eq!(
+                first_launch,
+                format!(" --session-dir '{}'", first.display())
+            );
+        }
+
+        for cli in [AgentCli::ClaudeCode, AgentCli::Codex] {
+            let mut launch = "unchanged".to_string();
+            assert_eq!(append_run_session_dir(cli, &state, &mut launch), None);
+            assert_eq!(launch, "unchanged");
+        }
+    }
 
     #[test]
     fn healthy_capture_schema_preserves_process_liveness() {

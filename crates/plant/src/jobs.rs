@@ -219,6 +219,9 @@ pub fn launch_line(
         // ambiguous: the same id can exist under more than one provider, and the
         // machine default provider is not guaranteed to be the one that has it.
         AgentCli::Prime => "PLANT_AGENT=1 command prime-agent --provider openai-codex".to_string(),
+        // Pi prompts before loading project-local resources unless trust is explicit.
+        // A background Herdr pane cannot answer, so approve this run up front.
+        AgentCli::Pi => "PLANT_AGENT=1 command pi --approve --provider openai-codex".to_string(),
         // sandboxed codex blocks on its first approval prompt — background panes can't answer.
         // --dangerously-bypass-hook-trust is the same problem by a second mechanism: codex
         // requires persisted per-hook trust and prompts "Press t to trust" for any hook it has
@@ -228,22 +231,22 @@ pub fn launch_line(
         // developed on had answered the prompt by hand months earlier, so it only ever appears
         // on a newly provisioned host. The hooks are the box's own dotfiles, which is precisely
         // the "automation that already vets hook sources" the flag documents.
-        AgentCli::Codex => "PLANT_AGENT=1 command codex --dangerously-bypass-approvals-and-sandbox \
+        AgentCli::Codex => {
+            "PLANT_AGENT=1 command codex --dangerously-bypass-approvals-and-sandbox \
              --dangerously-bypass-hook-trust \
              -c 'shell_environment_policy.set.PLANT_AGENT=\"1\"'"
-            .to_string(),
+                .to_string()
+        }
     };
     if let Some(m) = model {
         match cli {
             AgentCli::ClaudeCode => s.push_str(&format!(" --model='{m}'")),
             AgentCli::Codex => s.push_str(&format!(" -m '{m}'")),
-            AgentCli::Prime => s.push_str(&format!(" --model '{m}'")),
+            AgentCli::Prime | AgentCli::Pi => s.push_str(&format!(" --model '{m}'")),
         }
     }
-    // Both reasoning CLIs default to something weaker than plant wants and read it
-    // from ambient config (codex from ~/.codex/config.toml, prime-agent from
-    // settings.json — `low` as shipped). Pin it on every launch so a job's effort is
-    // a property of the job, not of whatever the box was last set to by hand.
+    // Reasoning CLIs read effort from ambient config. Pin it on every launch so a
+    // job's effort is a property of the job, not of the box's last interactive setting.
     // xhigh rather than max is the floor on purpose: gpt-5.3-codex-spark rejects
     // max outright, so an unqualified default of max would fail closed on that model.
     match cli {
@@ -251,7 +254,7 @@ pub fn launch_line(
             " -c model_reasoning_effort={}",
             effort.unwrap_or(Effort::XHigh).label()
         )),
-        AgentCli::Prime => s.push_str(&format!(
+        AgentCli::Prime | AgentCli::Pi => s.push_str(&format!(
             " --thinking {}",
             effort.unwrap_or(Effort::XHigh).label()
         )),
@@ -2100,11 +2103,18 @@ mod tests {
              --model 'gpt-5.6-luna' --thinking max"
         );
 
-        // Absent an explicit effort both CLIs are pinned to the xhigh floor rather
-        // than inheriting the box's ambient setting (prime-agent ships `low`).
+        let pi = launch_line(AgentCli::Pi, Some("gpt-5.6-luna"), Some(Effort::Max), None);
+        assert_eq!(
+            pi,
+            "PLANT_AGENT=1 command pi --approve --provider openai-codex \
+             --model 'gpt-5.6-luna' --thinking max"
+        );
+
+        // Absent an explicit effort every reasoning CLI is pinned to the xhigh floor.
         assert!(launch_line(AgentCli::Codex, None, None, None)
             .contains("-c model_reasoning_effort=xhigh"));
         assert!(launch_line(AgentCli::Prime, None, None, None).contains("--thinking xhigh"));
+        assert!(launch_line(AgentCli::Pi, None, None, None).contains("--thinking xhigh"));
     }
 
     /// prime-agent has no approval or hook-trust gate, so it must NOT inherit codex's
