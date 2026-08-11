@@ -8,7 +8,7 @@
 //! through the normalized model plus best-effort tool translation.
 
 use crate::recon::Harness;
-use crate::{claude_writer, codex_writer, normalize, pi_writer, recon, translate, vault};
+use crate::{claude_writer, codex_writer, normalize, pi_writer, recon, seals, translate, vault};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -30,6 +30,8 @@ pub struct ForkOptions {
     pub prompt: Option<String>,
     /// Restrict the resumed target to its native read-only controls.
     pub read_only: bool,
+    /// Fail on a local miss instead of fetching the seal from the store.
+    pub no_fetch: bool,
     /// Override CLAUDE_CONFIG_DIR resolution (tests).
     pub claude_config_dir: Option<PathBuf>,
     /// Override CODEX_HOME resolution (tests).
@@ -50,9 +52,8 @@ pub struct ForkOutcome {
 /// Fork a captured session into a fresh native session file.
 pub fn fork(root: &Path, id: &str, target: Target, opts: &ForkOptions) -> Result<ForkOutcome> {
     let session = vault::resolve_id(root, id)?;
-    let dir = vault::session_dir(root, &session)?;
-    let capture = vault::capture_file(&dir)?;
-    let recon = recon::reconstruct(&capture)?;
+    let materialised = seals::materialise(root, &session, !opts.no_fetch)?;
+    let recon = recon::reconstruct(&materialised.capture)?;
     if recon.messages.is_empty() {
         bail!("session {} reconstructed to an empty history", session.id);
     }

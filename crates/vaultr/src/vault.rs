@@ -139,28 +139,38 @@ pub fn resolve_id(root: &Path, query: &str) -> Result<Session> {
     }
 }
 
-/// Locate the session directory `<root>/YYYY/MM/DD/<id>`.
+/// Locate the session directory `<root>/YYYY/MM/DD/<id>`, or `Ok(None)` when it
+/// is simply not present.
 /// Tries the date derived from original_start first, then scans.
-pub fn session_dir(root: &Path, session: &Session) -> Result<PathBuf> {
+///
+/// Absence and hazard are separated on purpose: a directory that is merely
+/// missing is recoverable by fetching the seal from the store (`seals`), while a
+/// symlinked path level or a path escaping the canonical root is still an error
+/// no fetch should paper over.
+pub fn find_session_dir(root: &Path, session: &Session) -> Result<Option<PathBuf>> {
     if let Some(candidate) =
         dated_session_dir(root, &session.id, session.meta.original_start.as_deref())
     {
         if let Some(candidate) = existing_session_dir(root, &candidate)? {
-            return Ok(candidate);
+            return Ok(Some(candidate));
         }
     }
     // Fallback: scan YYYY/MM/DD for the id (lazy walk, stops at the first hit).
-    if let Some((_, dir)) = walk_session_dirs(root)?
+    Ok(walk_session_dirs(root)?
         .into_iter()
         .find(|(sid, _)| *sid == session.id)
-    {
-        return Ok(dir);
-    }
-    bail!(
-        "session directory for {} not found under {}",
-        session.id,
-        root.display()
-    )
+        .map(|(_, dir)| dir))
+}
+
+/// Locate the session directory, requiring it to be present.
+pub fn session_dir(root: &Path, session: &Session) -> Result<PathBuf> {
+    find_session_dir(root, session)?.ok_or_else(|| {
+        anyhow::anyhow!(
+            "session directory for {} not found under {}",
+            session.id,
+            root.display()
+        )
+    })
 }
 
 fn existing_session_dir(root: &Path, candidate: &Path) -> Result<Option<PathBuf>> {

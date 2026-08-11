@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use vaultr::{fork, normalize, recon, render, scan, validate, vault};
+use vaultr::{fork, normalize, recon, render, scan, seals, validate, vault};
 
 #[derive(Parser)]
 #[command(
@@ -14,6 +14,9 @@ struct Cli {
     /// Sessions root override (default: $VAULT_SESSIONS or ~/.dotfiles/vault/sessions)
     #[arg(long, global = true)]
     vault: Option<PathBuf>,
+    /// Fail on a local miss instead of fetching the seal from the S3 store
+    #[arg(long, global = true)]
+    no_fetch: bool,
     #[command(subcommand)]
     command: Cmd,
 }
@@ -101,8 +104,12 @@ fn run() -> Result<()> {
                     std::process::exit(code);
                 }
                 Cmd::Session(SessionCmd::List { all }) => list(&root, all),
-                Cmd::Session(SessionCmd::Path { id, copy }) => path(&root, &id, copy),
-                Cmd::Session(SessionCmd::Show { id, stats }) => show(&root, &id, stats),
+                Cmd::Session(SessionCmd::Path { id, copy }) => {
+                    path(&root, &id, copy, !cli.no_fetch)
+                }
+                Cmd::Session(SessionCmd::Show { id, stats }) => {
+                    show(&root, &id, stats, !cli.no_fetch)
+                }
                 Cmd::Session(SessionCmd::Fork {
                     id,
                     into,
@@ -116,6 +123,7 @@ fn run() -> Result<()> {
                         no_launch,
                         prompt,
                         read_only,
+                        no_fetch: cli.no_fetch,
                         ..Default::default()
                     };
                     let outcome = fork::fork(&root, &id, into, &opts)?;
@@ -180,9 +188,11 @@ fn list(root: &std::path::Path, all: bool) -> Result<()> {
     Ok(())
 }
 
-fn path(root: &std::path::Path, id: &str, copy: bool) -> Result<()> {
+/// A path is only useful if something is at it, so a local miss fetches here too
+/// rather than printing a directory that does not exist.
+fn path(root: &std::path::Path, id: &str, copy: bool, fetch: bool) -> Result<()> {
     let session = vault::resolve_id(root, id)?;
-    let dir = vault::session_dir(root, &session)?;
+    let dir = seals::materialise(root, &session, fetch)?.dir;
     let text = dir.display().to_string();
     println!("{text}");
     if copy {
@@ -194,10 +204,9 @@ fn path(root: &std::path::Path, id: &str, copy: bool) -> Result<()> {
     Ok(())
 }
 
-fn show(root: &std::path::Path, id: &str, stats: bool) -> Result<()> {
+fn show(root: &std::path::Path, id: &str, stats: bool, fetch: bool) -> Result<()> {
     let session = vault::resolve_id(root, id)?;
-    let dir = vault::session_dir(root, &session)?;
-    let file = vault::capture_file(&dir)?;
+    let file = seals::materialise(root, &session, fetch)?.capture;
     let recon = recon::reconstruct(&file)?;
     if stats {
         println!(
