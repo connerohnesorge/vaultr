@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -61,6 +61,8 @@ enum SessionCmd {
         #[arg(long, hide = true)]
         stats: bool,
     },
+    /// Stream the session's Herdr topology snapshots as JSONL
+    Herdr { id: String },
     /// Fork a captured session into a fresh native Claude/Codex/Pi session
     Fork {
         id: String,
@@ -110,6 +112,7 @@ fn run() -> Result<()> {
                 Cmd::Session(SessionCmd::Show { id, stats }) => {
                     show(&root, &id, stats, !cli.no_fetch)
                 }
+                Cmd::Session(SessionCmd::Herdr { id }) => herdr(&root, &id, !cli.no_fetch),
                 Cmd::Session(SessionCmd::Fork {
                     id,
                     into,
@@ -200,6 +203,26 @@ fn path(root: &std::path::Path, id: &str, copy: bool, fetch: bool) -> Result<()>
         use std::io::Write;
         child.stdin.take().unwrap().write_all(text.as_bytes())?;
         child.wait()?;
+    }
+    Ok(())
+}
+
+fn herdr(root: &std::path::Path, id: &str, fetch: bool) -> Result<()> {
+    let session = vault::resolve_id(root, id)?;
+    let materialised = seals::materialise_herdr(root, &session, fetch)?;
+    let file = std::fs::File::open(&materialised.sidecar)
+        .with_context(|| format!("open Herdr sidecar {}", materialised.sidecar.display()))?;
+    let stdout = std::io::stdout();
+    let mut output = stdout.lock();
+    if materialised.compressed {
+        let mut decoder = zstd::stream::read::Decoder::new(file)
+            .with_context(|| format!("decode Herdr sidecar {}", materialised.sidecar.display()))?;
+        std::io::copy(&mut decoder, &mut output)
+            .with_context(|| format!("stream Herdr sidecar {}", materialised.sidecar.display()))?;
+    } else {
+        let mut input = file;
+        std::io::copy(&mut input, &mut output)
+            .with_context(|| format!("stream Herdr sidecar {}", materialised.sidecar.display()))?;
     }
     Ok(())
 }
