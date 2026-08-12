@@ -21,3 +21,9 @@ id = "fork"
 title = "Fork vault session"
 contexts = ["pane"]
 command = ["./plugin/fork.sh"]
+
+[[actions]]
+id = "search"
+title = "Search vault sessions"
+contexts = ["pane"]
+command = ["./plugin/search.sh"]

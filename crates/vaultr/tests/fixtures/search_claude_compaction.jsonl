@@ -1,0 +1,2 @@
+{"harness":"claude-code","request":{"body_delta":{"history":{"key":"messages","prefix_length":0,"append":[{"role":"user","content":"before compaction"}]}}},"response":{"complete":false}}
+{"harness":"claude-code","request":{"body_delta":{"history":{"key":"messages","prefix_length":0,"append":[{"role":"user","content":"after compaction"}]}}},"response":{"complete":false}}

@@ -18,6 +18,7 @@ ignore = "0.4"
 toml = "0.8"
 memoize = "0.3"
 lazy_static = "1"
+tantivy = "0.22"
 
 [dev-dependencies]
 tempfile = "3"

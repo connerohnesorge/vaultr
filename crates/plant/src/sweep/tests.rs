@@ -426,6 +426,7 @@ fn inflight_lease_dedupes_until_completion_or_expiry() {
         1,
         Harness::ClaudeCode,
         Duration::from_secs(3600),
+        None,
     )
     .unwrap();
     assert!(first.iter().any(|path| path.ends_with(sid)));
@@ -436,6 +437,7 @@ fn inflight_lease_dedupes_until_completion_or_expiry() {
         10,
         Harness::ClaudeCode,
         Duration::from_secs(3600),
+        None,
     )
     .unwrap();
     assert!(during.is_empty(), "active batch must win");
@@ -451,6 +453,7 @@ fn inflight_lease_dedupes_until_completion_or_expiry() {
         1,
         Harness::ClaudeCode,
         Duration::from_secs(3600),
+        None,
     )
     .unwrap();
     assert!(
@@ -463,6 +466,7 @@ fn inflight_lease_dedupes_until_completion_or_expiry() {
         &InflightLease {
             sids: vec![next_sid.to_string()],
             expires_at: epoch_now().saturating_sub(1),
+            owner_attempt_id: None,
         },
     )
     .unwrap();
@@ -472,9 +476,66 @@ fn inflight_lease_dedupes_until_completion_or_expiry() {
         10,
         Harness::ClaudeCode,
         Duration::from_secs(3600),
+        None,
     )
     .unwrap();
     assert!(after.iter().any(|path| path.ends_with(next_sid)));
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn owner_release_removes_only_the_exact_learner_batch() {
+    let root = temp_root("inflight-owner-release");
+    let sessions = root.join("sessions");
+    std::fs::create_dir_all(root.join("learnings")).unwrap();
+    let claude = inflight_path(&sessions, Harness::ClaudeCode).unwrap();
+    let codex = inflight_path(&sessions, Harness::Codex).unwrap();
+    publish_inflight(
+        &claude,
+        &InflightLease {
+            sids: vec!["claude-sid".to_string()],
+            expires_at: epoch_now().saturating_add(3600),
+            owner_attempt_id: Some("attempt-a".to_string()),
+        },
+    )
+    .unwrap();
+    publish_inflight(
+        &codex,
+        &InflightLease {
+            sids: vec!["codex-sid".to_string()],
+            expires_at: epoch_now().saturating_add(3600),
+            owner_attempt_id: Some("attempt-b".to_string()),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(release_inflight_owned(&sessions, "attempt-a").unwrap(), 1);
+    assert!(!claude.exists());
+    assert!(codex.exists(), "the independent Codex lease must remain");
+    assert_eq!(release_inflight_owned(&sessions, "attempt-a").unwrap(), 0);
+    assert!(codex.exists(), "a mismatched owner must remain");
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn legacy_unowned_lease_is_never_released_by_attempt() {
+    let root = temp_root("inflight-legacy-owner");
+    let sessions = root.join("sessions");
+    std::fs::create_dir_all(root.join("learnings")).unwrap();
+    let path = inflight_path(&sessions, Harness::ClaudeCode).unwrap();
+    std::fs::write(
+        &path,
+        format!(
+            r#"{{"sids":["legacy"],"expires_at":{}}}"#,
+            epoch_now() + 3600
+        ),
+    )
+    .unwrap();
+
+    assert_eq!(release_inflight_owned(&sessions, "attempt-a").unwrap(), 0);
+    assert!(path.exists());
 
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -494,6 +555,7 @@ fn malformed_active_lease_fails_closed() {
         10,
         Harness::ClaudeCode,
         Duration::from_secs(3600),
+        None,
     )
     .unwrap_err();
     assert!(error.contains("parse"), "{error}");

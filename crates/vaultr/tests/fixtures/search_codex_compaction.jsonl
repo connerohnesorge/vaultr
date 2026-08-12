@@ -1,0 +1,2 @@
+{"harness":"codex","request":{"body_delta":{"history":{"key":"input","order":["before"],"new":{"before":{"type":"message","role":"user","content":[{"type":"input_text","text":"before compaction"}]}}}}},"response":{"complete":false}}
+{"harness":"codex","request":{"body_delta":{"history":{"key":"input","order":["after"],"new":{"after":{"type":"message","role":"user","content":[{"type":"input_text","text":"after compaction"}]}}}}},"response":{"complete":false}}

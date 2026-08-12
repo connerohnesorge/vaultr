@@ -9,6 +9,7 @@ pub mod render;
 pub mod scan;
 pub mod seals;
 pub mod secrets;
+pub mod session_index;
 pub mod translate;
 pub mod validate;
 pub mod vault;

@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use vaultr::{fork, normalize, recon, render, scan, seals, validate, vault};
+use vaultr::{fork, normalize, recon, render, scan, seals, session_index, validate, vault};
 
 #[derive(Parser)]
 #[command(
@@ -61,6 +61,32 @@ enum SessionCmd {
         #[arg(long, hide = true)]
         stats: bool,
     },
+    /// Build or update local session-search indexes
+    Index {
+        /// Update the local indexes incrementally
+        #[arg(long)]
+        update: bool,
+        /// Delete existing local indexes before building
+        #[arg(long)]
+        rebuild: bool,
+        /// Decode worker count
+        #[arg(long)]
+        workers: Option<usize>,
+    },
+    /// Search the local session index
+    Search {
+        /// Search terms or a quoted phrase
+        query: Vec<String>,
+        /// Maximum result count
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Emit result records as JSON
+        #[arg(long)]
+        json: bool,
+        /// Return duplicate turn bodies
+        #[arg(long)]
+        no_collapse: bool,
+    },
     /// Fork a captured session into a fresh native Claude/Codex/Pi session
     Fork {
         id: String,
@@ -110,6 +136,17 @@ fn run() -> Result<()> {
                 Cmd::Session(SessionCmd::Show { id, stats }) => {
                     show(&root, &id, stats, !cli.no_fetch)
                 }
+                Cmd::Session(SessionCmd::Index {
+                    update: _,
+                    rebuild,
+                    workers,
+                }) => index(&root, rebuild, workers),
+                Cmd::Session(SessionCmd::Search {
+                    query,
+                    limit,
+                    json,
+                    no_collapse,
+                }) => search(&root, &query.join(" "), limit, json, !no_collapse),
                 Cmd::Session(SessionCmd::Fork {
                     id,
                     into,
@@ -143,6 +180,110 @@ fn run() -> Result<()> {
             }
         }
     }
+}
+
+fn index(root: &std::path::Path, rebuild: bool, workers: Option<usize>) -> Result<()> {
+    let directory = session_index::state_root().join("sessions");
+    if rebuild && directory.exists() {
+        std::fs::remove_dir_all(&directory)?;
+    }
+    let stats = session_index::build_session_index(root, workers.unwrap_or(1))?;
+    println!(
+        "indexed {} sessions and {} turns with {} worker(s)",
+        stats.sessions,
+        stats.turns,
+        workers.unwrap_or(1).max(1),
+    );
+    Ok(())
+}
+
+fn search(
+    root: &std::path::Path,
+    query: &str,
+    limit: usize,
+    json: bool,
+    collapse: bool,
+) -> Result<()> {
+    let results = session_index::search_sessions(query, limit, collapse)?;
+    let newer_sessions = results.built_at.as_deref().map_or(0, |built_at| {
+        vault::list_sessions(root)
+            .map(|sessions| {
+                sessions
+                    .into_iter()
+                    .filter(|session| session.meta.last_activity() > built_at)
+                    .count()
+            })
+            .unwrap_or(0)
+    });
+    let warnings = (results.built_at.is_none() || newer_sessions > 0)
+        .then_some("index may be stale; run `vaultr session index --update`");
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "query": query,
+                "total": results.total,
+                "shown": results.hits.len(),
+                "freshness": results.built_at,
+                "warnings": warnings.iter().collect::<Vec<_>>(),
+                "sessions_since_build": newer_sessions,
+                "hits": results.hits,
+            })
+        );
+        return Ok(());
+    }
+    if let Some(warning) = warnings {
+        eprintln!("warning: {warning}");
+    }
+    println!(
+        "{} of {} hit(s) shown; built {}; {} sessions captured since build",
+        results.hits.len(),
+        results.total,
+        results.built_at.as_deref().unwrap_or("-"),
+        newer_sessions,
+    );
+    for hit in results.hits {
+        let markers = [
+            hit.compacted.then(|| "compacted".to_string()),
+            hit.partial.then(|| "partial".to_string()),
+            (hit.duplicates > 1).then(|| format!("{} duplicates", hit.duplicates)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(", ");
+        println!(
+            "{} | {} | {} | cwd={} | branch={} | turn={}{}",
+            &hit.session_id[..hit.session_id.len().min(8)],
+            if hit.timestamp.is_empty() {
+                "-"
+            } else {
+                &hit.timestamp
+            },
+            if hit.harness.is_empty() {
+                "-"
+            } else {
+                &hit.harness
+            },
+            if hit.cwd.is_empty() { "-" } else { &hit.cwd },
+            if hit.branch.is_empty() {
+                "-"
+            } else {
+                &hit.branch
+            },
+            hit.turn_index,
+            if markers.is_empty() {
+                String::new()
+            } else {
+                format!(" | {markers}")
+            },
+        );
+        println!(
+            "{}",
+            hit.body.lines().take(3).collect::<Vec<_>>().join("\n")
+        );
+    }
+    Ok(())
 }
 
 fn list(root: &std::path::Path, all: bool) -> Result<()> {

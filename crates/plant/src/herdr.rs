@@ -1246,11 +1246,32 @@ pub(crate) async fn run_agent(agent_run: AgentRun) -> AgentRunOutcome {
     run_agent_with_progress(agent_run, None).await
 }
 
+const PREFLIGHT_BACKOFFS: [Duration; 2] = [Duration::from_millis(250), Duration::from_millis(500)];
+
+async fn probe_herdr_with_backoff(label: &str) -> RunResult {
+    let mut probe = run30(&["herdr", "workspace", "list"]).await;
+    for (index, delay) in PREFLIGHT_BACKOFFS.iter().enumerate() {
+        if probe.ok {
+            break;
+        }
+        println!(
+            "[herdr:{label}] pre-launch probe failed ({}); retry {}/{} in {}ms",
+            probe.failure_detail(),
+            index + 1,
+            PREFLIGHT_BACKOFFS.len(),
+            delay.as_millis()
+        );
+        tokio::time::sleep(*delay).await;
+        probe = run30(&["herdr", "workspace", "list"]).await;
+    }
+    probe
+}
+
 pub(crate) async fn run_agent_with_progress(
     agent_run: AgentRun,
     progress: Option<&dyn AgentRunProgress>,
 ) -> AgentRunOutcome {
-    let probe = run30(&["herdr", "workspace", "list"]).await;
+    let probe = probe_herdr_with_backoff(&agent_run.label).await;
     if !probe.ok {
         println!(
             "[herdr:{}] unavailable ({})",
@@ -2054,6 +2075,15 @@ mod tests {
         let mut working = false;
         assert!(
             !snapshot_completed(&identity, &[codex_pane("done")], "w1:p1", &mut working).unwrap()
+        );
+    }
+
+    #[test]
+    fn preflight_retry_budget_is_bounded_and_backed_off() {
+        assert_eq!(PREFLIGHT_BACKOFFS.len() + 1, 3);
+        assert_eq!(
+            PREFLIGHT_BACKOFFS,
+            [Duration::from_millis(250), Duration::from_millis(500)]
         );
     }
 

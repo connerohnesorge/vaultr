@@ -63,6 +63,13 @@ impl Harness {
 }
 
 /// Result of reconstructing a capture.
+#[derive(Debug, Clone)]
+pub struct ObservedMessage {
+    pub message: Value,
+    pub in_final_replay: bool,
+}
+
+/// Result of reconstructing a capture.
 #[derive(Debug)]
 pub struct Recon {
     /// History key seen on the wire: "messages" (Anthropic) or "input" (Codex).
@@ -75,6 +82,10 @@ pub struct Recon {
     pub history_len: usize,
     /// Final history, with the trailing completed response (if any) appended.
     pub messages: Vec<Value>,
+    /// Every distinct message observed in request histories or completed output.
+    pub observed_messages: Vec<ObservedMessage>,
+    /// True when one or more history deltas could not be replayed.
+    pub partial: bool,
     /// Number of trailing assistant items appended from the final response.
     pub trailing_appended: usize,
     /// Envelopes parsed.
@@ -515,7 +526,10 @@ impl HarnessState {
 
 struct ReconState {
     msgs: Vec<Value>,
+    observed: Vec<Value>,
+    observed_keys: HashSet<String>,
     hash_dict: HashMap<String, Value>,
+    partial: bool,
     key: String,
     harness: HarnessState,
     trailing: Vec<Value>,
@@ -526,7 +540,10 @@ impl ReconState {
     fn new() -> Self {
         ReconState {
             msgs: Vec::new(),
+            observed: Vec::new(),
+            observed_keys: HashSet::new(),
             hash_dict: HashMap::new(),
+            partial: false,
             key: String::from("messages"),
             harness: HarnessState::Unknown,
             trailing: Vec::new(),
@@ -555,9 +572,18 @@ impl ReconState {
         let harness = next_harness.value();
 
         if let Some(h) = history {
-            apply_delta(h, &mut self.msgs, &mut self.hash_dict)?;
-            if let Some(k) = h.get("key").and_then(Value::as_str) {
-                self.key = k.to_string();
+            if let Err(error) = apply_delta(h, &mut self.msgs, &mut self.hash_dict) {
+                let recoverable = error.to_string().contains("lineage")
+                    || error.to_string().contains("does not resolve");
+                if !recoverable || self.msgs.is_empty() {
+                    return Err(error);
+                }
+                self.partial = true;
+            } else {
+                self.observe_messages(&self.msgs.clone());
+                if let Some(k) = h.get("key").and_then(Value::as_str) {
+                    self.key = k.to_string();
+                }
             }
         }
 
@@ -586,15 +612,41 @@ impl ReconState {
         Ok(())
     }
 
+    fn observe_messages(&mut self, messages: &[Value]) {
+        for message in messages {
+            let key = serde_json::to_string(message).expect("JSON values serialize");
+            if self.observed_keys.insert(key) {
+                self.observed.push(message.clone());
+            }
+        }
+    }
+
     fn finish(mut self) -> Recon {
         let history_len = self.msgs.len();
         let trailing_appended = self.trailing.len();
-        self.msgs.extend(self.trailing);
+        self.msgs.extend(std::mem::take(&mut self.trailing));
+        self.observe_messages(&self.msgs.clone());
+        let final_keys: HashSet<String> = self
+            .msgs
+            .iter()
+            .map(|message| serde_json::to_string(message).expect("JSON values serialize"))
+            .collect();
+        let observed_messages = self
+            .observed
+            .into_iter()
+            .map(|message| ObservedMessage {
+                in_final_replay: final_keys
+                    .contains(&serde_json::to_string(&message).expect("JSON values serialize")),
+                message,
+            })
+            .collect();
         Recon {
             key: self.key,
             harness: self.harness.value(),
             history_len,
             messages: self.msgs,
+            observed_messages,
+            partial: self.partial,
             trailing_appended,
             envelopes: self.envelopes,
         }

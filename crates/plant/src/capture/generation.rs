@@ -574,6 +574,13 @@ pub(crate) async fn seal_ready_generation(
     let path = seal_generation_in(&directory, &capture, &destination, FrameCompressor::Zstd)
         .await
         .map_err(|error| format!("seal detached generation for {sid}: {error}"))?;
+    // `state.json` retains the latest complete request body while a capture is
+    // live. Once the transcript is sealed, it is a derived capture too. Scrub
+    // it before the sealed session becomes indexable or shareable.
+    if directory.open_optional("state.json", false)?.is_some() {
+        let (_, hits) = scrub_entry(&directory, "state.json")?;
+        print_scrub(&directory_path.join("state.json"), hits);
+    }
     Ok(Some(SealedCapture { path, source_len }))
 }
 

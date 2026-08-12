@@ -442,3 +442,65 @@ wrapper and 15-minute cadence MUST remain unchanged.
 
 - WHEN Plant launches Claude, Codex, or Prime
 - THEN Plant preserves the existing launch and self-capture behavior
+
+### Requirement: Fair scheduled admission
+
+Plant MUST keep a rotating queue of due ordinary jobs. Each scheduler scan MUST launch no more ordinary workers than configured capacity. A capacity rejection MUST return the selected job to the queue after other due jobs. Plant MUST acquire cross-process capacity before it publishes an attempt fence. Plant MUST preserve per-job locks and durable cadence rechecks.
+
+#### Scenario: One slot serves multiple due jobs
+
+- GIVEN one ordinary scheduler slot is available
+- AND multiple ordinary jobs are due
+- WHEN Plant completes successive scheduler scans
+- THEN each due job receives an admission turn
+
+#### Scenario: Capacity remains occupied
+
+- GIVEN all ordinary scheduler slots are occupied
+- WHEN a selected due job cannot acquire capacity
+- THEN Plant records a diagnostic with the job name
+- AND Plant gives another due job the next admission turn
+- AND Plant publishes no attempt fence for the rejected job
+
+#### Scenario: One job has an unresolved fence
+
+- GIVEN one due job has an unresolved attempt fence
+- WHEN another job is due
+- THEN Plant keeps both jobs in fair admission
+- AND the unrelated job can execute
+
+#### Scenario: Plant restarts before admission
+
+- WHEN Plant restarts before a selected job receives capacity
+- THEN Plant rebuilds admission from durable cadence state
+- AND Plant publishes no attempt fence before capacity admission
+
+### Requirement: Owned learner batch startup boundary
+
+Plant MUST store the inherited `PLANT_ATTEMPT_ID` with a claimed learner batch. Claude and Codex learner batches MUST remain independent. Plant MUST retry the initial Herdr availability probe with a bounded backoff budget. Plant MUST release only the learner batch owned by the matching attempt when that budget expires before workspace creation. Plant MUST retain the batch after workspace creation or any uncertain outcome. Plant MUST preserve keyed Agent Run receipt behavior.
+
+#### Scenario: Herdr recovers during pre-launch retry
+
+- WHEN an initial Herdr availability probe fails
+- AND Herdr responds within the bounded retry budget
+- THEN Plant creates one Agent Run workspace
+- AND Plant retains the learner batch until normal completion
+
+#### Scenario: Herdr remains unavailable before workspace creation
+
+- GIVEN a learner batch is owned by the current `PLANT_ATTEMPT_ID`
+- WHEN every pre-launch availability probe fails
+- THEN Plant releases that exact learner batch
+- AND Plant returns a retryable Agent Run receipt
+
+#### Scenario: Another learner owns a batch
+
+- GIVEN another learner batch has a different owner
+- WHEN the current attempt fails before workspace creation
+- THEN Plant retains the differently owned batch
+
+#### Scenario: Startup outcome is uncertain
+
+- WHEN Plant creates a workspace or cannot prove pre-workspace failure
+- THEN Plant retains the learner batch
+- AND Plant retains fail-closed Agent Run state

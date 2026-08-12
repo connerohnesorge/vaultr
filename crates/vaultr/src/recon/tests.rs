@@ -43,6 +43,27 @@ fn live_raw_ignores_one_unterminated_final_fragment() {
 }
 
 #[test]
+fn reconstruction_retains_compacted_observed_messages() {
+    let first = env_append(0, "user", "retained only for search");
+    let second = env_append(0, "user", "final replay");
+    let r = reconstruct_reader(format!("{first}\n{second}\n").as_bytes()).unwrap();
+    assert_eq!(r.messages.len(), 1);
+    assert_eq!(r.observed_messages.len(), 2);
+    assert!(!r.observed_messages[0].in_final_replay);
+    assert!(r.observed_messages[1].in_final_replay);
+}
+
+#[test]
+fn reconstruction_marks_broken_lineage_partial_and_continues() {
+    let first = env_append(0, "user", "usable");
+    let broken = env_append(9, "user", "lost");
+    let last = env_append(1, "user", "recovered");
+    let r = reconstruct_reader(format!("{first}\n{broken}\n{last}\n").as_bytes()).unwrap();
+    assert!(r.partial);
+    assert_eq!(r.messages[1]["content"], "recovered");
+}
+
+#[test]
 fn sealed_segment_fails_on_malformed_trailing_content() {
     // A sealed (fully terminated) capture must not silently drop a broken tail.
     let a = env_append(0, "user", "a");

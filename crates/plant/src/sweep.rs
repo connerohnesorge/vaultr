@@ -303,6 +303,8 @@ fn inflight_path(vault: &Path, learner: Harness) -> Result<PathBuf, String> {
 struct InflightLease {
     sids: Vec<String>,
     expires_at: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owner_attempt_id: Option<String>,
 }
 
 fn read_inflight(path: &Path) -> Result<Option<InflightLease>, String> {
@@ -552,6 +554,7 @@ pub fn eligible_and_claim(
     max: usize,
     learner: Harness,
     duration: Duration,
+    owner_attempt_id: Option<&str>,
 ) -> Result<Vec<PathBuf>, String> {
     let path = inflight_path(vault, learner)?;
     let lock_path = path.with_extension("json.lock");
@@ -589,9 +592,53 @@ pub fn eligible_and_claim(
         expires_at: epoch_now()
             .saturating_add(duration.as_secs())
             .saturating_add(300),
+        owner_attempt_id: owner_attempt_id.map(str::to_string),
     };
     publish_inflight(&path, &lease)?;
     Ok(batch.into_iter().map(|(_, path)| path).collect())
+}
+
+/// Release only learner batches owned by the matching scheduled attempt.
+/// A missing or differently owned lease is retained.
+pub(crate) fn release_inflight_owned(vault: &Path, attempt_id: &str) -> Result<usize, String> {
+    if !vault.exists() && !vault.parent().is_some_and(Path::exists) {
+        return Ok(0);
+    }
+    let mut released = 0;
+    for learner in [Harness::ClaudeCode, Harness::Codex] {
+        let path = inflight_path(vault, learner)?;
+        if !path.parent().is_some_and(Path::exists) {
+            continue;
+        }
+        let lock_path = path.with_extension("json.lock");
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|error| format!("open {}: {error}", lock_path.display()))?;
+        lock.lock()
+            .map_err(|error| format!("lock {}: {error}", lock_path.display()))?;
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("read {}: {error}", path.display())),
+        };
+        let lease: InflightLease = serde_json::from_str(&text)
+            .map_err(|error| format!("parse {}: {error}", path.display()))?;
+        if lease.owner_attempt_id.as_deref() != Some(attempt_id) {
+            continue;
+        }
+        std::fs::remove_file(&path)
+            .map_err(|error| format!("release {}: {error}", path.display()))?;
+        if let Some(parent) = path.parent() {
+            crate::state::sync_dir(parent)
+                .map_err(|error| format!("sync {}: {error}", parent.display()))?;
+        }
+        released += 1;
+    }
+    Ok(released)
 }
 
 pub fn eligibility_stats(vault: &Path, learner: Harness) -> Result<(usize, usize), String> {
