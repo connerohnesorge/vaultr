@@ -114,10 +114,18 @@ export RUN_PANE_COMMAND=0
 "$(dirname "$0")/show.sh" >/dev/null
 test "$(cat "$PANE_COMMAND")" = "vaultr session show $sid | less -R"
 
-"$(dirname "$0")/copy-path.sh" >/dev/null
+"$(dirname "$0")/copy-path.sh" >"$tmp/copy-path-output"
 assert_nul_fields "$CAPTURED_ARGV" session path "$sid"
-printf '%s' "$hostile" >"$tmp/expected-path"
-cmp "$tmp/expected-path" "$CLIPBOARD"
-assert_nul_fields "$NOTIFICATION_ARGV" \
-  notification show "Vault session path copied" --body "$hostile" --sound done
+if [ "$(uname -s)" = "Darwin" ]; then
+  printf '%s' "$hostile" >"$tmp/expected-path"
+  cmp "$tmp/expected-path" "$CLIPBOARD"
+  assert_nul_fields "$NOTIFICATION_ARGV" \
+    notification show "Vault session path copied" --body "$hostile" --sound done
+else
+  test ! -e "$CLIPBOARD"
+  printf 'select to copy: %s\n' "$hostile" >"$tmp/expected-copy-output"
+  cmp "$tmp/expected-copy-output" "$tmp/copy-path-output"
+  assert_nul_fields "$NOTIFICATION_ARGV" \
+    notification show "Vault session path" --body "$hostile" --sound done
+fi
 test ! -e "$marker"

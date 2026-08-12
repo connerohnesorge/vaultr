@@ -5,8 +5,9 @@
 //! session listed and discoverable by clone — without holding that session's
 //! bytes. This module turns "listed" back into "readable".
 //!
-//! Only the read verbs (`session show`, `session path`, `session fork`) fetch.
-//! Nothing on the capture or sweep path does, deliberately: Plant walks all
+//! Only the read verbs (`session show`, `session path`, `session fork`, and
+//! `session herdr`) fetch. Nothing on the capture or sweep path does,
+//! deliberately: Plant walks all
 //! ~10k session directories on a 30-minute cadence (`compress`, `learn`,
 //! `reconcile`, `validate`), and a fetch reachable from that walk would turn an
 //! eligibility scan into a bulk download of the whole corpus.
@@ -22,13 +23,34 @@ use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// The store of record. Keys are the vault-relative path of the seal:
-/// `sessions/YYYY/MM/DD/<session-id>/turns.jsonl.zst`.
+/// The store of record. Every key is the seal's vault-relative path.
 const DEFAULT_STORE: &str = "s3://pantheon-vault-seals-athens";
 
 /// Zstd frame magic. A seal that does not start with it is not a seal — the
 /// cheap half of verifying a download that is far too large to decode.
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SealClass {
+    Capture,
+    Herdr,
+}
+
+impl SealClass {
+    fn filename(self) -> &'static str {
+        match self {
+            Self::Capture => "turns.jsonl.zst",
+            Self::Herdr => "herdr.jsonl.zst",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Capture => "capture",
+            Self::Herdr => "Herdr sidecar",
+        }
+    }
+}
 
 /// A resolved seal store: just the bucket, since the key layout is fixed.
 #[derive(Debug, Clone)]
@@ -76,7 +98,7 @@ struct Candidate {
 /// with starts between 00:22Z and 01:47Z). A timezone offset is under 24 hours
 /// by construction, so probing the neighbouring days closes that class exactly
 /// rather than approximately.
-fn candidates(root: &Path, session: &Session) -> Result<Vec<Candidate>> {
+fn candidates(root: &Path, session: &Session, seal: SealClass) -> Result<Vec<Candidate>> {
     let start = session.meta.original_start.as_deref().with_context(|| {
         format!(
             "session {} records no original_start, so its seal key cannot be derived",
@@ -98,8 +120,9 @@ fn candidates(root: &Path, session: &Session) -> Result<Vec<Candidate>> {
             );
             Candidate {
                 key: format!(
-                    "sessions/{year}/{month}/{day}/{}/turns.jsonl.zst",
-                    session.id
+                    "sessions/{year}/{month}/{day}/{}/{}",
+                    session.id,
+                    seal.filename()
                 ),
                 dir: root.join(year).join(month).join(day).join(&session.id),
             }
@@ -136,7 +159,7 @@ pub fn materialise(root: &Path, session: &Session, allow_fetch: bool) -> Result<
             root.display()
         );
     }
-    let capture = fetch(root, session)?;
+    let capture = fetch_seal(root, session, SealClass::Capture)?;
     let dir = capture
         .parent()
         .with_context(|| {
@@ -149,32 +172,83 @@ pub fn materialise(root: &Path, session: &Session, allow_fetch: bool) -> Result<
     Ok(Materialised { dir, capture })
 }
 
-/// Download a session's seal from the store and return its local path.
+/// A local Herdr topology sidecar and whether it needs zstd decoding.
+pub struct HerdrMaterialised {
+    pub sidecar: PathBuf,
+    pub compressed: bool,
+}
+
+/// Resolve a session's Herdr topology, fetching only that sidecar on a miss.
+///
+/// Raw topology wins while Plant still owns an appendable sidecar. Explicit
+/// inspection is the only caller; recurring capture and cultivation inventory
+/// remains local-only.
+pub fn materialise_herdr(
+    root: &Path,
+    session: &Session,
+    allow_fetch: bool,
+) -> Result<HerdrMaterialised> {
+    if let Some(dir) = vault::find_session_dir(root, session)? {
+        for (filename, compressed) in [("herdr.jsonl", false), ("herdr.jsonl.zst", true)] {
+            let path = dir.join(filename);
+            match std::fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.file_type().is_file() => {
+                    std::fs::File::open(&path)
+                        .with_context(|| format!("open Herdr sidecar at {}", path.display()))?;
+                    return Ok(HerdrMaterialised {
+                        sidecar: path,
+                        compressed,
+                    });
+                }
+                Ok(_) => bail!("Herdr sidecar is not a regular file at {}", path.display()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error)
+                        .with_context(|| format!("inspect Herdr sidecar at {}", path.display()));
+                }
+            }
+        }
+    }
+    if !allow_fetch {
+        bail!(
+            "session {} has no Herdr sidecar in {} and fetching is disabled",
+            session.id,
+            root.display()
+        );
+    }
+    Ok(HerdrMaterialised {
+        sidecar: fetch_seal(root, session, SealClass::Herdr)?,
+        compressed: true,
+    })
+}
+
+/// Download one seal class from the store and return its local path.
 ///
 /// The seal is written under a name that is invisible to everything else, then
-/// verified, then renamed into place. `parse_capture_generation_name` returns
-/// `Ok(None)` for the temp name, so a partial download is skipped rather than
-/// mistaken for a capture generation, and the `.zst-tmp` suffix is already
-/// gitignored, so a crashed fetch cannot be swept into a commit.
-pub fn fetch(root: &Path, session: &Session) -> Result<PathBuf> {
+/// verified, then renamed into place. Capture parsing skips the temp name, and
+/// the `.zst-tmp` suffix is already gitignored, so a crashed fetch cannot be
+/// swept into a commit.
+fn fetch_seal(root: &Path, session: &Session, seal: SealClass) -> Result<PathBuf> {
     let Some(store) = store()? else {
         bail!(
-            "session {} is not in the local vault and the seal store is disabled \
+            "session {} has no local {} and the seal store is disabled \
              (VAULTR_SEAL_STORE is empty)",
-            session.id
+            session.id,
+            seal.label()
         );
     };
-    let candidates = candidates(root, session)?;
+    let candidates = candidates(root, session, seal)?;
     let mut tried = Vec::new();
     for candidate in &candidates {
         tried.push(candidate.key.clone());
         let Some(size) = head_object(&store, &candidate.key)? else {
             continue;
         };
-        return download(&store, candidate, size, &session.id);
+        return download(&store, candidate, seal, size, &session.id);
     }
     bail!(
-        "seal for session {} is in neither the local vault nor s3://{}\n  tried: {}",
+        "{} for session {} is in neither the local vault nor s3://{}\n  tried: {}",
+        seal.label(),
         session.id,
         store.bucket,
         tried.join("\n         ")
@@ -221,16 +295,21 @@ fn head_object(store: &SealStore, key: &str) -> Result<Option<u64>> {
 fn download(
     store: &SealStore,
     candidate: &Candidate,
+    seal: SealClass,
     expected: u64,
     session_id: &str,
 ) -> Result<PathBuf> {
     std::fs::create_dir_all(&candidate.dir)
         .with_context(|| format!("create session directory {}", candidate.dir.display()))?;
-    let dest = candidate.dir.join("turns.jsonl.zst");
+    let dest = candidate.dir.join(seal.filename());
     // Staged in the destination directory so the rename is same-filesystem and
     // therefore atomic; a temp directory could be on another volume.
+    let stem = seal
+        .filename()
+        .strip_suffix(".zst")
+        .expect("every seal filename is zstd");
     let tmp = candidate.dir.join(format!(
-        "turns.jsonl.fetch-{}.zst-tmp",
+        "{stem}.fetch-{}.zst-tmp",
         uuid::Uuid::new_v4().simple()
     ));
     // Announced before the transfer rather than reported after it, and with the
@@ -264,10 +343,10 @@ fn download(
             );
         }
         verify(&tmp, expected)?;
-        // Losing a race to a concurrent fetch is fine — the bytes are the same
-        // object either way — but never clobber a capture that arrived meanwhile.
-        if dest.exists() {
-            bail!("capture appeared at {} during fetch", dest.display());
+        // Never clobber local evidence that arrived while the object downloaded.
+        let raw_herdr = candidate.dir.join("herdr.jsonl");
+        if dest.exists() || (seal == SealClass::Herdr && raw_herdr.exists()) {
+            bail!("{} appeared during fetch", seal.label());
         }
         std::fs::rename(&tmp, &dest)
             .with_context(|| format!("rename fetched seal into {}", dest.display()))?;
@@ -327,6 +406,9 @@ fn verify(path: &Path, expected: u64) -> Result<()> {
 mod tests {
     use super::*;
     use crate::vault::Meta;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     fn session(id: &str, start: Option<&str>) -> Session {
         Session {
@@ -341,7 +423,8 @@ mod tests {
     #[test]
     fn candidate_keys_lead_with_the_meta_derived_date() {
         let session = session("abc", Some("2026-07-14T01:47:38.711Z"));
-        let candidates = candidates(Path::new("/vault/sessions"), &session).unwrap();
+        let candidates =
+            candidates(Path::new("/vault/sessions"), &session, SealClass::Capture).unwrap();
         let keys: Vec<&str> = candidates.iter().map(|c| c.key.as_str()).collect();
         assert_eq!(
             keys,
@@ -355,12 +438,17 @@ mod tests {
             candidates[1].dir,
             Path::new("/vault/sessions/2026/07/13/abc")
         );
+        assert_eq!(
+            super::candidates(Path::new("/vault/sessions"), &session, SealClass::Herdr).unwrap()[0]
+                .key,
+            "sessions/2026/07/14/abc/herdr.jsonl.zst"
+        );
     }
 
     #[test]
     fn candidate_keys_cross_month_and_year_boundaries() {
         let session = session("abc", Some("2026-01-01T00:10:00Z"));
-        let keys: Vec<String> = candidates(Path::new("/v"), &session)
+        let keys: Vec<String> = candidates(Path::new("/v"), &session, SealClass::Capture)
             .unwrap()
             .into_iter()
             .map(|c| c.key)
@@ -370,7 +458,8 @@ mod tests {
 
     #[test]
     fn a_session_without_a_start_cannot_derive_a_key() {
-        let error = candidates(Path::new("/v"), &session("abc", None)).unwrap_err();
+        let error =
+            candidates(Path::new("/v"), &session("abc", None), SealClass::Capture).unwrap_err();
         assert!(error.to_string().contains("no original_start"));
     }
 
@@ -424,6 +513,7 @@ mod tests {
 
     /// Environment is process-global; these tests set one variable and restore it.
     fn temp_env(key: &str, value: Option<&str>, body: impl FnOnce()) {
+        let _guard = ENV_LOCK.lock().unwrap();
         let previous = std::env::var_os(key);
         match value {
             Some(value) => std::env::set_var(key, value),
