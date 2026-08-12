@@ -114,6 +114,9 @@ export RUN_PANE_COMMAND=0
 "$(dirname "$0")/show.sh" >/dev/null
 test "$(cat "$PANE_COMMAND")" = "vaultr session show $sid | less -R"
 
+"$(dirname "$0")/search.sh" >/dev/null
+grep -Fq 'vaultr\ session\ search\ --curated\ \"\$query\"\ \|\ less\ -R' "$PANE_COMMAND"
+
 "$(dirname "$0")/copy-path.sh" >/dev/null
 assert_nul_fields "$CAPTURED_ARGV" session path "$sid"
 printf '%s' "$hostile" >"$tmp/expected-path"

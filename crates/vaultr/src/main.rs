@@ -64,10 +64,10 @@ enum SessionCmd {
     /// Build or update local session-search indexes
     Index {
         /// Update the local indexes incrementally
-        #[arg(long)]
+        #[arg(long, conflicts_with = "rebuild")]
         update: bool,
         /// Delete existing local indexes before building
-        #[arg(long)]
+        #[arg(long, conflicts_with = "update")]
         rebuild: bool,
         /// Decode worker count
         #[arg(long)]
@@ -76,6 +76,7 @@ enum SessionCmd {
     /// Search the local session index
     Search {
         /// Search terms or a quoted phrase
+        #[arg(required = true)]
         query: Vec<String>,
         /// Maximum result count
         #[arg(long, default_value_t = 10)]
@@ -86,6 +87,12 @@ enum SessionCmd {
         /// Return duplicate turn bodies
         #[arg(long)]
         no_collapse: bool,
+        /// Exclude turns absent from the final replay
+        #[arg(long)]
+        final_only: bool,
+        /// Include up to three curated vault records
+        #[arg(long)]
+        curated: bool,
     },
     /// Fork a captured session into a fresh native Claude/Codex/Pi session
     Fork {
@@ -137,16 +144,28 @@ fn run() -> Result<()> {
                     show(&root, &id, stats, !cli.no_fetch)
                 }
                 Cmd::Session(SessionCmd::Index {
-                    update: _,
+                    update,
                     rebuild,
                     workers,
-                }) => index(&root, rebuild, workers),
+                }) => index(&root, update, rebuild, workers),
                 Cmd::Session(SessionCmd::Search {
                     query,
                     limit,
                     json,
                     no_collapse,
-                }) => search(&root, &query.join(" "), limit, json, !no_collapse),
+                    final_only,
+                    curated,
+                }) => search(
+                    &root,
+                    &query.join(" "),
+                    session_index::SearchOptions {
+                        limit,
+                        collapse: !no_collapse,
+                        final_only,
+                        curated,
+                    },
+                    json,
+                ),
                 Cmd::Session(SessionCmd::Fork {
                     id,
                     into,
@@ -182,17 +201,24 @@ fn run() -> Result<()> {
     }
 }
 
-fn index(root: &std::path::Path, rebuild: bool, workers: Option<usize>) -> Result<()> {
-    let directory = session_index::state_root().join("sessions");
-    if rebuild && directory.exists() {
-        std::fs::remove_dir_all(&directory)?;
+fn index(
+    root: &std::path::Path,
+    update: bool,
+    rebuild: bool,
+    workers: Option<usize>,
+) -> Result<()> {
+    if !update && !rebuild {
+        anyhow::bail!("choose `--update` or `--rebuild`");
     }
-    let stats = session_index::build_session_index(root, workers.unwrap_or(1))?;
+    let stats = session_index::update_indexes(root, workers.unwrap_or(1), rebuild)?;
     println!(
-        "indexed {} sessions and {} turns with {} worker(s)",
+        "indexed {} sessions and {} turns ({} changed); {} curated records ({} changed) with {} worker(s)",
         stats.sessions,
         stats.turns,
-        workers.unwrap_or(1).max(1),
+        stats.changed_sessions,
+        stats.curated_documents,
+        stats.changed_curated_documents,
+        stats.workers,
     );
     Ok(())
 }
@@ -200,23 +226,24 @@ fn index(root: &std::path::Path, rebuild: bool, workers: Option<usize>) -> Resul
 fn search(
     root: &std::path::Path,
     query: &str,
-    limit: usize,
+    options: session_index::SearchOptions,
     json: bool,
-    collapse: bool,
 ) -> Result<()> {
-    let results = session_index::search_sessions(query, limit, collapse)?;
-    let newer_sessions = results.built_at.as_deref().map_or(0, |built_at| {
-        vault::list_sessions(root)
-            .map(|sessions| {
-                sessions
-                    .into_iter()
-                    .filter(|session| session.meta.last_activity() > built_at)
-                    .count()
-            })
-            .unwrap_or(0)
-    });
-    let warnings = (results.built_at.is_none() || newer_sessions > 0)
-        .then_some("index may be stale; run `vaultr session index --update`");
+    let results = session_index::search(query, &options)?;
+    let freshness = index_freshness(results.built_at.as_deref());
+    let newer_sessions = if let Some(freshness) = freshness.as_deref() {
+        vault::list_sessions(root)?
+            .into_iter()
+            .filter(|session| timestamp_after(session.meta.last_activity(), freshness))
+            .count()
+    } else {
+        0
+    };
+    let warnings = if freshness.is_none() || newer_sessions > 0 {
+        vec!["index may be stale; run `vaultr session index --update`"]
+    } else {
+        Vec::new()
+    };
     if json {
         println!(
             "{}",
@@ -224,23 +251,51 @@ fn search(
                 "query": query,
                 "total": results.total,
                 "shown": results.hits.len(),
-                "freshness": results.built_at,
-                "warnings": warnings.iter().collect::<Vec<_>>(),
+                "curated_total": results.curated_total,
+                "curated_shown": results.curated_hits.len(),
+                "freshness": freshness,
+                "warnings": warnings,
                 "sessions_since_build": newer_sessions,
+                "coverage": results.coverage,
+                "curated_hits": results.curated_hits,
                 "hits": results.hits,
             })
         );
         return Ok(());
     }
-    if let Some(warning) = warnings {
+    for warning in warnings {
         eprintln!("warning: {warning}");
     }
+    if options.curated {
+        println!(
+            "{} of {} curated hit(s) shown",
+            results.curated_hits.len(),
+            results.curated_total,
+        );
+        for hit in results.curated_hits {
+            println!("{} | score={:.3}", hit.path, hit.score);
+            println!("{}", hit.snippet);
+        }
+    }
     println!(
-        "{} of {} hit(s) shown; built {}; {} sessions captured since build",
+        "{} of {} session hit(s) shown; built {}; {} sessions captured since build",
         results.hits.len(),
         results.total,
-        results.built_at.as_deref().unwrap_or("-"),
+        freshness.as_deref().unwrap_or("-"),
         newer_sessions,
+    );
+    println!(
+        "metadata coverage: harness={}/{}, cwd={}/{}, branch={}/{}, model={}/{}, timestamp={}/{}",
+        results.coverage.harness,
+        results.coverage.sessions,
+        results.coverage.cwd,
+        results.coverage.sessions,
+        results.coverage.branch,
+        results.coverage.sessions,
+        results.coverage.model,
+        results.coverage.sessions,
+        results.coverage.timestamp,
+        results.coverage.sessions,
     );
     for hit in results.hits {
         let markers = [
@@ -278,12 +333,43 @@ fn search(
                 format!(" | {markers}")
             },
         );
-        println!(
-            "{}",
-            hit.body.lines().take(3).collect::<Vec<_>>().join("\n")
-        );
+        println!("{}", hit.snippet);
     }
     Ok(())
+}
+
+fn timestamp_after(activity: &str, built_at: &str) -> bool {
+    match (
+        chrono::DateTime::parse_from_rfc3339(activity),
+        chrono::DateTime::parse_from_rfc3339(built_at),
+    ) {
+        (Ok(activity), Ok(built_at)) => activity > built_at,
+        _ => !activity.is_empty() && activity > built_at,
+    }
+}
+
+fn index_freshness(built_at: Option<&str>) -> Option<String> {
+    let ledger = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".local/state/plant/jobs/session-index.jsonl"));
+    let ledger_timestamp = ledger
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| {
+            text.lines()
+                .rev()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find(|record| {
+                    record.get("outcome").and_then(serde_json::Value::as_str) == Some("success")
+                })
+                .and_then(|record| record.get("ts").and_then(serde_json::Value::as_i64))
+        })
+        .and_then(|timestamp| chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp, 0))
+        .map(|timestamp| timestamp.to_rfc3339());
+    match (built_at, ledger_timestamp) {
+        (Some(built_at), Some(ledger)) if timestamp_after(&ledger, built_at) => Some(ledger),
+        (Some(built_at), _) => Some(built_at.to_string()),
+        (None, ledger) => ledger,
+    }
 }
 
 fn list(root: &std::path::Path, all: bool) -> Result<()> {

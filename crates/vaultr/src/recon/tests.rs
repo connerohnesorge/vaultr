@@ -64,6 +64,65 @@ fn reconstruction_marks_broken_lineage_partial_and_continues() {
 }
 
 #[test]
+fn reconstruction_retains_repeated_message_occurrences() {
+    let first = env_append(0, "user", "repeat");
+    let second = json!({
+        "harness": "claude-code",
+        "request": { "body_delta": { "history": {
+            "key": "messages",
+            "prefix_length": 1,
+            "append": [
+                {"role": "assistant", "content": "first answer"},
+                {"role": "user", "content": "repeat"}
+            ],
+        }}},
+    });
+    let r = reconstruct_reader(format!("{first}\n{second}\n").as_bytes()).unwrap();
+    let repeated = r
+        .observed_messages
+        .iter()
+        .filter(|message| message.message["content"] == "repeat")
+        .count();
+    assert_eq!(repeated, 2);
+    assert_eq!(r.observed_messages.len(), 3);
+}
+
+#[test]
+fn reconstruction_retains_response_compacted_before_next_request() {
+    let first = json!({
+        "harness": "claude-code",
+        "observed_at": "2026-01-01T00:00:00Z",
+        "request": { "body_delta": { "history": {
+            "key": "messages",
+            "prefix_length": 0,
+            "append": [{"role": "user", "content": "first"}],
+        }}},
+        "response": {
+            "complete": true,
+            "events": [
+                {"type": "content_block_start", "index": 0,
+                 "content_block": {"type": "text", "text": ""}},
+                {"type": "content_block_delta", "index": 0,
+                 "delta": {"type": "text_delta", "text": "vanished answer"}},
+                {"type": "message_stop"}
+            ]
+        }
+    });
+    let second = env_append(0, "user", "after compaction");
+    let r = reconstruct_reader(format!("{first}\n{second}\n").as_bytes()).unwrap();
+    let vanished = r
+        .observed_messages
+        .iter()
+        .find(|message| message.message.to_string().contains("vanished answer"))
+        .expect("completed output must remain observable");
+    assert!(!vanished.in_final_replay);
+    assert_eq!(
+        vanished.observed_at.as_deref(),
+        Some("2026-01-01T00:00:00Z")
+    );
+}
+
+#[test]
 fn sealed_segment_fails_on_malformed_trailing_content() {
     // A sealed (fully terminated) capture must not silently drop a broken tail.
     let a = env_append(0, "user", "a");

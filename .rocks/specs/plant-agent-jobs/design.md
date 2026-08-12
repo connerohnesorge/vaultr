@@ -75,18 +75,3 @@ A matching terminal capture produces a conclusive receipt.
 A conclusively absent execution without a terminal capture produces a conclusive failure.
 Unavailable or conflicting evidence retains the receipt and the attempt fence.
 Legacy receipts lack the identity and keep the existing operator recovery path.
-
-
-### ADR-0006: Rotate due jobs before worker launch
-
-The scheduler keeps a process-local queue of due ordinary job names. Each scan refreshes membership without resetting the current order. The scheduler launches only the configured number of admission turns. A rejected job returns behind the other due jobs. Restart rebuilds the queue from durable cadence state.
-
-Cross-process capacity admission remains before the per-job attempt guard. The worker performs the durable cadence recheck after admission. Capacity rejection writes a job-named diagnostic without creating a fence or ledger outcome. Unreadable attempt state remains fail-closed.
-
-### ADR-0007: Own learner batches with the scheduled attempt
-
-A learner claim stores the inherited `PLANT_ATTEMPT_ID` as its owner. Claude and Codex use separate lease files and locks. The Agent Run idempotency key uses the same value.
-
-The initial Herdr workspace-list probe has a bounded retry budget. Exhaustion before workspace creation proves that no Agent Run effect started. Plant then removes only lease files whose owner equals the keyed attempt. It makes the idempotency key retryable only after the owner-scoped release succeeds.
-
-Workspace creation is the retention boundary. Plant retains the learner lease after workspace creation, prompt delivery, a failed run, or uncertain evidence. This rule prevents a replacement batch from starting while an Agent Run effect can still exist.

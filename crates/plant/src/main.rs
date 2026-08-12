@@ -102,7 +102,6 @@ async fn dispatch(command: Command) -> i32 {
                     args.max,
                     args.learner,
                     lease,
-                    std::env::var("PLANT_ATTEMPT_ID").ok().as_deref(),
                 ) {
                     Ok(list) => list,
                     Err(error) => {

@@ -372,11 +372,6 @@ pub(crate) async fn run_idempotent(agent_run: AgentRun, key: &str) -> AgentRunRe
     };
     let outcome = match run_agent_with_progress(agent_run, Some(&progress)).await {
         AgentRunOutcome::Unavailable => {
-            if let Err(error) = crate::sweep::release_inflight_owned(&crate::vault_root(), key) {
-                return AgentRunReceipt::Indeterminate {
-                    detail: format!("could not release unavailable learner batch: {error}"),
-                };
-            }
             return match std::fs::remove_file(&path).and_then(|_| crate::state::sync_dir(&dir)) {
                 Ok(()) => AgentRunReceipt::Retryable {
                     detail: "herdr unavailable before launch".to_string(),

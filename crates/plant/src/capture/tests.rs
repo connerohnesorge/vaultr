@@ -792,6 +792,43 @@ async fn detachment_rechecks_behind_a_finishing_capture() {
 }
 
 #[tokio::test]
+async fn sealing_scrubs_state_before_detached_capture_commit() {
+    if !crate::process::which("zstd") {
+        return;
+    }
+    let (_guard, vault) = set_home();
+    let adapter = claude_adapter();
+    let sid = uuid::Uuid::new_v4().to_string();
+    let secret = "AKIAIOSFODNN7EXAMPLE";
+    let pending = prepare_capture(
+        &vault,
+        &adapter,
+        captured(Some(&sid)),
+        json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": secret}]
+        }),
+    )
+    .await
+    .unwrap();
+    let directory = pending.dir.clone();
+    finish_capture(&vault, &adapter, pending, &response(true))
+        .await
+        .unwrap();
+
+    seal_ready_generation(&vault, &sid, &directory)
+        .await
+        .unwrap()
+        .expect("capture seals");
+
+    let state = fs::read_to_string(directory.join("state.json")).unwrap();
+    assert!(!state.contains(secret));
+    assert!(state.contains("[REDACTED]"));
+    assert!(!directory.join("turns.jsonl").exists());
+    assert!(directory.join("turns.jsonl.zst").exists());
+}
+
+#[tokio::test]
 async fn detachment_includes_a_completion_queued_first() {
     if !crate::process::which("zstd") {
         return;
