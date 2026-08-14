@@ -44,6 +44,44 @@ pub struct Job {
     pub path: PathBuf,
     pub every: Duration,
     pub action: JobAction,
+    /// The job declared `# plant: idempotent`, so an abandoned attempt may be
+    /// cleared without asking whether its effects landed. See `IDEMPOTENT_MARKER`.
+    pub idempotent: bool,
+}
+
+/// A job asserting that running it twice costs nothing.
+///
+/// Without this, an attempt that dies between its last side effect and its
+/// ledger write blocks its job FOREVER: `reconcile_fence_at` cannot tell that
+/// case from one where nothing ran, so it fails safe and waits for a human.
+/// That is correct for `door-mail`, which would re-send. It is absurd for
+/// `session-index`, which recomputes an index from scratch — and it is what
+/// left session-index silent for 41h after a reboot on 2026-08-12, with only a
+/// "silent" line in the health sweep to show for it.
+///
+/// Declared in the job file rather than in plant, for the same reason the
+/// cadence lives in the filename: the claim belongs next to the code that has
+/// to keep it true. Absent marker means today's blocking behaviour, so a job
+/// that says nothing is still treated as unsafe to repeat.
+const IDEMPOTENT_MARKER: &str = "# plant: idempotent";
+
+/// Read the declaration from a job file's header.
+///
+/// Only the first 2 KiB is examined: the marker is a header declaration, and a
+/// job must not be able to acquire it by mentioning the phrase in passing far
+/// down in its body.
+fn declares_idempotent(path: &Path) -> bool {
+    let Ok(file) = File::open(path) else {
+        return false;
+    };
+    let mut head = vec![0u8; 2048];
+    let read = match std::io::Read::read(&mut file.take(2048), &mut head) {
+        Ok(read) => read,
+        Err(_) => return false,
+    };
+    String::from_utf8_lossy(&head[..read])
+        .lines()
+        .any(|line| line.trim() == IDEMPOTENT_MARKER)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -120,11 +158,13 @@ fn jobs_in(dir: &Path) -> Vec<Job> {
             let file_name = path.file_name()?.to_str()?.to_string();
             let (name, every) = parse_job_filename(&file_name)?;
             let action = action_for(&name);
+            let idempotent = declares_idempotent(&path);
             Some(Job {
                 name,
                 path,
                 every,
                 action,
+                idempotent,
             })
         })
         .collect()
@@ -573,6 +613,7 @@ fn reconcile_fence_at<F>(
     attempt_parent: &Path,
     ledger_path: &Path,
     ledger_parent: &Path,
+    idempotent: bool,
     sync: F,
 ) -> io::Result<FenceReconcile>
 where
@@ -595,6 +636,19 @@ where
         if existing.action == Some(JobAction::InProcessCompression) {
             return Ok(FenceReconcile::ResumableCompression(existing));
         }
+        // Every `Blocked` below exists because a missing ledger record cannot
+        // prove whether the effects landed. A job that declared itself
+        // idempotent has made that question consequence-free, so it clears
+        // instead of waiting for a human. The receipt lookup still runs first:
+        // a conclusive receipt is real history and is worth recording either
+        // way.
+        let block = |detail: String| {
+            if idempotent {
+                None
+            } else {
+                Some(FenceReconcile::Blocked(detail))
+            }
+        };
         // No ledger record, but the attempt ID doubles as the Agent Run
         // idempotency key: a conclusive receipt proves the effect finished even
         // though the scheduler died before recording it.
@@ -620,25 +674,31 @@ where
             // retryable. Clearing here would re-run plain script jobs whose
             // only failure was appending the final ledger record.
             Ok(crate::agent_run::ReceiptLookup::Absent) => {
-                return Ok(FenceReconcile::Blocked(format!(
+                if let Some(blocked) = block(format!(
                     "attempt {} has no durable final outcome; \
                      if it is abandoned, run `plant jobs unblock {name}`",
                     existing.id
-                )))
+                )) {
+                    return Ok(blocked);
+                }
             }
             Ok(crate::agent_run::ReceiptLookup::Pending { .. }) => {
-                return Ok(FenceReconcile::Blocked(format!(
+                if let Some(blocked) = block(format!(
                     "attempt {} claimed an agent run that never finished; \
                      if its agent is gone, run `plant jobs unblock {name}`",
                     existing.id
-                )))
+                )) {
+                    return Ok(blocked);
+                }
             }
             Err(error) => {
-                return Ok(FenceReconcile::Blocked(format!(
+                if let Some(blocked) = block(format!(
                     "attempt {} has an unreadable agent run receipt: {error}; \
                      run `plant jobs unblock {name}`",
                     existing.id
-                )))
+                )) {
+                    return Ok(blocked);
+                }
             }
         }
     }
@@ -647,7 +707,7 @@ where
     Ok(FenceReconcile::Ready)
 }
 
-fn reconcile_fence(name: &str) -> io::Result<FenceReconcile> {
+fn reconcile_fence(name: &str, idempotent: bool) -> io::Result<FenceReconcile> {
     let ledger = ledger_path(name);
     reconcile_fence_at(
         name,
@@ -655,12 +715,13 @@ fn reconcile_fence(name: &str) -> io::Result<FenceReconcile> {
         &attempt_dir(),
         &ledger,
         ledger.parent().expect("job ledger has a parent"),
+        idempotent,
         File::sync_all,
     )
 }
 
-async fn reconcile_fence_live(name: &str) -> io::Result<FenceReconcile> {
-    let result = reconcile_fence(name)?;
+async fn reconcile_fence_live(name: &str, idempotent: bool) -> io::Result<FenceReconcile> {
+    let result = reconcile_fence(name, idempotent)?;
     if !matches!(result, FenceReconcile::Blocked(_)) {
         return Ok(result);
     }
@@ -682,7 +743,7 @@ async fn reconcile_fence_live(name: &str) -> io::Result<FenceReconcile> {
         _ => return Ok(result),
     };
     match crate::agent_run::recover_pending(&fence.id, &checkpoint).await? {
-        crate::agent_run::PendingRecovery::Recovered => reconcile_fence(name),
+        crate::agent_run::PendingRecovery::Recovered => reconcile_fence(name, idempotent),
         crate::agent_run::PendingRecovery::Retained(detail) => Ok(FenceReconcile::Blocked(
             format!("attempt {} recovery retained: {detail}", fence.id),
         )),
@@ -717,7 +778,7 @@ pub fn unblock_job(name: &str) -> io::Result<Unblocked> {
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     // Never force what resolves itself — a conclusive receipt or a matching
     // ledger record must still take the ordinary reconciliation path.
-    match reconcile_fence(name)? {
+    match reconcile_fence(name, false)? {
         FenceReconcile::Ready | FenceReconcile::ResumableCompression(_) => {
             return Ok(Unblocked::AlreadyClear)
         }
@@ -787,7 +848,7 @@ fn publish_attempt(name: &str, action: JobAction, lock: File) -> io::Result<Atte
 #[cfg(test)]
 fn begin_attempt_locked(name: &str, lock: File) -> io::Result<AttemptStart> {
     verify_ledger_writable(name)?;
-    match reconcile_fence(name)? {
+    match reconcile_fence(name, false)? {
         FenceReconcile::Ready => {
             publish_attempt(name, JobAction::Script, lock).map(AttemptStart::Ready)
         }
@@ -807,13 +868,13 @@ fn begin_attempt(name: &str) -> io::Result<AttemptStart> {
     }
 }
 
-async fn begin_attempt_live(name: &str) -> io::Result<AttemptStart> {
+async fn begin_attempt_live(name: &str, idempotent: bool) -> io::Result<AttemptStart> {
     let lock = match acquire_attempt_lock(name)? {
         AttemptLockStart::Ready(lock) => lock,
         AttemptLockStart::Blocked(detail) => return Ok(AttemptStart::Blocked(detail)),
     };
     verify_ledger_writable(name)?;
-    match reconcile_fence_live(name).await? {
+    match reconcile_fence_live(name, idempotent).await? {
         FenceReconcile::Ready => {
             publish_attempt(name, JobAction::Script, lock).map(AttemptStart::Ready)
         }
@@ -838,7 +899,7 @@ fn begin_scheduled_attempt(job: &Job) -> io::Result<ScheduledAttemptStart> {
         AttemptLockStart::Blocked(detail) => return Ok(ScheduledAttemptStart::Blocked(detail)),
     };
     verify_ledger_writable(&job.name)?;
-    match reconcile_fence(&job.name)? {
+    match reconcile_fence(&job.name, job.idempotent)? {
         FenceReconcile::Ready => {}
         FenceReconcile::ResumableCompression(fence) => {
             return Ok(ScheduledAttemptStart::Ready(AttemptGuard {
@@ -862,7 +923,7 @@ async fn begin_scheduled_attempt_live(job: &Job) -> io::Result<ScheduledAttemptS
         AttemptLockStart::Blocked(detail) => return Ok(ScheduledAttemptStart::Blocked(detail)),
     };
     verify_ledger_writable(&job.name)?;
-    match reconcile_fence_live(&job.name).await? {
+    match reconcile_fence_live(&job.name, job.idempotent).await? {
         FenceReconcile::Ready => {}
         FenceReconcile::ResumableCompression(fence) => {
             return Ok(ScheduledAttemptStart::Ready(AttemptGuard {
@@ -1140,7 +1201,7 @@ fn finish_execution(
 }
 
 pub async fn run_job(job: &Job) -> i32 {
-    let attempt = match begin_attempt_live(&job.name).await {
+    let attempt = match begin_attempt_live(&job.name, job.idempotent).await {
         Ok(AttemptStart::Ready(attempt)) => attempt,
         Ok(AttemptStart::Blocked(detail)) => {
             eprintln!("[job:{}] dispatch blocked: {detail}", job.name);
@@ -1420,12 +1481,69 @@ mod tests {
         // The incident shape. Absent must NOT auto-clear: a job that dispatches
         // no agent never writes a receipt, so clearing would re-run a script
         // whose only failure was appending its final ledger record.
-        let FenceReconcile::Blocked(detail) = reconcile_fence("j").unwrap() else {
+        let FenceReconcile::Blocked(detail) = reconcile_fence("j", false).unwrap() else {
             panic!("an unproven outcome must not silently re-dispatch");
         };
         assert!(detail.contains("plant jobs unblock j"), "{detail}");
         assert!(attempt_path("j").exists());
         std::fs::remove_dir_all(state.parent().unwrap()).unwrap();
+    }
+
+    // Same fence, same absent receipt, opposite answer — the declaration is
+    // the only difference. session-index sat in exactly this state for 41h
+    // after a reboot killed it mid-run on 2026-08-12.
+    #[test]
+    fn an_idempotent_job_clears_the_fence_the_same_state_blocks_for_others() {
+        let (state, _guard) = fenced_job("fence-idempotent", "never-recorded");
+        assert!(
+            matches!(
+                reconcile_fence("j", false).unwrap(),
+                FenceReconcile::Blocked(_)
+            ),
+            "control: this state must block without the declaration"
+        );
+        assert!(attempt_path("j").exists());
+
+        assert!(
+            matches!(reconcile_fence("j", true).unwrap(), FenceReconcile::Ready),
+            "an idempotent job has nothing to protect by waiting"
+        );
+        assert!(
+            !attempt_path("j").exists(),
+            "a cleared fence must be gone from disk, not just reported Ready"
+        );
+        std::fs::remove_dir_all(state.parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn the_idempotent_marker_is_a_header_declaration_not_a_body_mention() {
+        let dir = std::env::temp_dir().join(format!("plant-idem-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let declared = dir.join("declared.5m.sh");
+        std::fs::write(
+            &declared,
+            "#!/usr/bin/env bash\n# plant: idempotent\nexit 0\n",
+        )
+        .unwrap();
+        assert!(declares_idempotent(&declared));
+
+        // Far enough down to be past the header window. A job must not inherit
+        // the guarantee by quoting the phrase in a comment or a heredoc.
+        let buried = dir.join("buried.5m.sh");
+        let mut body = String::from("#!/usr/bin/env bash\n");
+        body.push_str(&"# filler\n".repeat(400));
+        body.push_str("# plant: idempotent\n");
+        std::fs::write(&buried, &body).unwrap();
+        assert!(body.len() > 2048);
+        assert!(!declares_idempotent(&buried));
+
+        let silent = dir.join("silent.5m.sh");
+        std::fs::write(&silent, "#!/usr/bin/env bash\nexit 0\n").unwrap();
+        assert!(!declares_idempotent(&silent));
+        assert!(!declares_idempotent(&dir.join("missing.5m.sh")));
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1436,7 +1554,7 @@ mod tests {
             "claimed-never-finished",
             r#"{"state":"in_progress","key":"claimed-never-finished"}"#,
         );
-        let FenceReconcile::Blocked(detail) = reconcile_fence("j").unwrap() else {
+        let FenceReconcile::Blocked(detail) = reconcile_fence("j", false).unwrap() else {
             panic!("a claimed run with no outcome is genuinely ambiguous and must block");
         };
         assert!(detail.contains("plant jobs unblock j"), "{detail}");
@@ -1453,7 +1571,7 @@ mod tests {
             r#"{"state":"succeeded","key":"finished","detail":"agent done"}"#,
         );
         assert!(matches!(
-            reconcile_fence("j").unwrap(),
+            reconcile_fence("j", false).unwrap(),
             FenceReconcile::Ready
         ));
         let ledger = std::fs::read_to_string(state.join("jobs/j.jsonl")).unwrap();
@@ -1678,6 +1796,7 @@ mod tests {
             path: root.join("compress.30m.sh"),
             every: Duration::from_secs(1800),
             action: JobAction::InProcessCompression,
+            idempotent: false,
         };
 
         let ScheduledAttemptStart::Ready(attempt) = begin_scheduled_attempt(&job).unwrap() else {
@@ -1749,7 +1868,7 @@ mod tests {
         );
 
         assert!(matches!(
-            reconcile_fence("script").unwrap(),
+            reconcile_fence("script", false).unwrap(),
             FenceReconcile::Ready
         ));
         let ledger = std::fs::read_to_string(state.join("jobs/script.jsonl")).unwrap();
@@ -1787,6 +1906,7 @@ mod tests {
             path: root.join("compress.30m.sh"),
             every: Duration::from_secs(1800),
             action: JobAction::InProcessCompression,
+            idempotent: false,
         };
 
         let ScheduledAttemptStart::Blocked(detail) = begin_scheduled_attempt(&job).unwrap() else {
@@ -1835,6 +1955,7 @@ mod tests {
             path: root.join("compress.30m.sh"),
             every: Duration::from_secs(1800),
             action: JobAction::InProcessCompression,
+            idempotent: false,
         };
 
         let ScheduledAttemptStart::Ready(attempt) = begin_scheduled_attempt(&job).unwrap() else {
@@ -1892,9 +2013,15 @@ mod tests {
             b"{\"attempt_id\":\"written-but-not-durable\",\"outcome\":\"success\"}\n",
         )
         .unwrap();
-        let error = reconcile_fence_at("t", &fence_path, &attempts, &ledger, &ledgers, |_| {
-            Err(io::Error::other("injected sync failure"))
-        })
+        let error = reconcile_fence_at(
+            "t",
+            &fence_path,
+            &attempts,
+            &ledger,
+            &ledgers,
+            false,
+            |_| Err(io::Error::other("injected sync failure")),
+        )
         .unwrap_err();
         assert_eq!(error.to_string(), "injected sync failure");
         assert_eq!(std::fs::read(&fence_path).unwrap(), original_fence);
@@ -1953,6 +2080,7 @@ mod tests {
                 &attempts,
                 &ledger,
                 &ledgers,
+                false,
                 File::sync_all,
             )
             .unwrap(),
@@ -1977,6 +2105,7 @@ mod tests {
                 &attempts,
                 &ledger,
                 &ledgers,
+                false,
                 File::sync_all,
             )
             .unwrap(),

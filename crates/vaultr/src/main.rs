@@ -220,6 +220,18 @@ fn index(
         stats.changed_curated_documents,
         stats.workers,
     );
+    // Loud on stderr, but not an error exit: these sessions are unreadable
+    // because their sealed bytes are already broken, so failing the run would
+    // only mean no index at all until someone hand-repairs an append-only file.
+    if !stats.unreadable.is_empty() {
+        eprintln!(
+            "warning: skipped {} unreadable session(s):",
+            stats.unreadable.len()
+        );
+        for session in &stats.unreadable {
+            eprintln!("  {}: {}", session.id, session.reason);
+        }
+    }
     Ok(())
 }
 

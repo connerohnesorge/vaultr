@@ -64,6 +64,7 @@ async fn capacity_wait_cancellation_leaves_no_attempt_fence() {
         path: root.join("waiting.1m.sh"),
         every: Duration::from_secs(60),
         action: JobAction::Script,
+        idempotent: false,
     };
     let semaphore = Arc::new(tokio::sync::Semaphore::new(0));
     let scheduled = tokio::spawn({
@@ -160,6 +161,7 @@ async fn health_escalation_does_not_block_sync_jobs() {
         path: health_path,
         every: Duration::from_secs(900),
         action: JobAction::Script,
+        idempotent: false,
     };
 
     let teams_path = root.join("teams-sync.30m.ts");
@@ -174,6 +176,7 @@ async fn health_escalation_does_not_block_sync_jobs() {
         path: teams_path,
         every: Duration::from_secs(1800),
         action: JobAction::Script,
+        idempotent: false,
     };
 
     let outlook_path = root.join("outlook-sync.30m.sh");
@@ -188,6 +191,7 @@ async fn health_escalation_does_not_block_sync_jobs() {
         path: outlook_path,
         every: Duration::from_secs(1800),
         action: JobAction::Script,
+        idempotent: false,
     };
 
     let second_health = health.clone();
@@ -272,6 +276,7 @@ async fn failed_health_escalation_releases_supervisory_capacity() {
         path: health_path,
         every: Duration::from_secs(900),
         action: JobAction::Script,
+        idempotent: false,
     };
 
     assert_eq!(
@@ -303,6 +308,7 @@ async fn failed_compression_releases_normal_capacity() {
         path: root.join("compress.30m.sh"),
         every: Duration::from_secs(1800),
         action: JobAction::InProcessCompression,
+        idempotent: false,
     };
 
     assert_eq!(
@@ -335,6 +341,7 @@ async fn worker_without_capacity_publishes_no_attempt_fence() {
         path: script,
         every: Duration::from_secs(1800),
         action: JobAction::Script,
+        idempotent: false,
     };
     let occupied = try_acquire_worker_capacity(1).unwrap().unwrap();
 
@@ -369,6 +376,7 @@ async fn same_job_workers_share_one_attempt_flock() {
         path: root.join("same-job.1m.sh"),
         every: Duration::from_secs(60),
         action: JobAction::Script,
+        idempotent: false,
     };
     let capacity = try_acquire_worker_capacity(2).unwrap().unwrap();
     let first = match begin_scheduled_attempt(&job).unwrap() {
@@ -410,6 +418,7 @@ async fn concurrent_schedulers_execute_one_due_period() {
         path: script,
         every: Duration::from_secs(60),
         action: JobAction::Script,
+        idempotent: false,
     };
     let first_capacity = tokio::sync::Semaphore::new(1);
     let second_capacity = tokio::sync::Semaphore::new(1);
@@ -451,6 +460,7 @@ async fn dispatch_holds_one_guard_across_capacity_and_typed_execution() {
         path: wrapper,
         every: Duration::from_secs(1800),
         action: JobAction::InProcessCompression,
+        idempotent: false,
     };
 
     crate::capture::reset_recovery_calls();
@@ -516,6 +526,7 @@ async fn dispatch_holds_one_guard_across_capacity_and_typed_execution() {
         path: retry_path,
         every: Duration::from_secs(60),
         action: JobAction::Script,
+        idempotent: false,
     };
     let retry_semaphore = tokio::sync::Semaphore::new(1);
     assert_eq!(
@@ -547,6 +558,7 @@ async fn dispatch_holds_one_guard_across_capacity_and_typed_execution() {
         path: hanging_path,
         every: Duration::from_secs(60),
         action: JobAction::Script,
+        idempotent: false,
     };
     let started = std::time::Instant::now();
     assert_eq!(
@@ -607,6 +619,7 @@ async fn resumed_compression_uses_the_durable_action_inside_the_daemon() {
         every: Duration::from_secs(1800),
         // The durable fence, not current discovery metadata, owns replay.
         action: JobAction::Script,
+        idempotent: false,
     };
 
     let semaphore = tokio::sync::Semaphore::new(1);
@@ -659,6 +672,7 @@ async fn typed_script_fence_without_a_receipt_stays_blocked() {
         path: script,
         every: Duration::from_secs(60),
         action: JobAction::Script,
+        idempotent: false,
     };
 
     let semaphore = tokio::sync::Semaphore::new(1);
@@ -716,6 +730,7 @@ async fn ledger_backed_fence_clears_without_execution() {
         path: wrapper,
         every: Duration::from_secs(1800),
         action: JobAction::InProcessCompression,
+        idempotent: false,
     };
 
     let semaphore = tokio::sync::Semaphore::new(1);
@@ -784,6 +799,7 @@ async fn conclusive_receipts_reconcile_fences_the_scheduler_never_recorded() {
         path: script,
         every: Duration::from_secs(60),
         action: JobAction::Script,
+        idempotent: false,
     };
 
     // The script sees the published attempt ID, so it can key its agent run.
@@ -814,7 +830,7 @@ async fn conclusive_receipts_reconcile_fences_the_scheduler_never_recorded() {
         strand_fence(&state, "audit", id);
         write_receipt(&state, id, body);
         assert!(matches!(
-            reconcile_fence("audit").unwrap(),
+            reconcile_fence("audit", false).unwrap(),
             FenceReconcile::Ready
         ));
         assert!(!state.join("job-attempts/audit.json").exists());
@@ -860,7 +876,7 @@ async fn conclusive_receipts_reconcile_fences_the_scheduler_never_recorded() {
             write_receipt(&state, id, body);
         }
         let before = std::fs::read_to_string(state.join("jobs/audit.jsonl")).unwrap();
-        match reconcile_fence("audit").unwrap() {
+        match reconcile_fence("audit", false).unwrap() {
             FenceReconcile::Blocked(detail) => assert!(detail.contains(id), "{detail}"),
             FenceReconcile::Ready | FenceReconcile::ResumableCompression(_) => {
                 panic!("{id} must not clear its fence")
@@ -902,6 +918,7 @@ async fn incomplete_pending_identity_retains_the_attempt_fence() {
         path: root.join("identity.1m.sh"),
         every: Duration::from_secs(60),
         action: JobAction::Script,
+        idempotent: false,
     };
     strand_fence(&state, "identity", "pending-identity");
     write_receipt(
@@ -949,6 +966,7 @@ async fn scheduled_record_failure_blocks_the_next_dispatch() {
         path: script,
         every: Duration::from_secs(60),
         action: JobAction::Script,
+        idempotent: false,
     };
     let semaphore = tokio::sync::Semaphore::new(1);
 
