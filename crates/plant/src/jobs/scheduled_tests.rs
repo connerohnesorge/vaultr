@@ -52,6 +52,25 @@ fn unresolved_fence_does_not_remove_door_teams_from_admission() {
     assert_eq!(admission.take(1), vec!["door-teams"]);
 }
 
+#[test]
+fn reserved_durability_work_bypasses_a_saturated_ordinary_queue() {
+    let due = [
+        "capture-audit".to_string(),
+        "door-teams".to_string(),
+        "health".to_string(),
+        "seal-push".to_string(),
+        "teams-sync".to_string(),
+    ];
+    let mut admission = DueJobAdmission::default();
+    admission.refresh(&due);
+
+    assert_eq!(
+        admission.take_with_reserved(1),
+        vec!["capture-audit", "health", "seal-push"]
+    );
+    assert_eq!(admission.take(1), vec!["door-teams"]);
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn capacity_wait_cancellation_leaves_no_attempt_fence() {
     let root =
@@ -102,15 +121,14 @@ async fn cross_process_capacity_lease_is_bounded() {
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn supervisory_capacity_is_bounded_and_separate_from_normal_capacity() {
-    let root = std::env::temp_dir().join(format!(
-        "plant-supervisory-capacity-{}",
-        uuid::Uuid::new_v4()
-    ));
+async fn reserved_capacity_is_bounded_and_separate_from_normal_capacity() {
+    let root =
+        std::env::temp_dir().join(format!("plant-reserved-capacity-{}", uuid::Uuid::new_v4()));
     let state = root.join("state");
     let _state = crate::state::use_test_dir(state);
 
     assert_eq!(worker_class("health"), WorkerClass::Supervisory);
+    assert_eq!(worker_class("seal-push"), WorkerClass::Durability);
     assert_eq!(worker_class("teams-sync"), WorkerClass::Ordinary);
 
     let supervisory = try_acquire_supervisory_capacity().unwrap().unwrap();
@@ -118,13 +136,20 @@ async fn supervisory_capacity_is_bounded_and_separate_from_normal_capacity() {
         try_acquire_supervisory_capacity().unwrap().is_none(),
         "a second health worker cannot acquire the supervisory lease"
     );
+    let durability = try_acquire_durability_capacity().unwrap().unwrap();
+    assert!(
+        try_acquire_durability_capacity().unwrap().is_none(),
+        "a second seal-push worker cannot acquire the durability lease"
+    );
     let ordinary = try_acquire_worker_capacity(1)
         .unwrap()
-        .expect("health must not consume normal capacity");
+        .expect("reserved jobs must not consume normal capacity");
 
     drop(ordinary);
+    drop(durability);
     drop(supervisory);
     assert!(try_acquire_supervisory_capacity().unwrap().is_some());
+    assert!(try_acquire_durability_capacity().unwrap().is_some());
     std::fs::remove_dir_all(root).unwrap();
 }
 

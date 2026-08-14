@@ -370,6 +370,29 @@ impl DueJobAdmission {
             .collect()
     }
 
+    /// Admit every due reserved-class job alongside at most `ordinary_turns`
+    /// ordinary jobs. Reserved jobs have isolated durable leases, so leaving
+    /// them behind a saturated ordinary queue would strand their work despite
+    /// capacity being available for it.
+    fn take_with_reserved(&mut self, ordinary_turns: usize) -> Vec<String> {
+        let mut selected = Vec::new();
+        let mut deferred = VecDeque::new();
+        let mut ordinary = 0;
+
+        while let Some(name) = self.pending.pop_front() {
+            if worker_class(&name) != WorkerClass::Ordinary || ordinary < ordinary_turns {
+                if worker_class(&name) == WorkerClass::Ordinary {
+                    ordinary += 1;
+                }
+                selected.push(name);
+            } else {
+                deferred.push_back(name);
+            }
+        }
+        self.pending = deferred;
+        selected
+    }
+
     fn requeue(&mut self, name: String) {
         if !self.pending.iter().any(|queued| queued == &name) {
             self.pending.push_back(name);
@@ -413,13 +436,14 @@ fn worker_lease_dir() -> PathBuf {
 enum WorkerClass {
     Ordinary,
     Supervisory,
+    Durability,
 }
 
 fn worker_class(name: &str) -> WorkerClass {
-    if name == "health" {
-        WorkerClass::Supervisory
-    } else {
-        WorkerClass::Ordinary
+    match name {
+        "health" => WorkerClass::Supervisory,
+        "seal-push" => WorkerClass::Durability,
+        _ => WorkerClass::Ordinary,
     }
 }
 
@@ -481,6 +505,24 @@ fn try_acquire_supervisory_capacity() -> io::Result<Option<WorkerCapacityLease>>
     try_acquire_capacity_file(file)
 }
 
+/// Acquire the single bounded lease reserved for durability-critical work.
+///
+/// Seal uploads remain possible when ordinary agent-backed work exhausts the
+/// configurable worker pool. This must not share the supervisory lease: health
+/// reports the incident, while `seal-push` prevents it.
+fn try_acquire_durability_capacity() -> io::Result<Option<WorkerCapacityLease>> {
+    let dir = worker_lease_dir();
+    ensure_dir_durable(&dir)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(dir.join("durability.lock"))?;
+    try_acquire_capacity_file(file)
+}
+
 fn try_acquire_job_capacity(
     job: &Job,
     normal_capacity: usize,
@@ -488,6 +530,7 @@ fn try_acquire_job_capacity(
     match worker_class(&job.name) {
         WorkerClass::Ordinary => try_acquire_worker_capacity(normal_capacity),
         WorkerClass::Supervisory => try_acquire_supervisory_capacity(),
+        WorkerClass::Durability => try_acquire_durability_capacity(),
     }
 }
 
@@ -1348,7 +1391,7 @@ pub async fn scheduler(cfg: Cfg, vault: PathBuf) {
         }
         let due_names: Vec<String> = due_jobs.iter().map(|job| job.name.clone()).collect();
         admission.refresh(&due_names);
-        for name in admission.take(cap) {
+        for name in admission.take_with_reserved(cap) {
             let Some(job) = due_jobs.iter().find(|job| job.name == name).cloned() else {
                 continue;
             };
