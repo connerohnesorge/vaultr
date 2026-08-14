@@ -75,3 +75,15 @@ A matching terminal capture produces a conclusive receipt.
 A conclusively absent execution without a terminal capture produces a conclusive failure.
 Unavailable or conflicting evidence retains the receipt and the attempt fence.
 Legacy receipts lack the identity and keep the existing operator recovery path.
+
+### ADR-0006: Seal upload capacity is isolated from agent work
+
+`seal-push` gets its own single cross-process scheduler lease and is selected
+alongside, rather than within, the configured ordinary capacity. Its offsite
+copy is a durability boundary, while ordinary slots commonly hold multi-minute
+Herdr agent runs; sharing the pool can silently defer seal uploads past their
+90-minute broker-contact alert threshold.
+
+The dedicated lease remains one-at-a-time and does not share `health`'s
+supervisory lease. Health observes a failure; `seal-push` prevents the failure,
+so either must remain runnable while the ordinary queue is saturated.

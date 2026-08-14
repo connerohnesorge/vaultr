@@ -95,6 +95,28 @@ Plant MUST NOT hardwire or map interpreters per extension.
 - THEN Plant records a failed attempt with the spawn error in the job ledger
 - AND the scheduler continues unaffected
 
+### Requirement: Reserved seal durability capacity
+
+Plant MUST reserve one bounded scheduler-capacity lease for `seal-push`, separate
+from both the configured ordinary worker pool and the `health` supervisory
+lease. Plant MUST select a due `seal-push` job for dispatch even when the
+ordinary worker pool is saturated. A second concurrent `seal-push` MUST remain
+bounded by that dedicated lease.
+
+#### Scenario: Ordinary jobs saturate the configured worker pool
+
+- GIVEN every ordinary scheduler-capacity slot is held by another job
+- WHEN `seal-push` becomes due
+- THEN Plant dispatches it against its dedicated durability lease
+- AND no ordinary job exceeds the configured worker-pool capacity
+
+#### Scenario: An existing seal upload is still running
+
+- GIVEN the dedicated durability lease is held by `seal-push`
+- WHEN another scheduler observes `seal-push` as due
+- THEN the second worker does not dispatch another seal upload
+- AND ordinary and `health` work remain independently admissible
+
 ### Requirement: Durable scheduled-job attempt fencing
 
 Plant MUST acquire scheduler capacity before it publishes a scheduled attempt fence.
