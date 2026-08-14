@@ -161,6 +161,9 @@ pub fn scan_bytes(bytes: &[u8], rel_path: &Path, policy: &Policy) -> Vec<Hit> {
 }
 
 /// Redact one text line using the same pattern set as the scanner.
+/// The single placeholder both scrub paths write.
+pub const REDACTED: &str = "[REDACTED]";
+
 pub fn redact_line(line: &str, policy: &Policy) -> (String, usize) {
     let bytes = line.as_bytes();
     let detections = matcher::find(bytes, policy.patterns(), policy.ignored_secrets());
@@ -172,10 +175,89 @@ pub fn redact_line(line: &str, policy: &Policy) -> (String, usize) {
     let mut output = line.to_owned();
     for range in redactions {
         if output.is_char_boundary(range.start) && output.is_char_boundary(range.end) {
-            output.replace_range(range, "[REDACTED]");
+            output.replace_range(range, REDACTED);
         }
     }
     (output, detections.len())
+}
+
+/// Redact a capture envelope without breaking the JSON that frames it.
+///
+/// `redact_line` edits raw bytes. That is right for plain text and wrong for an
+/// already-serialized JSON line: when a match span abuts an escaped quote it
+/// takes the `\` with it, the surviving bare `"` closes the string early, and
+/// the record stops parsing. 15 of 6981 sealed captures were corrupted that way
+/// before this existed, and one of them is enough to skip a session forever —
+/// `vault/sessions/` is append-only, so a seal written broken stays broken.
+///
+/// So decode first and redact inside the decoded string VALUES, letting serde
+/// re-escape on the way out. A redaction can then never change the framing,
+/// and matching improves as a side effect: a secret containing a quote or a
+/// newline is one string here, while in serialized form it was split across
+/// escapes that no needle matched.
+///
+/// Object KEYS are left alone. Redacting one can collide with a sibling and
+/// silently drop a field, and a protocol field name is not where a secret
+/// lives. The result is re-checked anyway, so a secret that somehow reached a
+/// key falls back to byte replacement rather than surviving: a broken record
+/// costs one session, a leaked credential costs a rotation.
+pub fn redact_capture_line(line: &str, needles: &[String], policy: &Policy) -> (String, usize) {
+    let byte_pass = |text: &str| -> (String, usize) {
+        let mut output = text.to_owned();
+        let mut hits = 0;
+        for needle in needles {
+            let found = output.matches(needle.as_str()).count();
+            if found > 0 {
+                hits += found;
+                output = output.replace(needle.as_str(), REDACTED);
+            }
+        }
+        let (output, pattern_hits) = redact_line(&output, policy);
+        (output, hits + pattern_hits)
+    };
+
+    // A line that was never JSON has no framing to protect — scrub it as text.
+    let Ok(mut value) = serde_json::from_str::<serde_json::Value>(line) else {
+        return byte_pass(line);
+    };
+    let mut hits = 0;
+    redact_json_strings(&mut value, &mut hits, &byte_pass);
+    let Ok(encoded) = serde_json::to_string(&value) else {
+        return byte_pass(line);
+    };
+    if byte_pass(&encoded).1 > 0 {
+        // Something matched outside a string value. Never seen in practice, but
+        // scrubbing has to fail closed.
+        return byte_pass(line);
+    }
+    (encoded, hits)
+}
+
+fn redact_json_strings(
+    value: &mut serde_json::Value,
+    hits: &mut usize,
+    redact: &impl Fn(&str) -> (String, usize),
+) {
+    match value {
+        serde_json::Value::String(text) => {
+            let (redacted, found) = redact(text);
+            if found > 0 {
+                *hits += found;
+                *text = redacted;
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                redact_json_strings(item, hits, redact);
+            }
+        }
+        serde_json::Value::Object(entries) => {
+            for (_, entry) in entries.iter_mut() {
+                redact_json_strings(entry, hits, redact);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Append a path/digest-scoped allowlist decision and update a loaded policy.

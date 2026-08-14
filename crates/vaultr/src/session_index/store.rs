@@ -75,6 +75,17 @@ pub struct SessionIndexStats {
     pub curated_documents: usize,
     pub changed_curated_documents: usize,
     pub workers: usize,
+    /// Sessions whose capture could not be reconstructed, newest-first.
+    ///
+    /// Reported rather than fatal: see `decode_sessions`.
+    pub unreadable: Vec<UnreadableSession>,
+}
+
+/// A session the index had to skip, and why.
+#[derive(Debug, Clone)]
+pub struct UnreadableSession {
+    pub id: String,
+    pub reason: String,
 }
 
 struct UpdateLock {
@@ -155,6 +166,7 @@ pub fn update_indexes(
         curated_documents: curated_stats.sources,
         changed_curated_documents: curated_stats.changed,
         workers: workers.max(1),
+        unreadable: session_stats.unreadable,
     })
 }
 
@@ -170,6 +182,7 @@ struct UpdateStats {
     sources: usize,
     documents: usize,
     changed: usize,
+    unreadable: Vec<UnreadableSession>,
 }
 
 fn update_session_index(
@@ -206,6 +219,7 @@ fn update_session_index(
         .collect();
     let changed_count = changed.len() + removed.len();
     let mut next_sources = metadata.sources.clone();
+    let mut unreadable = Vec::new();
     for source_id in &removed {
         next_sources.remove(source_id);
     }
@@ -219,7 +233,7 @@ fn update_session_index(
         for source in &changed {
             writer.delete_term(Term::from_field_text(fields.session_id, &source.session.id));
         }
-        decode_sessions(changed, workers, |source, reconstruction| {
+        unreadable = decode_sessions(changed, workers, |source, reconstruction| {
             let turns = derive_turns(&source.session, &reconstruction);
             let document_count = turns.len();
             for turn in turns {
@@ -264,6 +278,7 @@ fn update_session_index(
             .map(|record| record.documents)
             .sum(),
         changed: changed_count,
+        unreadable,
     })
 }
 
@@ -408,22 +423,39 @@ fn update_curated_index(
             .map(|record| record.documents)
             .sum(),
         changed: changed_count,
+        // Curated records are plain files, not reconstructed captures: an
+        // unreadable one is a real error and already returned above.
+        unreadable: Vec::new(),
     })
 }
 
+/// Reconstruct every source in parallel and hand each one to `visit`.
+///
+/// A source that fails to RECONSTRUCT is skipped and returned, not fatal. The
+/// corpus is append-only and a capture can be sealed already broken — plant's
+/// scrubber used to byte-replace inside serialized JSON and ate the backslash of
+/// an escaped quote, which left 15 of 6981 seals carrying one unparseable
+/// record. Cancelling the whole run on the first of them made `session index`
+/// fail permanently over 0.2% of the corpus, and no amount of retrying could
+/// clear it because the bytes are already committed. Skipping costs exactly the
+/// sessions that cannot be read; aborting costs every session that can.
+///
+/// A `visit` failure stays fatal. That is our own index writer refusing, so the
+/// index would be wrong rather than merely incomplete.
 fn decode_sessions(
     sources: Vec<SessionSource>,
     workers: usize,
     mut visit: impl FnMut(SessionSource, crate::recon::Recon) -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<UnreadableSession>> {
     if sources.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let worker_count = workers.max(1).min(sources.len());
     let next = AtomicUsize::new(0);
     let cancelled = AtomicBool::new(false);
     let (sender, receiver) = mpsc::sync_channel(worker_count.saturating_mul(2).max(1));
     let mut first_error = None;
+    let mut unreadable = Vec::new();
     std::thread::scope(|scope| {
         for _ in 0..worker_count {
             let sender = sender.clone();
@@ -438,35 +470,36 @@ fn decode_sessions(
                 let Some(source) = sources.get(index).cloned() else {
                     break;
                 };
-                let result = crate::recon::reconstruct(&source.capture)
-                    .map(|reconstruction| (source, reconstruction));
-                if result.is_err() {
-                    cancelled.store(true, Ordering::Release);
-                }
-                if sender.send(result).is_err() {
+                // Deliberately not cancelling on a reconstruct error: one
+                // unreadable capture must not strand the rest of the corpus.
+                let result = crate::recon::reconstruct(&source.capture);
+                if sender.send((source, result)).is_err() {
                     break;
                 }
             });
         }
         drop(sender);
-        for result in receiver {
+        for (source, result) in receiver {
             if first_error.is_some() {
                 continue;
             }
             match result {
-                Ok((source, reconstruction)) => {
+                Ok(reconstruction) => {
                     if let Err(error) = visit(source, reconstruction) {
                         cancelled.store(true, Ordering::Release);
                         first_error = Some(error);
                     }
                 }
-                Err(error) => first_error = Some(error),
+                Err(error) => unreadable.push(UnreadableSession {
+                    id: source.session.id,
+                    reason: format!("{error:#}"),
+                }),
             }
         }
     });
     match first_error {
         Some(error) => Err(error),
-        None => Ok(()),
+        None => Ok(unreadable),
     }
 }
 

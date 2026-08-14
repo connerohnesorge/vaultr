@@ -70,6 +70,99 @@ fn scrub_redacts_leaked_credential_shapes_without_over_matching_base64() {
     assert_eq!((kept.as_str(), hits), (base64, 0));
 }
 
+// The three shapes below are the ones that actually reached origin/main: a
+// secret sitting immediately before an escaped quote. The byte scrub's match
+// span ran one byte long, took the `\` with it, and the surviving bare `"`
+// closed the JSON string early. 15 of 6981 seals carry a record broken this
+// way, and `vault/sessions/` is append-only, so each one is permanent.
+#[test]
+fn scrubbing_a_secret_against_an_escaped_quote_keeps_the_envelope_parseable() {
+    let policy = vaultr::secrets::Policy::default();
+    let secret = "sk-ant-api03-A1b2C3d4E5f6G7h8I9j0K1l2";
+    let planted = [
+        (
+            "websocket header",
+            format!("Sec-WebSocket-Key: {secret}\" \\n"),
+        ),
+        ("api key header", format!("X-API-Key: {secret}\" https://x")),
+        ("chat text", format!("Got your api key: {secret}\"}},{{")),
+    ];
+
+    for (label, value) in planted {
+        let line = serde_json::to_string(&serde_json::json!({"body": value})).unwrap();
+        assert!(
+            line.contains("\\\""),
+            "{label}: fixture must contain an escaped quote, got {line}"
+        );
+
+        // Control: the old byte path really does destroy this line. Without
+        // this the test could pass against a fixture that never reproduced.
+        let (old, old_hits) = vaultr::secrets::redact_line(&line, &policy);
+        assert!(old_hits > 0, "{label}: control did not detect the secret");
+        assert!(
+            serde_json::from_str::<Value>(&old).is_err(),
+            "{label}: control no longer reproduces the corruption: {old}"
+        );
+
+        let (scrubbed, hits) = vaultr::secrets::redact_capture_line(&line, &[], &policy);
+        assert!(hits > 0, "{label}: not redacted");
+        assert!(!scrubbed.contains(secret), "{label}: secret survived");
+        let parsed: Value = serde_json::from_str(&scrubbed)
+            .unwrap_or_else(|error| panic!("{label}: {error} in {scrubbed}"));
+        // The surrounding text must survive intact — redaction, not truncation.
+        let body = parsed["body"].as_str().unwrap();
+        assert!(body.contains("[REDACTED]"), "{label}: {body}");
+        assert!(
+            body.ends_with(value.split(secret).nth(1).unwrap()),
+            "{label}: {body}"
+        );
+    }
+}
+
+#[test]
+fn denylist_needles_are_redacted_inside_json_without_the_escaped_variant() {
+    let policy = vaultr::secrets::Policy::default();
+    // Synthetic. A denylist needle is by definition a real credential, so the
+    // fixture for one must never be copied from an actual denylist.
+    let secret = "SyntheticNeedle9Value!";
+    // A quote right after the secret is exactly the adjacency that broke the
+    // byte path, and a needle carries no pattern guard to save it.
+    let line = serde_json::to_string(
+        &serde_json::json!({"prompt": format!("password: {secret}\" and more")}),
+    )
+    .unwrap();
+
+    let needles = vec![secret.to_string()];
+    let (scrubbed, hits) = vaultr::secrets::redact_capture_line(&line, &needles, &policy);
+    assert_eq!(hits, 1);
+    assert!(!scrubbed.contains(secret));
+    let parsed: Value = serde_json::from_str(&scrubbed).unwrap();
+    assert_eq!(parsed["prompt"], "password: [REDACTED]\" and more");
+}
+
+#[test]
+fn a_line_that_is_not_json_still_gets_scrubbed_as_text() {
+    let policy = vaultr::secrets::Policy::default();
+    let secret = "glpat-A1b2C3d4E5f6G7h8I9j0";
+    let line = format!("not json at all: {secret}");
+    let (scrubbed, hits) = vaultr::secrets::redact_capture_line(&line, &[], &policy);
+    assert!(hits > 0);
+    assert!(!scrubbed.contains(secret));
+    assert!(scrubbed.starts_with("not json at all: "));
+}
+
+#[test]
+fn a_clean_envelope_is_returned_untouched() {
+    let policy = vaultr::secrets::Policy::default();
+    let line = "{\"role\":\"user\",\"content\":\"deploy the thing\"}";
+    let (scrubbed, hits) = vaultr::secrets::redact_capture_line(line, &[], &policy);
+    assert_eq!(hits, 0);
+    assert_eq!(
+        serde_json::from_str::<Value>(&scrubbed).unwrap(),
+        serde_json::from_str::<Value>(line).unwrap()
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn detachment_rejects_symlinked_capture_and_sidecar_sources() {

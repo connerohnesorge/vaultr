@@ -62,18 +62,14 @@ fn scrub_entry(directory: &SessionDirectory, name: &str) -> Result<(File, usize)
                 .map_err(|error| format!("clone scrub temp: {error}"))?,
         );
         let mut hits = 0;
+        // One JSON-aware pass for both the denylist needles and the pattern
+        // matcher. Byte-replacing either one inside a serialized envelope is
+        // what ate the backslash of an escaped quote and left 15 seals with an
+        // unparseable record.
+        let needles: Vec<String> = needles.iter().cloned().collect();
         for line in reader.lines() {
-            let mut line = line.map_err(|error| format!("read session capture: {error}"))?;
-            let mut count = 0;
-            for needle in &needles {
-                let needle_hits = line.matches(needle).count();
-                if needle_hits > 0 {
-                    count += needle_hits;
-                    line = line.replace(needle, "[REDACTED]");
-                }
-            }
-            let (line, pattern_hits) = vaultr::secrets::redact_line(&line, &policy);
-            count += pattern_hits;
+            let line = line.map_err(|error| format!("read session capture: {error}"))?;
+            let (line, count) = vaultr::secrets::redact_capture_line(&line, &needles, &policy);
             hits += count;
             writeln!(writer, "{line}")
                 .map_err(|error| format!("write scrubbed session capture: {error}"))?;
