@@ -599,7 +599,24 @@ pub(crate) enum AgentRunObservation {
     Retain(String),
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_SOCKET_PATH_OVERRIDE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_test_socket_path_override(path: Option<PathBuf>) -> Option<PathBuf> {
+    TEST_SOCKET_PATH_OVERRIDE
+        .with(|override_path| std::mem::replace(&mut *override_path.borrow_mut(), path))
+}
+
 fn socket_path() -> PathBuf {
+    #[cfg(test)]
+    if let Some(path) =
+        TEST_SOCKET_PATH_OVERRIDE.with(|override_path| override_path.borrow().clone())
+    {
+        return path;
+    }
     std::env::var("HERDR_SOCKET_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
@@ -608,9 +625,9 @@ fn socket_path() -> PathBuf {
         })
 }
 
-pub(crate) async fn pane_list() -> Option<Vec<Pane>> {
+async fn pane_list_at(path: &Path) -> Option<Vec<Pane>> {
     tokio::time::timeout(Duration::from_secs(2), async {
-        let mut stream = UnixStream::connect(socket_path()).await.ok()?;
+        let mut stream = UnixStream::connect(path).await.ok()?;
         stream
             .write_all(b"{\"id\":\"plant\",\"method\":\"pane.list\",\"params\":{}}\n")
             .await
@@ -624,6 +641,11 @@ pub(crate) async fn pane_list() -> Option<Vec<Pane>> {
     .await
     .ok()
     .flatten()
+}
+
+pub(crate) async fn pane_list() -> Option<Vec<Pane>> {
+    let path = socket_path();
+    pane_list_at(&path).await
 }
 
 /// Herdr reports `idle` for a bare shell too. Only supported native-agent panes
@@ -728,29 +750,72 @@ fn snapshot_completed(
     Ok(*working && ready_pane_identity(panes, pane).is_some())
 }
 
-async fn wait_for_prompt_ready(pane: &str, timeout: Duration) -> Result<PaneIdentity, String> {
-    tokio::time::timeout(timeout, async {
+const PROMPT_READINESS_RETRY_DELAY: Duration = Duration::from_millis(250);
+const PROMPT_READINESS_SETTLE_DELAY: Duration = Duration::from_secs(3);
+
+fn prompt_readiness_state(panes: &[Pane], pane: &str) -> String {
+    let Some(candidate) = panes.iter().find(|candidate| candidate.pane_id == pane) else {
+        return format!("pane {pane} is absent");
+    };
+    if !AgentCli::is_known_herdr_agent(candidate.agent.as_deref()) {
+        return format!("pane {pane} has no supported native agent");
+    }
+    format!("pane {pane} is {}", candidate.agent_status)
+}
+
+async fn wait_for_prompt_ready_at(
+    pane: &str,
+    budget: Duration,
+    path: &Path,
+    retry_delay: Duration,
+    settle_delay: Duration,
+) -> Result<PaneIdentity, String> {
+    let mut last_state = "no pane state observed".to_string();
+    let ready = tokio::time::timeout(budget, async {
         loop {
-            let Some(panes) = pane_list().await else {
-                tokio::time::sleep(Duration::from_millis(250)).await;
+            let Some(panes) = pane_list_at(path).await else {
+                last_state = "Herdr pane list is unavailable".to_string();
+                tokio::time::sleep(retry_delay).await;
                 continue;
             };
             let Some(identity) = ready_pane_identity(&panes, pane) else {
-                tokio::time::sleep(Duration::from_millis(250)).await;
+                last_state = prompt_readiness_state(&panes, pane);
+                tokio::time::sleep(retry_delay).await;
                 continue;
             };
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            let Some(panes) = pane_list().await else {
+            last_state = format!("pane {pane} is ready and settling");
+            tokio::time::sleep(settle_delay).await;
+            let Some(panes) = pane_list_at(path).await else {
+                last_state = "Herdr pane list is unavailable while the pane settles".to_string();
+                tokio::time::sleep(retry_delay).await;
                 continue;
             };
-            if let Some(identity) = settled_ready_identity(&identity, &panes, pane)? {
-                return Ok(identity);
+            match settled_ready_identity(&identity, &panes, pane)? {
+                Some(identity) => return Ok(identity),
+                None => last_state = prompt_readiness_state(&panes, pane),
             }
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            tokio::time::sleep(retry_delay).await;
         }
     })
+    .await;
+    match ready {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "pre-submit readiness budget expired; last observed state: {last_state}"
+        )),
+    }
+}
+
+async fn wait_for_prompt_ready(pane: &str, budget: Duration) -> Result<PaneIdentity, String> {
+    let path = socket_path();
+    wait_for_prompt_ready_at(
+        pane,
+        budget,
+        &path,
+        PROMPT_READINESS_RETRY_DELAY,
+        PROMPT_READINESS_SETTLE_DELAY,
+    )
     .await
-    .map_err(|_| "supported native-agent pane did not reach idle or done".to_string())?
 }
 
 struct AgentStartSubscription {
@@ -1334,7 +1399,8 @@ pub(crate) async fn run_agent_with_progress(
                 "could not persist launched identity ({detail})"
             ));
         }
-        let mut identity = match wait_for_prompt_ready(pane, Duration::from_secs(60)).await {
+        let readiness_budget = agent_run.timeout;
+        let mut identity = match wait_for_prompt_ready(pane, readiness_budget).await {
             Ok(identity) => identity,
             Err(detail) => {
                 eprintln!(
@@ -1765,6 +1831,146 @@ mod tests {
         }
     }
 
+    fn readiness_socket_path() -> PathBuf {
+        PathBuf::from("/tmp").join(format!("plant-readiness-{}.sock", uuid::Uuid::new_v4()))
+    }
+
+    fn pane_list_reply(pane: &Pane) -> Vec<u8> {
+        let agent_session = pane
+            .agent_session
+            .as_ref()
+            .map(|session| serde_json::json!({"value": session.value}));
+        let mut reply = serde_json::to_vec(&serde_json::json!({
+            "result": {"panes": [{
+                "workspace_id": pane.workspace_id,
+                "tab_id": pane.tab_id,
+                "pane_id": pane.pane_id,
+                "terminal_id": pane.terminal_id,
+                "cwd": pane.cwd,
+                "focused": pane.focused,
+                "agent_status": pane.agent_status,
+                "agent": pane.agent,
+                "agent_session": agent_session,
+            }]},
+        }))
+        .unwrap();
+        reply.push(b'\n');
+        reply
+    }
+
+    fn readiness_server(
+        path: PathBuf,
+        responses: Vec<Option<Pane>>,
+    ) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::UnixListener::bind(path).unwrap();
+        tokio::spawn(async move {
+            for response in responses {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut request = String::new();
+                reader.read_line(&mut request).await.unwrap();
+                let request: Value = serde_json::from_str(&request).unwrap();
+                assert_eq!(
+                    request.get("method").and_then(Value::as_str),
+                    Some("pane.list")
+                );
+                if let Some(pane) = response {
+                    reader
+                        .get_mut()
+                        .write_all(&pane_list_reply(&pane))
+                        .await
+                        .unwrap();
+                }
+            }
+        })
+    }
+
+    fn agent_run_readiness_server(path: PathBuf) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::UnixListener::bind(path).unwrap();
+        tokio::spawn(async move {
+            let mut pane_lists = 0;
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut reader = BufReader::new(stream);
+                let mut request = String::new();
+                reader.read_line(&mut request).await.unwrap();
+                let request: Value = serde_json::from_str(&request).unwrap();
+                match request.get("method").and_then(Value::as_str) {
+                    Some("pane.list") => {
+                        let response = match pane_lists {
+                            0 => None,
+                            1 => {
+                                let mut pane = codex_pane("idle");
+                                pane.agent = None;
+                                Some(pane)
+                            }
+                            2 | 3 => Some(codex_pane("idle")),
+                            _ => Some(codex_pane("working")),
+                        };
+                        pane_lists += 1;
+                        if let Some(pane) = response {
+                            reader
+                                .get_mut()
+                                .write_all(&pane_list_reply(&pane))
+                                .await
+                                .unwrap();
+                        }
+                    }
+                    Some("events.subscribe") => {
+                        reader
+                            .get_mut()
+                            .write_all(b"{\"id\":\"plant-agent-start\",\"result\":{\"type\":\"subscription_started\"}}\n")
+                            .await
+                            .unwrap();
+                        for status in ["working", "done"] {
+                            let mut event = serde_json::to_vec(&serde_json::json!({
+                                "event": "pane.agent_status_changed",
+                                "data": {
+                                    "pane_id": "w1:p1",
+                                    "workspace_id": "w1",
+                                    "agent_status": status,
+                                    "agent": "codex",
+                                },
+                            }))
+                            .unwrap();
+                            event.push(b'\n');
+                            reader.get_mut().write_all(&event).await.unwrap();
+                        }
+                    }
+                    other => panic!("unexpected Herdr method {other:?}"),
+                }
+            }
+        })
+    }
+
+    struct RestoredProcessPath(Option<String>);
+
+    impl Drop for RestoredProcessPath {
+        fn drop(&mut self) {
+            crate::process::set_test_path_override(self.0.take());
+        }
+    }
+
+    struct RestoredSocketPath(Option<PathBuf>);
+
+    impl Drop for RestoredSocketPath {
+        fn drop(&mut self) {
+            set_test_socket_path_override(self.0.take());
+        }
+    }
+
+    fn fake_herdr(bin: &Path, log: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = bin.join("herdr");
+        let script = "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '__LOG__'\ncase \"$1:$2\" in\n  workspace:list) printf '%s\\n' '{\"result\":{\"workspaces\":[]}}' ;;\n  workspace:create) printf '%s\\n' '{\"result\":{\"workspace\":{\"workspace_id\":\"w1\"},\"root_pane\":{\"pane_id\":\"w1:p1\"}}}' ;;\n  pane:read) printf '%s\\n' 'agent terminal output' ;;\nesac\n"
+            .replace("__LOG__", &log.display().to_string());
+        std::fs::write(&path, script).unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+
     #[test]
     fn decodes_typed_panes_and_workspaces() {
         let panes: PaneListReply = serde_json::from_str(
@@ -2033,6 +2239,203 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[tokio::test]
+    async fn readiness_recovers_delayed_native_classification() {
+        let path = readiness_socket_path();
+        let mut delayed = codex_pane("idle");
+        delayed.agent = None;
+        let ready = codex_pane("idle");
+        let server = readiness_server(
+            path.clone(),
+            vec![Some(delayed), Some(ready.clone()), Some(ready)],
+        );
+
+        let identity = wait_for_prompt_ready_at(
+            "w1:p1",
+            Duration::from_secs(1),
+            &path,
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(identity.terminal_id, "t1");
+        server.await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn readiness_recovers_a_transient_pane_list_failure_before_one_prompt() {
+        let path = readiness_socket_path();
+        let ready = codex_pane("idle");
+        let server = readiness_server(path.clone(), vec![None, Some(ready.clone()), Some(ready)]);
+
+        wait_for_prompt_ready_at(
+            "w1:p1",
+            Duration::from_secs(1),
+            &path,
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+
+        server.await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn readiness_recovery_types_one_prompt_after_transport_and_classification_recovery() {
+        let bin = std::env::temp_dir().join(format!("plant-fake-herdr-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&bin).unwrap();
+        let log = bin.join("calls.log");
+        fake_herdr(&bin, &log);
+        let socket = readiness_socket_path();
+        let server = agent_run_readiness_server(socket.clone());
+        let _path = RestoredProcessPath(crate::process::set_test_path_override(Some(
+            bin.display().to_string(),
+        )));
+        let _socket = RestoredSocketPath(set_test_socket_path_override(Some(socket.clone())));
+
+        let outcome = run_agent(AgentRun {
+            label: "readiness-recovery-test".to_string(),
+            cwd: "/tmp".to_string(),
+            launch: "LAUNCH".to_string(),
+            prompt: "PROMPT".to_string(),
+            timeout: Duration::from_secs(5),
+            cleanup: WorkspaceCleanup::Never,
+            preset_session_id: None,
+            discover_session_id: false,
+            session_record_dir: None,
+            env: Vec::new(),
+        })
+        .await;
+
+        assert!(matches!(
+            outcome,
+            AgentRunOutcome::Failed(detail) if detail.contains("capture session id")
+        ));
+        let prompt_calls = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .filter(|line| *line == "pane run w1:p1 PROMPT")
+            .count();
+        assert_eq!(prompt_calls, 1);
+
+        server.abort();
+        let _ = server.await;
+        std::fs::remove_file(socket).unwrap();
+        std::fs::remove_dir_all(bin).unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_readiness_does_not_type_the_prompt() {
+        let bin = std::env::temp_dir().join(format!("plant-fake-herdr-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&bin).unwrap();
+        let log = bin.join("calls.log");
+        fake_herdr(&bin, &log);
+        let socket = readiness_socket_path();
+        let mut agentless = codex_pane("idle");
+        agentless.agent = None;
+        let server = readiness_server(socket.clone(), vec![Some(agentless)]);
+        let _path = RestoredProcessPath(crate::process::set_test_path_override(Some(
+            bin.display().to_string(),
+        )));
+        let _socket = RestoredSocketPath(set_test_socket_path_override(Some(socket.clone())));
+
+        let outcome = run_agent(AgentRun {
+            label: "readiness-expiry-test".to_string(),
+            cwd: "/tmp".to_string(),
+            launch: "LAUNCH".to_string(),
+            prompt: "PROMPT".to_string(),
+            timeout: Duration::from_millis(25),
+            cleanup: WorkspaceCleanup::Never,
+            preset_session_id: None,
+            discover_session_id: false,
+            session_record_dir: None,
+            env: Vec::new(),
+        })
+        .await;
+
+        assert!(matches!(
+            outcome,
+            AgentRunOutcome::Failed(detail) if detail.contains("pre-submit readiness budget expired")
+        ));
+        let prompt_calls = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .filter(|line| *line == "pane run w1:p1 PROMPT")
+            .count();
+        assert_eq!(prompt_calls, 0);
+
+        server.await.unwrap();
+        std::fs::remove_file(socket).unwrap();
+        std::fs::remove_dir_all(bin).unwrap();
+    }
+
+    #[tokio::test]
+    async fn readiness_rejects_terminal_or_session_identity_changes() {
+        let path = readiness_socket_path();
+        let ready = codex_pane("idle");
+        let mut replaced_terminal = ready.clone();
+        replaced_terminal.terminal_id = "replacement".to_string();
+        let server = readiness_server(path.clone(), vec![Some(ready), Some(replaced_terminal)]);
+
+        let error = wait_for_prompt_ready_at(
+            "w1:p1",
+            Duration::from_secs(1),
+            &path,
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("identity changed"));
+        server.await.unwrap();
+        std::fs::remove_file(path).unwrap();
+
+        let path = readiness_socket_path();
+        let mut ready = codex_pane("idle");
+        ready.agent_session = Some(AgentSession {
+            value: "session-1".to_string(),
+        });
+        let mut replaced_session = ready.clone();
+        replaced_session.agent_session = Some(AgentSession {
+            value: "session-2".to_string(),
+        });
+        let server = readiness_server(path.clone(), vec![Some(ready), Some(replaced_session)]);
+
+        let error = wait_for_prompt_ready_at(
+            "w1:p1",
+            Duration::from_secs(1),
+            &path,
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("identity changed"));
+        server.await.unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn expired_readiness_budget_reports_the_last_state_without_a_prompt() {
+        let path = readiness_socket_path();
+        let error = wait_for_prompt_ready_at(
+            "w1:p1",
+            Duration::from_millis(10),
+            &path,
+            Duration::from_millis(1),
+            Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(error.contains("pre-submit readiness budget expired"));
+        assert!(error.contains("last observed state: Herdr pane list is unavailable"));
     }
 
     #[test]

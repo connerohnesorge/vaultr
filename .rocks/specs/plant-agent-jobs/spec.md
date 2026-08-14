@@ -4,7 +4,7 @@
 
 ### Requirement: Deep Herdr agent lifecycle
 
-Plant MUST run each agent-backed Cultivation Job through one high-level Herdr lifecycle interface that owns workspace creation and reclamation, verified agent readiness, prompt delivery, completion waiting, and best-effort cleanup with focus restoration. Plant MUST reconcile readiness snapshots until the selected supported native-agent pane remains prompt-ready after the composer settles. Plant MUST snapshot that pane's terminal and available agent-session identity before checked `pane run` prompt typing. Plant MUST receive a subscription acknowledgment before prompt typing. If the pane has not entered `working`, Plant MUST send exactly one checked Enter. Plant MUST reconcile buffered lifecycle events with same-pane snapshots. Plant MUST observe post-submit `working` before accepting a later terminal state. Plant MUST recheck terminal/session identity before returning success. Failed typing, failed submission, a missing transition, pre-existing terminal state, or a pane identity change MUST NOT return `Succeeded`. The scheduler MUST retain job selection, launch construction, prompts, cadence, and outcome recording.
+Plant MUST run each agent-backed Cultivation Job through one high-level Herdr lifecycle interface that owns workspace creation and reclamation, verified agent readiness, prompt delivery, completion waiting, and best-effort cleanup with focus restoration. Plant MUST use the configured Agent Run timeout as a bounded pre-submit readiness budget. Plant MUST retry unavailable Herdr pane lists during that budget. Plant MUST retry delayed native-agent classification during that budget. Plant MUST reconcile readiness snapshots until the selected supported native-agent pane remains prompt-ready after the composer settles. Plant MUST snapshot that pane's terminal and available agent-session identity before checked `pane run` prompt typing. Plant MUST report the final observed readiness state if the budget expires. Plant MUST receive a subscription acknowledgment before prompt typing. If the pane has not entered `working`, Plant MUST send exactly one checked Enter. Plant MUST reconcile buffered lifecycle events with same-pane snapshots. Plant MUST observe post-submit `working` before accepting a later terminal state. Plant MUST recheck terminal/session identity before returning success. Failed typing, failed submission, a missing transition, pre-existing terminal state, or a pane identity change MUST NOT return `Succeeded`. The scheduler MUST retain job selection, launch construction, prompts, cadence, and outcome recording.
 
 #### Scenario: Herdr is unavailable before an attempt
 
@@ -34,11 +34,44 @@ Plant MUST run each agent-backed Cultivation Job through one high-level Herdr li
 - THEN the lifecycle returns `Failed`
 - AND Plant MUST NOT durably report the run as succeeded
 
+#### Scenario: Herdr is unavailable during pre-submit readiness
+
+- GIVEN Plant has created an Agent Run workspace
+- AND Herdr pane listing fails during pre-submit readiness
+- WHEN the readiness budget remains available
+- THEN Plant retries pane readiness
+- AND Plant does not type the prompt
+
+#### Scenario: Native agent classification is delayed
+
+- GIVEN the workspace pane exists
+- AND the pane is not yet a supported native agent
+- WHEN the readiness budget remains available
+- THEN Plant continues readiness recovery
+- AND Plant types one prompt after stable native readiness
+
 #### Scenario: Readiness changes while the composer settles
 
 - WHEN a selected supported native-agent pane becomes non-ready after initial readiness
 - THEN Plant continues waiting for the same pane identity
 - AND Plant does not type the prompt before readiness returns
+
+#### Scenario: Pane identity changes during readiness
+
+- GIVEN Plant has observed a candidate pane
+- AND the pane terminal or available agent-session identity changes
+- WHEN Plant checks readiness
+- THEN Plant returns a failed outcome
+- AND Plant does not type the prompt
+
+#### Scenario: Pre-submit readiness expires
+
+- GIVEN the readiness budget expires
+- AND the pane is not stably ready
+- WHEN Plant evaluates the Agent Run
+- THEN Plant returns a failed readiness outcome
+- AND Plant reports the final observed readiness state
+- AND Plant does not type the prompt
 
 #### Scenario: A terminal event is absent
 

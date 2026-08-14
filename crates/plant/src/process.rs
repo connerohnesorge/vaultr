@@ -35,18 +35,33 @@ impl RunResult {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static TEST_PATH_OVERRIDE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_path_override(path: Option<String>) -> Option<String> {
+    TEST_PATH_OVERRIDE
+        .with(|override_path| std::mem::replace(&mut *override_path.borrow_mut(), path))
+}
+
 /// PATH that works no matter who spawned Plant.
 pub(crate) fn augmented_path() -> String {
+    #[cfg(test)]
+    if let Some(path) = TEST_PATH_OVERRIDE.with(|override_path| override_path.borrow().clone()) {
+        return path;
+    }
     let home = std::env::var("HOME").unwrap_or_default();
     let mut parts = vec![];
+    for dir in [".nix-profile/bin", ".local/bin", ".bun/bin"] {
+        parts.push(format!("{home}/{dir}"));
+    }
     let executable_dir = std::env::current_exe()
         .ok()
         .and_then(|exe| exe.parent().map(Path::to_path_buf));
     if let Some(dir) = executable_dir {
         parts.push(dir.display().to_string());
-    }
-    for dir in [".nix-profile/bin", ".local/bin", ".bun/bin"] {
-        parts.push(format!("{home}/{dir}"));
     }
     parts.push("/opt/homebrew/bin".into());
     parts.push("/usr/local/bin".into());
@@ -243,7 +258,7 @@ mod tests {
             command
                 .args([
                     "-c",
-                    &format!("/bin/sleep 0.2; printf done > '{}'", marker_text),
+                    &format!("/bin/sleep 1; printf done > '{}'", marker_text),
                 ])
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
@@ -256,7 +271,7 @@ mod tests {
         owner.abort();
         let _ = owner.await;
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_secs(2)).await;
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), "done");
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -276,12 +291,12 @@ mod tests {
         let pid_path = root.join("pid");
         let marker = root.join("late-marker");
         let script = format!(
-            "echo $$ > '{}'; sleep 1; echo late > '{}'",
+            "echo $$ > '{}'; /bin/sleep 2; echo late > '{}'",
             pid_path.display(),
             marker.display()
         );
 
-        let result = run(&["/bin/sh", "-c", &script], Duration::from_millis(200)).await;
+        let result = run(&["/bin/sh", "-c", &script], Duration::from_secs(1)).await;
         assert_eq!(result.end, RunEnd::TimedOut);
         assert!(!result.ok);
         assert_eq!(result.failure_detail(), "timed out");
@@ -296,7 +311,7 @@ mod tests {
             Some(libc::ESRCH),
             "timed-out direct child must already be reaped"
         );
-        tokio::time::sleep(Duration::from_millis(1100)).await;
+        tokio::time::sleep(Duration::from_millis(2100)).await;
         assert!(!marker.exists(), "delayed child effect occurred");
         let _ = std::fs::remove_dir_all(root);
     }

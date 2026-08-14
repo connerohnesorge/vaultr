@@ -16,8 +16,15 @@ being accepted as the current run.
 Plant's agent-run boundary surrounds that lifecycle with durable keyed receipt
 state before side effects and durable conclusive outcomes before return.
 Unkeyed callers retain the legacy human-output contract. Consumers MUST NOT
-reimplement either lifecycle; Vault Doors' typed client is described by
+reimplement either lifecycle. Vault Doors' typed client is described by
 `vault-doors/design.md` ADR-0003.
+
+Before prompt typing, Plant uses the configured Agent Run timeout as its
+pre-submit readiness budget. It retries unavailable pane lists and delayed
+native-agent classification within that budget. Each candidate must survive
+composer settlement with the same terminal and agent-session identity. Budget
+expiry reports the final observed state. Plant never types a prompt before
+stable readiness. Post-submit observation remains unchanged.
 
 ### ADR-0002: Scheduled attempts fence only admitted execution
 
