@@ -364,6 +364,7 @@ impl DueJobAdmission {
         }
     }
 
+    #[cfg(test)]
     fn take(&mut self, turns: usize) -> Vec<String> {
         (0..turns)
             .filter_map(|_| self.pending.pop_front())
