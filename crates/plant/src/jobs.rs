@@ -179,6 +179,19 @@ fn active_job(name: &str) -> Option<Job> {
     active_job_at(&dir, short_hostname, name)
 }
 
+const IDEMPOTENT_HEADER: &[u8] = b"# plant: idempotent";
+const JOB_HEADER_SCAN_BYTES: u64 = 2048;
+
+fn job_declares_idempotence(path: &Path) -> io::Result<bool> {
+    let mut header = Vec::with_capacity(JOB_HEADER_SCAN_BYTES as usize);
+    File::open(path)?
+        .take(JOB_HEADER_SCAN_BYTES)
+        .read_to_end(&mut header)?;
+    Ok(header
+        .split(|byte| *byte == b'\n')
+        .any(|line| line == IDEMPOTENT_HEADER))
+}
+
 /// Panes are kept open by default so failed agent runs stay inspectable; setting
 /// PLANT_KEEP_PANES=0 opts into auto-close honoring the requested cleanup.
 /// Keep-by-default is a recorded product decision (commit 3f9d55e) — do not invert it.
@@ -617,6 +630,7 @@ fn reconcile_fence_at<F>(
     attempt_parent: &Path,
     ledger_path: &Path,
     ledger_parent: &Path,
+    script_path: Option<&Path>,
     sync: F,
 ) -> io::Result<FenceReconcile>
 where
@@ -658,17 +672,22 @@ where
                     ),
                 )?;
             }
-            // Absent stays blocking. It does NOT prove nothing ran: a job with
-            // no agent dispatch never writes a receipt at all, and the
-            // herdr-unavailable path deletes its claim to keep the key
-            // retryable. Clearing here would re-run plain script jobs whose
-            // only failure was appending the final ledger record.
+            // An absent receipt does NOT prove nothing ran: a job with no
+            // agent dispatch never writes one. Only an exact declaration on
+            // the active Script permits a repeat after this ambiguous outcome.
             Ok(crate::agent_run::ReceiptLookup::Absent) => {
-                return Ok(FenceReconcile::Blocked(format!(
-                    "attempt {} has no durable final outcome; \
-                     if it is abandoned, run `plant jobs unblock {name}`",
-                    existing.id
-                )))
+                let safe_to_repeat = existing.action == Some(JobAction::Script)
+                    && match script_path {
+                        Some(path) => job_declares_idempotence(path)?,
+                        None => false,
+                    };
+                if !safe_to_repeat {
+                    return Ok(FenceReconcile::Blocked(format!(
+                        "attempt {} has no durable final outcome; \
+                         if it is abandoned, run `plant jobs unblock {name}`",
+                        existing.id
+                    )));
+                }
             }
             Ok(crate::agent_run::ReceiptLookup::Pending { .. }) => {
                 return Ok(FenceReconcile::Blocked(format!(
@@ -691,7 +710,10 @@ where
     Ok(FenceReconcile::Ready)
 }
 
-fn reconcile_fence(name: &str) -> io::Result<FenceReconcile> {
+fn reconcile_fence_with_script(
+    name: &str,
+    script_path: Option<&Path>,
+) -> io::Result<FenceReconcile> {
     let ledger = ledger_path(name);
     reconcile_fence_at(
         name,
@@ -699,16 +721,25 @@ fn reconcile_fence(name: &str) -> io::Result<FenceReconcile> {
         &attempt_dir(),
         &ledger,
         ledger.parent().expect("job ledger has a parent"),
+        script_path,
         File::sync_all,
     )
 }
 
-async fn reconcile_fence_live(name: &str) -> io::Result<FenceReconcile> {
-    let result = reconcile_fence(name)?;
+fn reconcile_fence(name: &str) -> io::Result<FenceReconcile> {
+    reconcile_fence_with_script(name, None)
+}
+
+fn reconcile_job_fence(job: &Job) -> io::Result<FenceReconcile> {
+    reconcile_fence_with_script(&job.name, Some(&job.path))
+}
+
+async fn reconcile_fence_live(job: &Job) -> io::Result<FenceReconcile> {
+    let result = reconcile_job_fence(job)?;
     if !matches!(result, FenceReconcile::Blocked(_)) {
         return Ok(result);
     }
-    let fence_path = attempt_path(name);
+    let fence_path = attempt_path(&job.name);
     let text = match std::fs::read_to_string(&fence_path) {
         Ok(text) => text,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(result),
@@ -726,7 +757,7 @@ async fn reconcile_fence_live(name: &str) -> io::Result<FenceReconcile> {
         _ => return Ok(result),
     };
     match crate::agent_run::recover_pending(&fence.id, &checkpoint).await? {
-        crate::agent_run::PendingRecovery::Recovered => reconcile_fence(name),
+        crate::agent_run::PendingRecovery::Recovered => reconcile_job_fence(job),
         crate::agent_run::PendingRecovery::Retained(detail) => Ok(FenceReconcile::Blocked(
             format!("attempt {} recovery retained: {detail}", fence.id),
         )),
@@ -759,9 +790,13 @@ pub fn unblock_job(name: &str) -> io::Result<Unblocked> {
     };
     let fence: AttemptFence = serde_json::from_str(&text)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    // Never force what resolves itself — a conclusive receipt or a matching
-    // ledger record must still take the ordinary reconciliation path.
-    match reconcile_fence(name)? {
+    // Never force what resolves itself — a conclusive receipt, a matching
+    // ledger record, or a safe-repeat declaration takes ordinary reconciliation.
+    let reconciliation = match active_job(name) {
+        Some(job) => reconcile_job_fence(&job),
+        None => reconcile_fence(name),
+    }?;
+    match reconciliation {
         FenceReconcile::Ready | FenceReconcile::ResumableCompression(_) => {
             return Ok(Unblocked::AlreadyClear)
         }
@@ -851,15 +886,15 @@ fn begin_attempt(name: &str) -> io::Result<AttemptStart> {
     }
 }
 
-async fn begin_attempt_live(name: &str) -> io::Result<AttemptStart> {
-    let lock = match acquire_attempt_lock(name)? {
+async fn begin_attempt_live(job: &Job) -> io::Result<AttemptStart> {
+    let lock = match acquire_attempt_lock(&job.name)? {
         AttemptLockStart::Ready(lock) => lock,
         AttemptLockStart::Blocked(detail) => return Ok(AttemptStart::Blocked(detail)),
     };
-    verify_ledger_writable(name)?;
-    match reconcile_fence_live(name).await? {
+    verify_ledger_writable(&job.name)?;
+    match reconcile_fence_live(job).await? {
         FenceReconcile::Ready => {
-            publish_attempt(name, JobAction::Script, lock).map(AttemptStart::Ready)
+            publish_attempt(&job.name, JobAction::Script, lock).map(AttemptStart::Ready)
         }
         FenceReconcile::ResumableCompression(fence) => Ok(AttemptStart::Blocked(format!(
             "attempt {} awaits in-process compression resume",
@@ -882,7 +917,7 @@ fn begin_scheduled_attempt(job: &Job) -> io::Result<ScheduledAttemptStart> {
         AttemptLockStart::Blocked(detail) => return Ok(ScheduledAttemptStart::Blocked(detail)),
     };
     verify_ledger_writable(&job.name)?;
-    match reconcile_fence(&job.name)? {
+    match reconcile_job_fence(job)? {
         FenceReconcile::Ready => {}
         FenceReconcile::ResumableCompression(fence) => {
             return Ok(ScheduledAttemptStart::Ready(AttemptGuard {
@@ -906,7 +941,7 @@ async fn begin_scheduled_attempt_live(job: &Job) -> io::Result<ScheduledAttemptS
         AttemptLockStart::Blocked(detail) => return Ok(ScheduledAttemptStart::Blocked(detail)),
     };
     verify_ledger_writable(&job.name)?;
-    match reconcile_fence_live(&job.name).await? {
+    match reconcile_fence_live(job).await? {
         FenceReconcile::Ready => {}
         FenceReconcile::ResumableCompression(fence) => {
             return Ok(ScheduledAttemptStart::Ready(AttemptGuard {
@@ -1184,7 +1219,7 @@ fn finish_execution(
 }
 
 pub async fn run_job(job: &Job) -> i32 {
-    let attempt = match begin_attempt_live(&job.name).await {
+    let attempt = match begin_attempt_live(job).await {
         Ok(AttemptStart::Ready(attempt)) => attempt,
         Ok(AttemptStart::Blocked(detail)) => {
             eprintln!("[job:{}] dispatch blocked: {detail}", job.name);
@@ -1456,6 +1491,103 @@ mod tests {
         )
         .unwrap();
         (state, guard)
+    }
+
+    #[test]
+    fn idempotence_header_must_be_exact_and_inside_first_2_kib() {
+        let root =
+            std::env::temp_dir().join(format!("plant-idempotence-header-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let script = root.join("job.sh");
+
+        std::fs::write(&script, b"#!/bin/sh\n# plant: idempotent").unwrap();
+        assert!(job_declares_idempotence(&script).unwrap());
+
+        let mut at_boundary =
+            vec![b'#'; JOB_HEADER_SCAN_BYTES as usize - IDEMPOTENT_HEADER.len() - 1];
+        at_boundary.push(b'\n');
+        at_boundary.extend_from_slice(IDEMPOTENT_HEADER);
+        std::fs::write(&script, at_boundary).unwrap();
+        assert!(job_declares_idempotence(&script).unwrap());
+
+        let mut outside_window = vec![b'#'; JOB_HEADER_SCAN_BYTES as usize];
+        outside_window.push(b'\n');
+        outside_window.extend_from_slice(IDEMPOTENT_HEADER);
+        std::fs::write(&script, outside_window).unwrap();
+        assert!(!job_declares_idempotence(&script).unwrap());
+
+        for body in [
+            b"#!/bin/sh\necho '# plant: idempotent'\n".as_slice(),
+            b"#!/bin/sh\n # plant: idempotent\n".as_slice(),
+            b"#!/bin/sh\n# plant: idempotent later\n".as_slice(),
+        ] {
+            std::fs::write(&script, body).unwrap();
+            assert!(!job_declares_idempotence(&script).unwrap());
+        }
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn safe_repeat_recovery_clears_only_marked_scripts_without_pending_receipts() {
+        let root =
+            std::env::temp_dir().join(format!("plant-safe-repeat-fence-{}", uuid::Uuid::new_v4()));
+        let state = root.join("state");
+        std::fs::create_dir_all(state.join("job-attempts")).unwrap();
+        std::fs::create_dir_all(state.join("jobs")).unwrap();
+        let _state = crate::state::use_test_dir(state.clone());
+        let marked_script = root.join("marked.sh");
+        let unmarked_script = root.join("unmarked.sh");
+        std::fs::write(&marked_script, b"#!/bin/sh\n# plant: idempotent\n").unwrap();
+        std::fs::write(&unmarked_script, b"#!/bin/sh\n").unwrap();
+
+        let job = |name: &str, path: &Path| Job {
+            name: name.to_string(),
+            path: path.to_path_buf(),
+            every: Duration::from_secs(60),
+            action: JobAction::Script,
+        };
+        let fence = |name: &str, id: &str| {
+            write_fence(
+                &attempt_path(name),
+                &AttemptFence {
+                    id: id.to_string(),
+                    started_ts: 1,
+                    retryable: false,
+                    action: Some(JobAction::Script),
+                },
+            )
+            .unwrap();
+        };
+
+        fence("repeat", "abandoned-repeat");
+        assert!(matches!(
+            reconcile_job_fence(&job("repeat", &marked_script)).unwrap(),
+            FenceReconcile::Ready
+        ));
+        assert!(!attempt_path("repeat").exists());
+        assert!(!state.join("jobs/repeat.jsonl").exists());
+
+        fence("pending", "pending-repeat");
+        write_receipt(
+            &state,
+            "pending-repeat",
+            r#"{"state":"in_progress","key":"pending-repeat"}"#,
+        );
+        assert!(matches!(
+            reconcile_job_fence(&job("pending", &marked_script)).unwrap(),
+            FenceReconcile::Blocked(_)
+        ));
+        assert!(attempt_path("pending").exists());
+
+        fence("unmarked", "ambiguous-unmarked");
+        assert!(matches!(
+            reconcile_job_fence(&job("unmarked", &unmarked_script)).unwrap(),
+            FenceReconcile::Blocked(_)
+        ));
+        assert!(attempt_path("unmarked").exists());
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1936,10 +2068,11 @@ mod tests {
             b"{\"attempt_id\":\"written-but-not-durable\",\"outcome\":\"success\"}\n",
         )
         .unwrap();
-        let error = reconcile_fence_at("t", &fence_path, &attempts, &ledger, &ledgers, |_| {
-            Err(io::Error::other("injected sync failure"))
-        })
-        .unwrap_err();
+        let error =
+            reconcile_fence_at("t", &fence_path, &attempts, &ledger, &ledgers, None, |_| {
+                Err(io::Error::other("injected sync failure"))
+            })
+            .unwrap_err();
         assert_eq!(error.to_string(), "injected sync failure");
         assert_eq!(std::fs::read(&fence_path).unwrap(), original_fence);
         std::fs::remove_dir_all(root).unwrap();
@@ -1997,6 +2130,7 @@ mod tests {
                 &attempts,
                 &ledger,
                 &ledgers,
+                None,
                 File::sync_all,
             )
             .unwrap(),
@@ -2021,6 +2155,7 @@ mod tests {
                 &attempts,
                 &ledger,
                 &ledgers,
+                None,
                 File::sync_all,
             )
             .unwrap(),
