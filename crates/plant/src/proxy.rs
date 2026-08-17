@@ -369,6 +369,23 @@ async fn handle_origin(
         }
     }
 
+    let capturing = adapter.captures(&method, &path) && raw.is_some();
+    // Admit captured turns before dispatching them upstream. Acquiring this gate
+    // after the response headers arrive lets every local agent fan out at once,
+    // then leaves accepted response bodies unpolled behind the capture queue.
+    // Under load that queue can outlive an upstream stream and make an otherwise
+    // healthy request look like a network failure to the client.
+    let capture_permit = if capturing {
+        Some(
+            DOM_GATE
+                .acquire()
+                .await
+                .expect("capture admission gate is never closed"),
+        )
+    } else {
+        None
+    };
+
     let url = http_upstream_url(adapter, upstream_base, &path, &query);
     let mut builder = ctx
         .client
@@ -407,11 +424,9 @@ async fn handle_origin(
     }
     let upstream_headers_full = upstream.headers().clone();
 
-    // Request-time capture half, under a semaphore: parsing a multi-MB body into
-    // a JSON DOM costs ~10x its size; bounding concurrency bounds peak RSS.
-    let capturing = adapter.captures(&method, &path) && raw.is_some();
+    // Request-time capture half, under the admission permit acquired before
+    // dispatch: parsing a multi-MB body into a JSON DOM costs ~10x its size.
     let pending: Option<capture::PendingCapture> = if capturing {
-        let _permit = DOM_GATE.acquire().await;
         let prepared = prepare_http_capture(
             ctx.vault.clone(),
             adapter.clone(),
@@ -433,6 +448,7 @@ async fn handle_origin(
     } else {
         None
     };
+    drop(capture_permit);
 
     let mut resp_builder = Response::builder().status(status);
     *resp_builder.headers_mut().unwrap() = response_headers;
@@ -924,6 +940,62 @@ mod tests {
             otel: Arc::new(Otel::new()),
             ca: Arc::new(crate::ca::Ca::load_or_create_in(&ca_dir).unwrap()),
         })
+    }
+
+    #[tokio::test]
+    async fn captured_turn_waits_for_admission_before_upstream_dispatch() {
+        let _skip_finish = SkipCaptureFinish::new();
+        let permits = DOM_GATE
+            .acquire_many(4)
+            .await
+            .expect("capture admission gate is never closed");
+        let (upstream, mut started, release, upstream_task) = blocking_upstream().await;
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let vault = std::env::temp_dir().join(format!("plant-admission-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&vault).unwrap();
+        let mut ctx = test_ctx(upstream);
+        Arc::get_mut(&mut ctx).unwrap().vault.clone_from(&vault);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let supervisor = tokio::spawn(serve_until_shutdown(
+            listener,
+            ctx,
+            shutdown_rx,
+            Duration::from_secs(2),
+        ));
+
+        let request = tokio::spawn(post_capture_request(
+            address,
+            "00000000-0000-4000-8000-000000000021",
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), started.recv())
+                .await
+                .is_err(),
+            "captured turn reached the upstream before admission"
+        );
+
+        drop(permits);
+        tokio::time::timeout(Duration::from_secs(1), started.recv())
+            .await
+            .expect("admitted turn never reached the upstream")
+            .expect("upstream stopped");
+        release.send(true).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), request)
+            .await
+            .expect("admitted turn never completed")
+            .unwrap();
+
+        shutdown_tx.send(true).unwrap();
+        let lease = tokio::time::timeout(Duration::from_secs(2), supervisor)
+            .await
+            .expect("proxy did not shut down")
+            .unwrap();
+        drop(lease);
+        upstream_task.abort();
+        let _ = upstream_task.await;
+        await_capture_tasks_drained().await;
+        std::fs::remove_dir_all(vault).unwrap();
     }
 
     /// Assert the listener lease came back, without racing the kernel for it.
