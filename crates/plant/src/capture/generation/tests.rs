@@ -8,7 +8,7 @@ fn detached(
     body: &[u8],
     base_len: u64,
 ) -> vaultr::vault::DetachedGeneration {
-    let digest = vaultr::vault::sha256_hex(body);
+    let digest = vaultr::digest::sha256_hex(body);
     let path = root.join(format!("{stem}.sealing-{base_len}-{digest}"));
     std::fs::write(&path, body).unwrap();
     vaultr::vault::DetachedGeneration {
@@ -114,7 +114,7 @@ async fn sealing_rejects_symlinked_source_and_destination_without_mutating_targe
     let generation = vaultr::vault::DetachedGeneration {
         path: source.clone(),
         base_len: 0,
-        digest: vaultr::vault::sha256_file(&outside_source).unwrap(),
+        digest: vaultr::digest::sha256_file(&outside_source).unwrap(),
     };
 
     assert!(seal_generation(&generation, &destination).await.is_err());
@@ -127,7 +127,7 @@ async fn sealing_rejects_symlinked_source_and_destination_without_mutating_targe
     let generation = vaultr::vault::DetachedGeneration {
         path: source.clone(),
         base_len: 0,
-        digest: vaultr::vault::sha256_file(&source).unwrap(),
+        digest: vaultr::digest::sha256_file(&source).unwrap(),
     };
     assert!(seal_generation(&generation, &destination).await.is_err());
     assert_eq!(

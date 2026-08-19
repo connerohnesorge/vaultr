@@ -265,7 +265,7 @@ impl ReconstructionSnapshot {
                     if snapshot.detached.is_some() {
                         anyhow::bail!("multiple detached capture generations in {}", dir.display());
                     }
-                    let actual = crate::vault::sha256_reader(segment.reader()?)?;
+                    let actual = crate::digest::sha256_reader(segment.reader()?)?;
                     if actual != digest {
                         anyhow::bail!(
                             "detached generation digest mismatch at {}",
@@ -329,7 +329,7 @@ impl SnapshotFile {
         file.seek(SeekFrom::Start(offset))
             .context("seek retained sealed generation")?;
         let decoder = zstd::Decoder::new(file.take(self.len - offset)).context("zstd decoder")?;
-        crate::vault::sha256_reader(decoder)
+        crate::digest::sha256_reader(decoder)
     }
 }
 

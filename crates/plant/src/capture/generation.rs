@@ -489,14 +489,16 @@ async fn seal_generation_in(
             destination.display()
         ));
     };
-    let decoded_digest =
-        vaultr::vault::decoded_zstd_suffix_digest(clone_at_start(&committed)?, generation.base_len)
-            .map_err(|_| {
-                format!(
-                    "sealed destination suffix is invalid at {}",
-                    destination.display()
-                )
-            })?;
+    let decoded_digest = vaultr::digest::decoded_zstd_suffix_digest(
+        clone_at_start(&committed)?,
+        generation.base_len,
+    )
+    .map_err(|_| {
+        format!(
+            "sealed destination suffix is invalid at {}",
+            destination.display()
+        )
+    })?;
     if decoded_digest != generation.digest {
         return Err(format!(
             "sealed destination conflicts with detached generation at {}",

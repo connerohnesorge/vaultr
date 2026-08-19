@@ -341,7 +341,7 @@ fn daemon_scheduler_runs_compression_in_process_and_records_conflicts() {
     let detached_body = b"detached evidence\n";
     let detached = session.join(format!(
         "turns.jsonl.sealing-0-{}",
-        vaultr::vault::sha256_hex(detached_body)
+        vaultr::digest::sha256_hex(detached_body)
     ));
     fs::write(&detached, detached_body).unwrap();
     let sealed = session.join("turns.jsonl.zst");

@@ -295,14 +295,14 @@ pub(super) fn staging_base() -> PathBuf {
 
 pub(super) fn staging_dir(root: &str, sid: &str) -> PathBuf {
     staging_base()
-        .join(vaultr::vault::sha256_hex(root.as_bytes()))
+        .join(vaultr::digest::sha256_hex(root.as_bytes()))
         .join(sid)
 }
 
 fn recovery_index_dir(root: &str) -> PathBuf {
     crate::state::dir()
         .join("capture-recovery")
-        .join(vaultr::vault::sha256_hex(root.as_bytes()))
+        .join(vaultr::digest::sha256_hex(root.as_bytes()))
 }
 
 fn pending_marker(root: &str, sid: &str) -> PathBuf {
@@ -907,7 +907,7 @@ fn recover(vault: &Path, live_cutoff: Option<&str>) -> Result<(), String> {
     initialize_recovery_index(&root, &directories)?;
     let mut sessions = indexed_pending_sessions(&root)?;
 
-    let hash_dir = staging_base().join(vaultr::vault::sha256_hex(root.as_bytes()));
+    let hash_dir = staging_base().join(vaultr::digest::sha256_hex(root.as_bytes()));
     if hash_dir.exists() {
         for entry in fs::read_dir(&hash_dir).map_err(|error| {
             format!(

@@ -513,7 +513,7 @@ fn normalize_request(
 
     let ids = websocket_identity(adapter, request_headers, &body);
     let encoded = serde_json::to_vec(&body).ok()?;
-    let body_sha256 = vaultr::vault::sha256_hex(&encoded);
+    let body_sha256 = vaultr::digest::sha256_hex(&encoded);
     Some(NormalizedRequest {
         body,
         encoded,

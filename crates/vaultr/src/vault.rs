@@ -2,8 +2,6 @@
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 /// Per-session index entry from `<root>/.meta/<session-uuid>.json`.
@@ -317,7 +315,7 @@ impl CaptureGenerations {
                 CaptureGenerationName::Raw => generations.raw = Some(path),
                 CaptureGenerationName::Sealed => generations.sealed = Some(path),
                 CaptureGenerationName::Detached { base_len, digest } => {
-                    if sha256_reader(file)
+                    if crate::digest::sha256_reader(file)
                         .with_context(|| format!("hash capture generation {}", path.display()))?
                         != digest
                     {
@@ -354,39 +352,6 @@ impl CaptureGenerations {
             .map(|generation| generation.path.as_path())
             .or(self.raw.as_deref())
     }
-}
-
-pub fn sha256_hex(data: &[u8]) -> String {
-    let mut hash = Sha256::new();
-    hash.update(data);
-    format!("{:x}", hash.finalize())
-}
-
-pub fn sha256_file(path: &Path) -> Result<String> {
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("hash capture generation {}", path.display()))?;
-    sha256_reader(file)
-}
-
-pub fn sha256_reader(mut reader: impl Read) -> Result<String> {
-    let mut hash = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hash.update(&buffer[..read]);
-    }
-    Ok(format!("{:x}", hash.finalize()))
-}
-
-/// Decode the concatenated-zstd suffix at `offset` and hash its exact
-/// uncompressed bytes. Reconstruction and Sealing use this same evidence proof.
-pub fn decoded_zstd_suffix_digest(mut reader: impl Read + Seek, offset: u64) -> Result<String> {
-    reader.seek(SeekFrom::Start(offset))?;
-    let decoder = zstd::Decoder::new(reader)?;
-    sha256_reader(decoder)
 }
 
 /// The capture file inside a session directory.

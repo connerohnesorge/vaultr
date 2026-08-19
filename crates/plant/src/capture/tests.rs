@@ -2,7 +2,7 @@ use super::persistence::{has_open_capture, session_lock, staging_base, staging_d
 use super::*;
 use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
-use vaultr::vault::sha256_hex;
+use vaultr::digest::sha256_hex;
 
 fn temp_vault(label: &str) -> PathBuf {
     std::env::temp_dir().join(format!("plant-{label}-{}", uuid::Uuid::new_v4()))
