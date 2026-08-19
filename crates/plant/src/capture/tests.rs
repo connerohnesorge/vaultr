@@ -965,7 +965,12 @@ async fn recovery_requires_stage_root_sequence_and_envelope_identity() {
         }
         let stage = staging_dir(&canonical_root(&vault), &sid)
             .join(format!("{}-{file_request_id}.json", pending.sequence));
-        crate::fsutil::atomic_replace(&stage, document.to_string().as_bytes()).unwrap();
+        crate::state::replace_file(
+            &stage,
+            document.to_string().as_bytes(),
+            crate::state::Durability::Rename,
+        )
+        .unwrap();
 
         let error = recover_all(&vault).unwrap_err();
         let expected = match case {
@@ -1008,7 +1013,7 @@ async fn recovery_reconciles_only_matching_retired_stages() {
             "{sequence}-{}.json",
             committed["request_id"].as_str().unwrap()
         ));
-        crate::fsutil::atomic_replace(
+        crate::state::replace_file(
             &stage,
             json!({
                 "root": root,
@@ -1018,6 +1023,7 @@ async fn recovery_reconciles_only_matching_retired_stages() {
             })
             .to_string()
             .as_bytes(),
+            crate::state::Durability::Rename,
         )
         .unwrap();
 
@@ -1104,4 +1110,40 @@ async fn incomplete_recovery_conflict_preserves_capture_journal_and_stage() {
     assert_eq!(staged.len(), 1, "durable recovery evidence remains");
     let staged: Value = serde_json::from_slice(&fs::read(&staged[0]).unwrap()).unwrap();
     assert_eq!(staged["envelope"]["response"]["complete"], false);
+}
+
+/// The capture journal must be fsync-durable: the pending recovery marker is,
+/// and a durable pointer to a non-durable target is the bug this pins shut.
+/// The per-turn stage stays deliberately rename-only (live-traffic throughput).
+#[tokio::test]
+async fn capture_journal_is_durable_and_stage_is_not() {
+    let (_guard, vault) = set_home();
+    let adapter = claude_adapter();
+    let sid = uuid::Uuid::new_v4().to_string();
+
+    let pending = prepare_capture(&vault, &adapter, captured(Some(&sid)), body(&["a"]))
+        .await
+        .unwrap();
+
+    let dir = pending.dir.clone();
+    let journal = dir.join("state.json");
+    assert_eq!(
+        crate::state::recorded_durability(&journal),
+        Some(crate::state::Durability::Fsync),
+        "capture journal write must fsync"
+    );
+
+    finish_capture(&vault, &adapter, pending, &response(true))
+        .await
+        .unwrap();
+
+    let stage = staging_dir(&canonical_root(&vault), &sid).join(format!(
+        "0-{}.json",
+        turns_lines(&dir)[0]["request_id"].as_str().unwrap()
+    ));
+    assert_eq!(
+        crate::state::recorded_durability(&stage),
+        Some(crate::state::Durability::Rename),
+        "staged envelope stays off the fsync path"
+    );
 }

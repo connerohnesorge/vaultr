@@ -335,7 +335,7 @@ fn inflight_sessions(vault: &Path, learner: Harness) -> HashSet<String> {
 
 fn publish_inflight(path: &Path, lease: &InflightLease) -> Result<(), String> {
     let body = serde_json::to_vec(lease).map_err(|error| error.to_string())?;
-    crate::fsutil::atomic_replace(path, &body)
+    crate::state::replace_file(path, &body, crate::state::Durability::Rename)
         .map_err(|error| format!("publish {}: {error}", path.display()))
 }
 

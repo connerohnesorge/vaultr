@@ -136,7 +136,14 @@ impl Journal {
             serde_json::to_vec(&Value::Object(self.state.clone())).map_err(|e| e.to_string())?;
         let mut line = body;
         line.push(b'\n');
-        crate::fsutil::atomic_replace(&self.dir.join("state.json"), &line).map_err(|error| {
+        // The pending recovery marker is fsync-durable and points at this
+        // journal, so the journal must be at least as durable as the pointer.
+        crate::state::replace_file(
+            &self.dir.join("state.json"),
+            &line,
+            crate::state::Durability::Fsync,
+        )
+        .map_err(|error| {
             format!(
                 "capture journal: persist {}: {error}",
                 self.dir.join("state.json").display()
@@ -306,7 +313,7 @@ fn mark_pending(root: &str, sid: &str) -> Result<(), String> {
     let path = pending_marker(root, sid);
     let body = serde_json::to_vec(&json!({ "root": root, "session_id": sid }))
         .map_err(|error| error.to_string())?;
-    crate::state::atomic_write(&path, &body)
+    crate::state::replace_file(&path, &body, crate::state::Durability::Fsync)
         .map_err(|error| format!("capture recovery: write marker {}: {error}", path.display()))
 }
 
@@ -342,9 +349,14 @@ impl Stage {
             "request_id": request_id,
             "envelope": envelope,
         });
-        crate::fsutil::atomic_replace(
+        // Deliberately rename-only: this runs on the live-traffic path for every
+        // captured turn, and an fsync barrier per turn is a real throughput cost.
+        // A stage lost to a power cut costs one unrecovered turn; the durable
+        // journal and recovery marker still describe consistent state without it.
+        crate::state::replace_file(
             &path,
             &serde_json::to_vec(&document).map_err(|error| error.to_string())?,
+            crate::state::Durability::Rename,
         )
         .map_err(|error| format!("capture stage: write {}: {error}", path.display()))?;
         Ok(Self {
@@ -787,7 +799,7 @@ fn initialize_recovery_index(
         drop(journal);
         super::release_memory();
     }
-    crate::state::atomic_write(&index, root.as_bytes())
+    crate::state::replace_file(&index, root.as_bytes(), crate::state::Durability::Fsync)
         .map_err(|error| format!("capture recovery: write index {}: {error}", index.display()))
 }
 

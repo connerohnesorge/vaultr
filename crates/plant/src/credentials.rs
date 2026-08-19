@@ -21,7 +21,7 @@
 //! `claude` session already started keeps the token it started with; the next
 //! invocation picks up the new one.
 
-use crate::fsutil::atomic_replace;
+use crate::state::{replace_file, Durability};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -142,7 +142,7 @@ fn write_secret(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
         // directory listing leaks which credentials exist.
         let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
     }
-    atomic_replace(path, bytes)
+    replace_file(path, bytes, Durability::Rename)
         .map_err(|error| format!("cannot write {}: {error}", path.display()))?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
         .map_err(|error| format!("cannot chmod {}: {error}", path.display()))
