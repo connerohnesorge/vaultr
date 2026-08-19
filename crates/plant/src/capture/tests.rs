@@ -296,6 +296,31 @@ async fn prepare_capture_degenerate_inputs() {
 }
 
 #[test]
+fn session_dir_refuses_a_symlinked_date_level() {
+    use std::os::unix::fs::symlink;
+
+    let vault = temp_vault("capture-symlink");
+    let outside = temp_vault("capture-outside");
+    let session_id = uuid::Uuid::new_v4().to_string();
+    let meta_dir = vault.join(".meta");
+    fs::create_dir_all(&meta_dir).unwrap();
+    fs::create_dir_all(outside.join("07/10")).unwrap();
+    fs::write(
+        meta_dir.join(format!("{session_id}.json")),
+        r#"{"original_start":"2026-07-10T00:00:00Z"}"#,
+    )
+    .unwrap();
+    symlink(&outside, vault.join("2026")).unwrap();
+
+    let error = session_dir(&vault, &session_id).unwrap_err().to_string();
+    assert!(error.contains("symlinked session path level"), "{error}");
+    assert!(!outside.join("07/10").join(&session_id).exists());
+
+    fs::remove_dir_all(&vault).unwrap();
+    fs::remove_dir_all(&outside).unwrap();
+}
+
+#[test]
 fn session_dir_creates_from_meta_without_scanning_and_caches() {
     let vault = temp_vault("capture");
     let session_id = uuid::Uuid::new_v4().to_string();

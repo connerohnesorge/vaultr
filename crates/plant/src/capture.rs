@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::SystemTime;
 use vaultr::recon;
-use vaultr::vault::{dated_session_dir, Meta};
+use vaultr::vault::{contained_levels, dated_session_dir, Meta};
 
 #[cfg(test)]
 use std::cell::Cell;
@@ -153,7 +153,13 @@ pub fn session_dir(vault: &Path, session_id: &str) -> std::io::Result<PathBuf> {
     let dir = dated_session_dir(vault, session_id, original_start.as_deref())
         .or_else(|| dated_session_dir(vault, session_id, Some(&iso_now())))
         .expect("iso_now returns RFC 3339");
+    // Refuse a symlinked date level rather than writing captures through it —
+    // the same containment the vaultr reader enforces on this exact path.
+    contained_levels(vault, &dir).map_err(std::io::Error::other)?;
     fs::create_dir_all(&dir)?;
+    // Re-check after creation: nothing we just made may be a symlink, and a
+    // level swapped underneath us between the two walks is caught here.
+    contained_levels(vault, &dir).map_err(std::io::Error::other)?;
     map.insert(key, dir.clone());
     Ok(dir)
 }

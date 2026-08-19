@@ -61,6 +61,51 @@ pub fn dated_session_dir(
     )
 }
 
+/// Outcome of walking the levels of a session path below the vault root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainedLevels {
+    /// Every level below `root` exists and is a real (non-symlink) directory.
+    Complete,
+    /// Some level is absent, or exists but is not a directory. Every level that
+    /// *did* exist was a real directory, so a creator may safely proceed.
+    Incomplete,
+}
+
+/// Verify that every already-existing level of `candidate` below `root` is a
+/// real directory, refusing any symlinked level.
+///
+/// Levels that do not exist yet are not an error: the reader treats
+/// `Incomplete` as "not present", and a creator can call this *before*
+/// `create_dir_all` to make sure it will not write through a pre-existing
+/// symlink. Only genuine hazards — a symlinked level, an unreadable level, or a
+/// candidate that is not under `root` — come back as `Err`.
+pub fn contained_levels(root: &Path, candidate: &Path) -> Result<ContainedLevels> {
+    let relative = candidate
+        .strip_prefix(root)
+        .with_context(|| format!("session path is not under {}", root.display()))?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        let metadata = match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ContainedLevels::Incomplete);
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect session path {}", current.display()));
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            bail!("symlinked session path level at {}", current.display());
+        }
+        if !metadata.is_dir() {
+            return Ok(ContainedLevels::Incomplete);
+        }
+    }
+    Ok(ContainedLevels::Complete)
+}
+
 impl Meta {
     /// Sort key: most recent activity (ISO strings sort lexicographically).
     pub fn last_activity(&self) -> &str {
@@ -174,26 +219,8 @@ pub fn session_dir(root: &Path, session: &Session) -> Result<PathBuf> {
 }
 
 fn existing_session_dir(root: &Path, candidate: &Path) -> Result<Option<PathBuf>> {
-    let relative = candidate
-        .strip_prefix(root)
-        .with_context(|| format!("session path is not under {}", root.display()))?;
-    let mut current = root.to_path_buf();
-    for component in relative.components() {
-        current.push(component);
-        let metadata = match std::fs::symlink_metadata(&current) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("inspect session path {}", current.display()));
-            }
-        };
-        if metadata.file_type().is_symlink() {
-            bail!("symlinked session path level at {}", current.display());
-        }
-        if !metadata.is_dir() {
-            return Ok(None);
-        }
+    if contained_levels(root, candidate)? == ContainedLevels::Incomplete {
+        return Ok(None);
     }
     let canonical_root = std::fs::canonicalize(root)
         .with_context(|| format!("canonicalize session root {}", root.display()))?;
