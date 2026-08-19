@@ -7,45 +7,113 @@ use crate::normalize::{Block, Message, Role};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
+/// Harness-independent classification of a tool call. Each writer renders a
+/// kind into its own vocabulary; the alternations that recognise a harness's
+/// tool names live here exactly once.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ToolKind {
+    Shell,
+    Edit,
+    Write,
+    Read,
+    Glob,
+    Grep,
+    WebSearch,
+    Plan,
+}
+
+impl ToolKind {
+    /// Classify a Codex tool name.
+    pub(crate) fn from_codex(name: &str) -> Option<Self> {
+        Some(match name {
+            "shell" | "exec_command" | "local_shell" | "local_shell_call" | "container.exec" => {
+                Self::Shell
+            }
+            "apply_patch" => Self::Edit,
+            "web_search" | "web.search" => Self::WebSearch,
+            "update_plan" => Self::Plan,
+            "view_image" | "read_file" => Self::Read,
+            "list_dir" | "list_files" => Self::Glob,
+            "grep" | "search" => Self::Grep,
+            _ => return None,
+        })
+    }
+
+    /// Classify a Claude tool name.
+    pub(crate) fn from_claude(name: &str) -> Option<Self> {
+        Some(match name {
+            "Bash" => Self::Shell,
+            "Edit" | "MultiEdit" | "NotebookEdit" => Self::Edit,
+            "Write" => Self::Write,
+            "WebSearch" => Self::WebSearch,
+            "TodoWrite" => Self::Plan,
+            "Read" => Self::Read,
+            "Glob" => Self::Glob,
+            "Grep" => Self::Grep,
+            _ => return None,
+        })
+    }
+
+    fn claude_name(self) -> &'static str {
+        match self {
+            Self::Shell => "Bash",
+            Self::Edit => "Edit",
+            Self::Write => "Write",
+            Self::Read => "Read",
+            Self::Glob => "Glob",
+            Self::Grep => "Grep",
+            Self::WebSearch => "WebSearch",
+            Self::Plan => "TodoWrite",
+        }
+    }
+
+    fn codex_name(self) -> &'static str {
+        match self {
+            Self::Shell => "shell",
+            Self::Edit | Self::Write => "apply_patch",
+            Self::Read => "view_image",
+            Self::Glob => "list_dir",
+            Self::Grep => "grep",
+            Self::WebSearch => "web_search",
+            Self::Plan => "update_plan",
+        }
+    }
+
+    /// Pi's vocabulary. Pi has no counterpart for search or plan tools.
+    pub(crate) fn pi_name(self) -> Option<&'static str> {
+        Some(match self {
+            Self::Shell => "bash",
+            Self::Edit => "edit",
+            Self::Write => "write",
+            Self::Read => "read",
+            Self::Glob => "find",
+            Self::Grep => "grep",
+            Self::WebSearch | Self::Plan => return None,
+        })
+    }
+}
+
 /// Codex tool name -> Claude tool name.
 pub fn codex_to_claude(name: &str) -> Option<&'static str> {
-    Some(match name {
-        "shell" | "exec_command" | "local_shell" | "local_shell_call" | "container.exec" => "Bash",
-        "apply_patch" => "Edit",
-        "web_search" | "web.search" => "WebSearch",
-        "update_plan" => "TodoWrite",
-        "view_image" | "read_file" => "Read",
-        "list_dir" | "list_files" => "Glob",
-        "grep" | "search" => "Grep",
-        _ => return None,
-    })
+    ToolKind::from_codex(name).map(ToolKind::claude_name)
 }
 
 /// Claude tool name -> Codex tool name.
 pub fn claude_to_codex(name: &str) -> Option<&'static str> {
-    Some(match name {
-        "Bash" => "shell",
-        "Edit" | "Write" | "MultiEdit" | "NotebookEdit" => "apply_patch",
-        "WebSearch" => "web_search",
-        "TodoWrite" => "update_plan",
-        "Read" => "view_image",
-        "Glob" => "list_dir",
-        "Grep" => "grep",
-        _ => return None,
-    })
+    ToolKind::from_claude(name).map(ToolKind::codex_name)
 }
 
 /// Render an unmapped tool call as readable plain text.
-fn tool_use_text(name: &str, input: &Value) -> String {
+pub(crate) fn tool_use_text(name: &str, input: &Value) -> String {
     let args = serde_json::to_string(input).unwrap_or_default();
     format!("[tool call: {name}({args})]")
 }
 
-fn tool_result_text(content: &str) -> String {
+pub(crate) fn tool_result_text(content: &str) -> String {
     format!("[tool result]\n{content}")
 }
 
-fn valid_correlations(messages: &[Message]) -> HashSet<&str> {
+pub(crate) fn valid_correlations(messages: &[Message]) -> HashSet<&str> {
     let mut occurrences: HashMap<&str, Vec<bool>> = HashMap::new();
     for block in messages.iter().flat_map(|message| &message.blocks) {
         let (id, is_use) = match block {
