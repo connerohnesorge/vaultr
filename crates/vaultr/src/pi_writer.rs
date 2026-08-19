@@ -2,6 +2,7 @@
 //! Pi's cwd-encoded session directory.
 
 use crate::normalize::{Block, Message, Role};
+use crate::translate::{tool_result_text, tool_use_text, valid_correlations, ToolKind};
 use crate::writeio::write_atomic_0600;
 use anyhow::{bail, Result};
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
@@ -290,39 +291,10 @@ fn entry_id(ids: &mut HashSet<String>) -> String {
     }
 }
 
-fn valid_correlations(messages: &[Message]) -> HashSet<&str> {
-    let mut occurrences: HashMap<&str, Vec<bool>> = HashMap::new();
-    for block in messages.iter().flat_map(|message| &message.blocks) {
-        let (id, is_use) = match block {
-            Block::ToolUse {
-                correlation_id: Some(id),
-                ..
-            } if !id.is_empty() => (id.as_str(), true),
-            Block::ToolResult {
-                correlation_id: Some(id),
-                ..
-            } if !id.is_empty() => (id.as_str(), false),
-            _ => continue,
-        };
-        occurrences.entry(id).or_default().push(is_use);
-    }
-    occurrences
-        .into_iter()
-        .filter_map(|(id, order)| (order.as_slice() == [true, false]).then_some(id))
-        .collect()
-}
-
 fn pi_tool<'a>(name: &'a str, input: &Value) -> Option<(&'a str, Value)> {
-    let mapped = match name {
-        "shell" | "exec_command" | "local_shell" | "local_shell_call" | "container.exec"
-        | "Bash" => "bash",
-        "apply_patch" | "Edit" | "MultiEdit" | "NotebookEdit" => "edit",
-        "Write" => "write",
-        "view_image" | "read_file" | "Read" => "read",
-        "list_dir" | "list_files" | "Glob" => "find",
-        "grep" | "search" | "Grep" => "grep",
-        _ => return None,
-    };
+    let mapped = ToolKind::from_codex(name)
+        .or_else(|| ToolKind::from_claude(name))
+        .and_then(ToolKind::pi_name)?;
     let mut arguments = input.as_object()?.clone();
     rename_key(&mut arguments, "file_path", "path");
     rename_key(&mut arguments, "old_string", "oldText");
@@ -341,17 +313,6 @@ fn rename_key(map: &mut Map<String, Value>, old: &str, new: &str) {
     if let Some(value) = map.remove(old) {
         map.entry(new.to_string()).or_insert(value);
     }
-}
-
-fn tool_use_text(name: &str, input: &Value) -> String {
-    format!(
-        "[tool call: {name}({})]",
-        serde_json::to_string(input).unwrap_or_default()
-    )
-}
-
-fn tool_result_text(content: &str) -> String {
-    format!("[tool result]\n{content}")
 }
 
 fn zero_usage() -> Value {
