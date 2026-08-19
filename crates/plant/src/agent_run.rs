@@ -248,7 +248,7 @@ fn persist_agent_outcome(path: &Path, key: &str, outcome: &AgentRunReceipt) -> i
     let mut bytes =
         serde_json::to_vec(&record).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     bytes.push(b'\n');
-    crate::state::atomic_write(path, &bytes)
+    crate::state::replace_file(path, &bytes, crate::state::Durability::Fsync)
 }
 
 fn persist_agent_checkpoint(
@@ -296,7 +296,7 @@ fn persist_agent_checkpoint(
     let mut bytes =
         serde_json::to_vec(&record).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     bytes.push(b'\n');
-    crate::state::atomic_write(path, &bytes)
+    crate::state::replace_file(path, &bytes, crate::state::Durability::Fsync)
 }
 
 /// Run an agent at most once for a caller-supplied stable key. Conclusive

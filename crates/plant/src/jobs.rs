@@ -31,7 +31,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::domain::{AgentCli, Effort};
 use crate::herdr::WorkspaceCleanup;
-use crate::state::{atomic_write, dir as state_dir, ensure_dir_durable, sync_dir};
+use crate::state::{dir as state_dir, ensure_dir_durable, replace_file, sync_dir, Durability};
 
 mod config;
 #[cfg(test)]
@@ -552,7 +552,7 @@ fn write_fence(path: &Path, fence: &AttemptFence) -> io::Result<()> {
     let mut bytes =
         serde_json::to_vec(fence).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     bytes.push(b'\n');
-    atomic_write(path, &bytes)
+    replace_file(path, &bytes, Durability::Fsync)
 }
 
 fn ledger_has_attempt_at<F>(

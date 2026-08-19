@@ -82,23 +82,74 @@ pub(crate) fn ensure_dir_durable(path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+/// Which crash guarantee a replacement write buys. The caller states it; the
+/// guarantee is never implied by which helper happened to be in scope.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Durability {
+    /// Atomic for a reader, but nothing is fsynced: after a power loss the
+    /// replacement may be absent or truncated. Only for state a later pass can
+    /// rebuild, or where the fsync barrier costs more than the data is worth.
+    Rename,
+    /// The bytes and the directory entry are both on stable storage before the
+    /// call returns. Required for anything a recovery pointer refers to.
+    Fsync,
+}
+
+/// Atomically replace `path` from a unique temporary file in the same
+/// directory, with the crash guarantee named by `durability`.
+pub(crate) fn replace_file(path: &Path, bytes: &[u8], durability: Durability) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path has no parent"))?;
-    ensure_dir_durable(parent)?;
+    match durability {
+        Durability::Rename => std::fs::create_dir_all(parent)?,
+        Durability::Fsync => ensure_dir_durable(parent)?,
+    }
     let tmp = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
     let result = (|| {
-        let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
+        let mut file = match durability {
+            Durability::Rename => File::create(&tmp)?,
+            Durability::Fsync => OpenOptions::new().write(true).create_new(true).open(&tmp)?,
+        };
         file.write_all(bytes)?;
-        file.sync_all()?;
+        if durability == Durability::Fsync {
+            file.sync_all()?;
+        }
         std::fs::rename(&tmp, path)?;
-        sync_dir(parent)
+        if durability == Durability::Fsync {
+            sync_dir(parent)?;
+        }
+        Ok(())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(tmp);
     }
+    #[cfg(test)]
+    if result.is_ok() {
+        record_write(path, durability);
+    }
     result
+}
+
+#[cfg(test)]
+static WRITE_LOG: std::sync::Mutex<Vec<(PathBuf, Durability)>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+fn record_write(path: &Path, durability: Durability) {
+    let mut log = WRITE_LOG.lock().unwrap_or_else(|error| error.into_inner());
+    log.push((path.to_path_buf(), durability));
+}
+
+/// The durability of the most recent successful [`replace_file`] of `path`.
+/// Lets a test pin a call site's guarantee so a later edit cannot quietly
+/// downgrade it.
+#[cfg(test)]
+pub(crate) fn recorded_durability(path: &Path) -> Option<Durability> {
+    let log = WRITE_LOG.lock().unwrap_or_else(|error| error.into_inner());
+    log.iter()
+        .rev()
+        .find(|(recorded, _)| recorded == path)
+        .map(|(_, durability)| *durability)
 }
 
 #[cfg(test)]

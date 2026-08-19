@@ -254,7 +254,11 @@ fn write_drop(vault: &Path, session_id: &str, reason: &str) -> std::io::Result<(
     meta.first_drop.get_or_insert_with(|| now.clone());
     meta.last_drop = Some(now);
     meta.last_drop_reason = Some(reason.to_string());
-    crate::fsutil::atomic_replace(&path, (to_string_pretty_1(&json!(meta)) + "\n").as_bytes())
+    crate::state::replace_file(
+        &path,
+        (to_string_pretty_1(&json!(meta)) + "\n").as_bytes(),
+        crate::state::Durability::Rename,
+    )
 }
 
 /// The preflight decision. An unmeasurable volume is never treated as full.
