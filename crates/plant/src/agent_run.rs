@@ -3,12 +3,10 @@ use crate::herdr::{
     AgentRunOutcome, AgentRunProgress,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
 
 #[derive(Debug, Deserialize, PartialEq, Serialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
@@ -61,51 +59,6 @@ enum AgentRunRecovery {
     Retain(String),
 }
 
-fn capture_has_completed_envelope(path: &Path) -> Result<bool, String> {
-    let mut completed = false;
-    vaultr::recon::for_each_envelope(path, |envelope| {
-        completed |= envelope
-            .pointer("/response/complete")
-            .and_then(Value::as_bool)
-            == Some(true);
-        Ok(())
-    })
-    .map_err(|error| error.to_string())?;
-    Ok(completed)
-}
-
-fn session_has_completed_envelope(vault: &Path, session_id: &str) -> Result<bool, String> {
-    let session =
-        vaultr::vault::resolve_id(vault, session_id).map_err(|error| error.to_string())?;
-    let directory =
-        vaultr::vault::session_dir(vault, &session).map_err(|error| error.to_string())?;
-    let capture = vaultr::vault::capture_file(&directory).map_err(|error| error.to_string())?;
-    capture_has_completed_envelope(&capture)
-}
-
-pub(crate) async fn wait_for_completed_envelope(
-    vault: &Path,
-    session_id: &str,
-) -> Result<(), String> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        match session_has_completed_envelope(vault, session_id) {
-            Ok(true) => return Ok(()),
-            Ok(false) if Instant::now() >= deadline => {
-                return Err(format!(
-                    "session {session_id} produced no completed capture envelope"
-                ));
-            }
-            Err(error) if Instant::now() >= deadline => {
-                return Err(format!(
-                    "could not inspect capture for session {session_id}: {error}"
-                ));
-            }
-            _ => tokio::time::sleep(Duration::from_millis(100)).await,
-        }
-    }
-}
-
 async fn recovered_capture_outcome_at(
     vault: &Path,
     checkpoint: &AgentRunCheckpoint,
@@ -115,7 +68,7 @@ async fn recovered_capture_outcome_at(
             "pending Agent Run has no captured session identity".to_string(),
         );
     };
-    match wait_for_completed_envelope(vault, session_id).await {
+    match crate::envelope::wait_for_completed_envelope(vault, session_id).await {
         Ok(()) => AgentRunRecovery::Succeeded(
             "agent completed; recovered from the matching terminal capture".to_string(),
         ),
@@ -547,21 +500,6 @@ mod tests {
         assert!(matches!(checkpoint, AgentRunCheckpoint::Working { .. }));
 
         std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn capture_completion_requires_a_completed_envelope() {
-        let path =
-            std::env::temp_dir().join(format!("plant-capture-{}.jsonl", uuid::Uuid::new_v4()));
-        std::fs::write(&path, "{\"response\":{\"complete\":false}}\n").unwrap();
-        assert!(!capture_has_completed_envelope(&path).unwrap());
-        std::fs::write(
-            &path,
-            "{\"response\":{\"complete\":false}}\n{\"response\":{\"complete\":true}}\n",
-        )
-        .unwrap();
-        assert!(capture_has_completed_envelope(&path).unwrap());
-        std::fs::remove_file(path).unwrap();
     }
 
     #[tokio::test]
