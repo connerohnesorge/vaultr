@@ -1504,7 +1504,7 @@ pub(crate) async fn run_agent_with_progress(
     }
     let outcome = match (outcome, session_id) {
         (AgentRunOutcome::Succeeded(_), Some(session_id)) => {
-            match crate::agent_run::wait_for_completed_envelope(&crate::vault_root(), &session_id)
+            match crate::envelope::wait_for_completed_envelope(&crate::vault_root(), &session_id)
                 .await
             {
                 Ok(()) => AgentRunOutcome::Succeeded("agent done".to_string()),

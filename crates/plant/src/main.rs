@@ -10,6 +10,7 @@ mod cli;
 mod coverage;
 mod credentials;
 mod domain;
+mod envelope;
 mod fsutil;
 mod herdr;
 mod jobs;
