@@ -612,6 +612,27 @@ pub enum CompressError {
     Operational(String),
 }
 
+/// What one sweep actually got through. `skipped` names the sessions whose own
+/// readiness check failed: the sweep steps over them and keeps going, because a
+/// per-session fault is not a reason to stop sealing every later session. It is
+/// reported rather than swallowed — a sweep that quietly seals less than the
+/// corpus looks identical to one that had nothing to do.
+#[derive(Debug, Default)]
+pub struct CompressOutcome {
+    pub sealed: u32,
+    pub skipped: Vec<(String, String)>,
+}
+
+impl fmt::Display for CompressOutcome {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} sealed", self.sealed)?;
+        if !self.skipped.is_empty() {
+            write!(formatter, ", {} skipped", self.skipped.len())?;
+        }
+        Ok(())
+    }
+}
+
 impl fmt::Display for CompressError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -652,33 +673,48 @@ fn exclude_from_commit(vault: &Path, sealed: &Path, size: u64) {
     );
 }
 
-pub async fn compress_sweep(vault: &Path, idle: Duration) -> Result<(), CompressError> {
+pub async fn compress_sweep(
+    vault: &Path,
+    idle: Duration,
+) -> Result<CompressOutcome, CompressError> {
     let (pending, _learn) = pending_generations(vault).map_err(CompressError::Inventory)?;
     if !which("zstd") {
         return Err(CompressError::Operational("zstd not on PATH".into()));
     }
-    let mut sealed = 0u32;
+    let mut outcome = CompressOutcome::default();
     for selected in pending {
-        if !selected
-            .ready_to_seal(idle)
-            .map_err(CompressError::Inventory)?
-        {
-            continue;
+        // Every fault below belongs to one session. Propagating it would let a
+        // single unsealable capture halt the sweep before every later session,
+        // forever, on every tick — the corpus stops sealing and the only signal
+        // is one repeated error naming the first bad row.
+        match selected.ready_to_seal(idle) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) => {
+                outcome.skipped.push((selected.sid.clone(), error));
+                continue;
+            }
         }
-        let directory = selected.path().parent().ok_or_else(|| {
-            CompressError::Inventory(format!(
-                "capture has no session directory: {}",
-                selected.path().display()
-            ))
-        })?;
-        let Some(generation) =
-            crate::capture::seal_ready_generation(vault, &selected.sid, directory)
-                .await
-                .map_err(CompressError::Operational)?
-        else {
+        let Some(directory) = selected.path().parent() else {
+            outcome.skipped.push((
+                selected.sid.clone(),
+                format!(
+                    "capture has no session directory: {}",
+                    selected.path().display()
+                ),
+            ));
             continue;
         };
-        sealed += 1;
+        let generation =
+            match crate::capture::seal_ready_generation(vault, &selected.sid, directory).await {
+                Ok(Some(generation)) => generation,
+                Ok(None) => continue,
+                Err(error) => {
+                    outcome.skipped.push((selected.sid.clone(), error));
+                    continue;
+                }
+            };
+        outcome.sealed += 1;
         let sealed_size = std::fs::metadata(&generation.path)
             .map(|metadata| metadata.len())
             .unwrap_or(0);
@@ -693,16 +729,20 @@ pub async fn compress_sweep(vault: &Path, idle: Duration) -> Result<(), Compress
             sealed_size as f64 / 1e6
         );
     }
+    for (sid, error) in &outcome.skipped {
+        println!("[compress] skipped {sid}: {error}");
+    }
+    let sealed = outcome.sealed;
     if sealed == 0 {
-        println!("[compress] nothing to seal");
-        return Ok(());
+        println!("[compress] nothing to seal ({outcome})");
+        return Ok(outcome);
     }
     let repository = match vaultr::validate::content_root(vault) {
         Ok(path) if path.as_os_str().is_empty() => ".".to_string(),
         Ok(path) => path.to_str().unwrap_or(".").to_string(),
         Err(_) => {
             println!("[compress] sealed {sealed}, commit skipped: sessions root has no parent");
-            return Ok(());
+            return Ok(outcome);
         }
     };
     run30(&["git", "-C", &repository, "add", "-A", "sessions"]).await;
@@ -721,7 +761,7 @@ pub async fn compress_sweep(vault: &Path, idle: Duration) -> Result<(), Compress
             "FAILED (next sweep retries)"
         }
     );
-    Ok(())
+    Ok(outcome)
 }
 
 #[cfg(test)]
