@@ -15,6 +15,7 @@ import {
   landFile,
   legacyKey,
   setupDoorTest,
+  spawnExitedProcess,
   spawnWorker,
   stubCalls,
   stubLog,
@@ -363,9 +364,7 @@ test("two contenders retaining one stale inode cannot remove its successor lock"
   landFile("mail/a.md", 1000);
   writeIdempotentStub(0, { delay: 1 });
   mkdirSync(join(tmp, "state"), { recursive: true });
-  const exited = Bun.spawn(["/usr/bin/true"]);
-  await exited.exited;
-  const stale = { pid: exited.pid, token: "stale-owner" };
+  const stale = { pid: await spawnExitedProcess(), token: "stale-owner" };
   const lock = join(tmp, "state", "t.lock");
   writeFileSync(
     lock,
@@ -414,9 +413,7 @@ test("two contenders retaining one stale inode cannot remove its successor lock"
 test("a live successor swapped in after guarded owner parse is retained", async () => {
   landFile("mail/a.md", 1000);
   mkdirSync(join(tmp, "state"), { recursive: true });
-  const exited = Bun.spawn(["/usr/bin/true"]);
-  await exited.exited;
-  const stale = { pid: exited.pid, token: "stale-owner" };
+  const stale = { pid: await spawnExitedProcess(), token: "stale-owner" };
   const successor = { pid: process.pid, token: "live-successor" };
   const lock = join(tmp, "state", "t.lock");
   writeFileSync(lock, `${JSON.stringify(stale)}\n`);
@@ -445,9 +442,7 @@ test("retargeting an intermediate state alias cannot redirect stale unlink", asy
   symlinkSync(oldBase, alias);
   process.env.DOOR_STATE_DIR = join(alias, "doors");
 
-  const exited = Bun.spawn(["/usr/bin/true"]);
-  await exited.exited;
-  const stale = { pid: exited.pid, token: "stale-owner" };
+  const stale = { pid: await spawnExitedProcess(), token: "stale-owner" };
   const successor = { pid: process.pid, token: "new-root-successor" };
   const oldLock = join(oldBase, "doors", "t.lock");
   const successorLock = join(newBase, "doors", "t.lock");

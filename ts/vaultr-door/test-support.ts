@@ -151,6 +151,24 @@ export function spawnWorker(extraEnv: Record<string, string> = {}) {
   });
 }
 
+/**
+ * Runs a trivial process to completion and returns its pid, which is then a pid
+ * that genuinely belonged to a real, now-exited process. Spawns the running Bun
+ * binary rather than an absolute FHS path, which does not exist on NixOS.
+ */
+export async function spawnExitedProcess(): Promise<number> {
+  const child = Bun.spawn([process.execPath, "-e", ""], {
+    stdout: "ignore",
+    stderr: "ignore",
+  });
+  const pid = child.pid;
+  const code = await child.exited;
+  if (code !== 0) {
+    throw new Error(`expected a clean exit from ${process.execPath}, got ${code}`);
+  }
+  return pid;
+}
+
 export async function waitForFile(path: string): Promise<void> {
   for (let attempt = 0; attempt < 200; attempt++) {
     if (existsSync(path)) return;
