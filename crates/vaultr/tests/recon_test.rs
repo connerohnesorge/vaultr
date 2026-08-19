@@ -311,7 +311,7 @@ fn detached_generation_reconstructs_once_before_and_after_commit() {
     let detached = tmp.path().join(format!(
         "turns.jsonl.sealing-{}-{}",
         first_frame.len(),
-        vaultr::vault::sha256_hex(detached_body.as_bytes())
+        vaultr::digest::sha256_hex(detached_body.as_bytes())
     ));
     fs::write(&detached, &detached_body).unwrap();
 
@@ -345,7 +345,7 @@ fn detached_generation_is_not_omitted_for_an_unproven_sealed_suffix() {
     let detached = tmp.path().join(format!(
         "turns.jsonl.sealing-{}-{}",
         first_frame.len(),
-        vaultr::vault::sha256_hex(second.as_bytes())
+        vaultr::digest::sha256_hex(second.as_bytes())
     ));
     fs::write(&detached, second).unwrap();
 
@@ -360,7 +360,7 @@ fn detached_generation_errors_do_not_echo_captured_content() {
     let captured = "TOP-SECRET-CAPTURED-CONTENT\n";
     let detached = tmp.path().join(format!(
         "turns.jsonl.sealing-0-{}",
-        vaultr::vault::sha256_hex(captured.as_bytes())
+        vaultr::digest::sha256_hex(captured.as_bytes())
     ));
     fs::write(&detached, captured).unwrap();
     let error = recon::reconstruct(&detached).unwrap_err().to_string();

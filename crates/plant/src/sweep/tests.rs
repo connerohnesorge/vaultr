@@ -571,7 +571,7 @@ async fn detached_sealing_conflict_is_an_operational_failure() {
     let body = b"detached evidence\n";
     let detached = directory.join(format!(
         "turns.jsonl.sealing-0-{}",
-        vaultr::vault::sha256_hex(body)
+        vaultr::digest::sha256_hex(body)
     ));
     std::fs::write(&detached, body).unwrap();
     let sealed = directory.join("turns.jsonl.zst");

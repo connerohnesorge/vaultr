@@ -495,7 +495,7 @@ async fn detached_generation_does_not_bypass_strict_journal_loading() {
     let body = b"detached evidence\n";
     let detached = dir.join(format!(
         "turns.jsonl.sealing-0-{}",
-        vaultr::vault::sha256_hex(body)
+        vaultr::digest::sha256_hex(body)
     ));
     fs::write(&detached, body).unwrap();
     fs::write(dir.join("state.json"), b"{corrupt").unwrap();

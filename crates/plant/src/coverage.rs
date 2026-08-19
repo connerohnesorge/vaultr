@@ -267,7 +267,7 @@ mod tests {
         let detached = dir.join(format!(
             "turns.jsonl.sealing-{}-{}",
             sealed_body.len(),
-            vaultr::vault::sha256_hex(detached_body.as_bytes())
+            vaultr::digest::sha256_hex(detached_body.as_bytes())
         ));
         std::fs::write(&detached, detached_body).unwrap();
 

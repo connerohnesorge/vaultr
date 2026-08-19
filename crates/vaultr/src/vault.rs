@@ -2,8 +2,6 @@
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 /// Per-session index entry from `<root>/.meta/<session-uuid>.json`.
@@ -59,6 +57,51 @@ pub fn dated_session_dir(
             .join(date.format("%d").to_string())
             .join(session_id),
     )
+}
+
+/// Outcome of walking the levels of a session path below the vault root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainedLevels {
+    /// Every level below `root` exists and is a real (non-symlink) directory.
+    Complete,
+    /// Some level is absent, or exists but is not a directory. Every level that
+    /// *did* exist was a real directory, so a creator may safely proceed.
+    Incomplete,
+}
+
+/// Verify that every already-existing level of `candidate` below `root` is a
+/// real directory, refusing any symlinked level.
+///
+/// Levels that do not exist yet are not an error: the reader treats
+/// `Incomplete` as "not present", and a creator can call this *before*
+/// `create_dir_all` to make sure it will not write through a pre-existing
+/// symlink. Only genuine hazards — a symlinked level, an unreadable level, or a
+/// candidate that is not under `root` — come back as `Err`.
+pub fn contained_levels(root: &Path, candidate: &Path) -> Result<ContainedLevels> {
+    let relative = candidate
+        .strip_prefix(root)
+        .with_context(|| format!("session path is not under {}", root.display()))?;
+    let mut current = root.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        let metadata = match std::fs::symlink_metadata(&current) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ContainedLevels::Incomplete);
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("inspect session path {}", current.display()));
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            bail!("symlinked session path level at {}", current.display());
+        }
+        if !metadata.is_dir() {
+            return Ok(ContainedLevels::Incomplete);
+        }
+    }
+    Ok(ContainedLevels::Complete)
 }
 
 impl Meta {
@@ -174,26 +217,8 @@ pub fn session_dir(root: &Path, session: &Session) -> Result<PathBuf> {
 }
 
 fn existing_session_dir(root: &Path, candidate: &Path) -> Result<Option<PathBuf>> {
-    let relative = candidate
-        .strip_prefix(root)
-        .with_context(|| format!("session path is not under {}", root.display()))?;
-    let mut current = root.to_path_buf();
-    for component in relative.components() {
-        current.push(component);
-        let metadata = match std::fs::symlink_metadata(&current) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => {
-                return Err(error)
-                    .with_context(|| format!("inspect session path {}", current.display()));
-            }
-        };
-        if metadata.file_type().is_symlink() {
-            bail!("symlinked session path level at {}", current.display());
-        }
-        if !metadata.is_dir() {
-            return Ok(None);
-        }
+    if contained_levels(root, candidate)? == ContainedLevels::Incomplete {
+        return Ok(None);
     }
     let canonical_root = std::fs::canonicalize(root)
         .with_context(|| format!("canonicalize session root {}", root.display()))?;
@@ -290,7 +315,7 @@ impl CaptureGenerations {
                 CaptureGenerationName::Raw => generations.raw = Some(path),
                 CaptureGenerationName::Sealed => generations.sealed = Some(path),
                 CaptureGenerationName::Detached { base_len, digest } => {
-                    if sha256_reader(file)
+                    if crate::digest::sha256_reader(file)
                         .with_context(|| format!("hash capture generation {}", path.display()))?
                         != digest
                     {
@@ -327,39 +352,6 @@ impl CaptureGenerations {
             .map(|generation| generation.path.as_path())
             .or(self.raw.as_deref())
     }
-}
-
-pub fn sha256_hex(data: &[u8]) -> String {
-    let mut hash = Sha256::new();
-    hash.update(data);
-    format!("{:x}", hash.finalize())
-}
-
-pub fn sha256_file(path: &Path) -> Result<String> {
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("hash capture generation {}", path.display()))?;
-    sha256_reader(file)
-}
-
-pub fn sha256_reader(mut reader: impl Read) -> Result<String> {
-    let mut hash = Sha256::new();
-    let mut buffer = [0u8; 64 * 1024];
-    loop {
-        let read = reader.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        hash.update(&buffer[..read]);
-    }
-    Ok(format!("{:x}", hash.finalize()))
-}
-
-/// Decode the concatenated-zstd suffix at `offset` and hash its exact
-/// uncompressed bytes. Reconstruction and Sealing use this same evidence proof.
-pub fn decoded_zstd_suffix_digest(mut reader: impl Read + Seek, offset: u64) -> Result<String> {
-    reader.seek(SeekFrom::Start(offset))?;
-    let decoder = zstd::Decoder::new(reader)?;
-    sha256_reader(decoder)
 }
 
 /// The capture file inside a session directory.

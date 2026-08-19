@@ -566,7 +566,7 @@ async fn prepare_http_capture(
             method,
             path,
             content_encoding,
-            body_sha256: vaultr::vault::sha256_hex(&decoded),
+            body_sha256: vaultr::digest::sha256_hex(&decoded),
             ids,
             started_at,
         };

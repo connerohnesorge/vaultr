@@ -356,7 +356,7 @@ pub(super) fn clone_at_start(file: &File) -> Result<File, String> {
 }
 
 pub(super) fn hash_file(file: &File) -> Result<String, String> {
-    vaultr::vault::sha256_reader(clone_at_start(file)?).map_err(|error| error.to_string())
+    vaultr::digest::sha256_reader(clone_at_start(file)?).map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

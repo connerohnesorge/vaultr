@@ -80,7 +80,7 @@ fn retained_snapshot_survives_sealed_replace_and_detached_unlink() {
     let detached = root.path().join(format!(
         "turns.jsonl.sealing-{}-{}",
         first_frame.len(),
-        crate::vault::sha256_hex(second.as_bytes())
+        crate::digest::sha256_hex(second.as_bytes())
     ));
     std::fs::write(&detached, second.as_bytes()).unwrap();
     let merged = root.path().join(".merged");
