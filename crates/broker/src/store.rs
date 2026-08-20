@@ -8,22 +8,20 @@
 //! memory and CPU cost, so the store bounds their concurrency. A bulk reconcile
 //! can otherwise fork enough existence checks to OOM the broker.
 //!
-//! Two calls only, and both are chosen to fit the write-only grant this service
-//! holds (`s3:ListBucket` on `sessions/*` + `s3:PutObject` on `sessions/*`, no
-//! `s3:GetObject`):
+//! The broker uses a small set of AWS CLI calls. Listing and upload preserve the
+//! existing narrow write grant. Reads use `s3 presign` so the broker can return
+//! a short-lived URL without buffering seal bytes or issuing `get-object` itself.
 //!
 //! - `list-objects-v2` returns key *and* size, which is everything an idempotent
-//!   size-checked comparison needs. `head-object` would have been the obvious
-//!   call and is the wrong one — it is authorised by `s3:GetObject`, which this
-//!   service must not hold.
+//!   size-checked comparison needs. `head-object` would be the obvious call and
+//!   is unnecessary for the write path.
 //! - `put-object` is single-part. `aws s3 cp` switches to multipart above 8 MB,
 //!   which drags in `s3:AbortMultipartUpload` to clean up after a failure;
-//!   single-part keeps the IAM policy exactly as narrow as it was written, at
-//!   the cost of a 5 GiB per-object ceiling that the largest seal on record
-//!   (2.7 GB) sits comfortably under.
+//!   single-part keeps the write policy narrow, at the cost of a 5 GiB
+//!   per-object ceiling that the largest seal on record (2.7 GB) sits under.
 
 use anyhow::{bail, Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::process::Command;
 use tokio::sync::{Semaphore, SemaphorePermit};
 
@@ -46,6 +44,7 @@ pub const DEFAULT_MAX_AWS_PROCESSES: usize = 6;
 #[derive(Debug)]
 pub struct Store {
     bucket: String,
+    aws_binary: PathBuf,
     aws_processes: Semaphore,
 }
 
@@ -58,12 +57,21 @@ pub struct Object {
 
 impl Store {
     pub fn with_max_aws_processes(bucket: impl Into<String>, max_aws_processes: usize) -> Self {
+        Self::with_aws_binary(bucket, max_aws_processes, "aws")
+    }
+
+    pub(crate) fn with_aws_binary(
+        bucket: impl Into<String>,
+        max_aws_processes: usize,
+        aws_binary: impl Into<PathBuf>,
+    ) -> Self {
         assert!(
             max_aws_processes > 0,
             "the AWS process limit must be positive"
         );
         Store {
             bucket: bucket.into(),
+            aws_binary: aws_binary.into(),
             aws_processes: Semaphore::new(max_aws_processes),
         }
     }
@@ -120,6 +128,20 @@ impl Store {
             .map(|object| object.size))
     }
 
+    /// Return a short-lived URL that authorizes one object read.
+    pub async fn presign(&self, key: &str, expires_in: u64) -> Result<String> {
+        let object = format!("s3://{}/{}", self.bucket, key);
+        let expires_in = expires_in.to_string();
+        let output = self
+            .aws(&["s3", "presign", &object, "--expires-in", &expires_in])
+            .await?;
+        let url = output.trim();
+        if url.is_empty() {
+            bail!("aws s3 presign returned an empty URL for {object}");
+        }
+        Ok(url.to_string())
+    }
+
     /// Write one object. The body is a file so the transfer streams and the
     /// length is exact; the caller has already spooled and size-checked it.
     pub async fn put(&self, key: &str, body: &Path) -> Result<()> {
@@ -146,9 +168,9 @@ impl Store {
         // The request body is already on disk before an upload reaches here, so
         // waiting applies backpressure without retaining seal bytes in memory.
         // Every AWS CLI child passes through this one permit boundary, including
-        // listings, existence checks, and writes.
+        // listings, presign checks, and writes.
         let _permit = self.aws_process_permit().await;
-        let output = Command::new("aws")
+        let output = Command::new(&self.aws_binary)
             .args(args)
             .kill_on_drop(true)
             .output()

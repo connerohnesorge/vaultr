@@ -1,7 +1,7 @@
 //! What counts as a seal key.
 //!
-//! The broker holds a write grant into a bucket of regulated agent-transcript
-//! data, so the key it is handed decides what that grant can be talked into
+//! The broker holds grants into a bucket of regulated agent-transcript data, so
+//! the key it is handed decides what those grants can be talked into reading or
 //! writing. Validation is therefore a whitelist of the one shape a seal has —
 //! `sessions/YYYY/MM/DD/<session-id>/<seal file>` — rather than a blacklist of
 //! traversal tricks.
