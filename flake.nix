@@ -77,6 +77,16 @@
           vaultr = { type = "app"; program = "${workspace}/bin/vaultr"; };
           plant = { type = "app"; program = "${workspace}/bin/plant"; };
         };
+        # Without this, `nix develop` falls back to the default package's build
+        # environment, which carries cargo and rustc but not clippy or rustfmt —
+        # so the two lint gates CI runs could not be reproduced locally at all.
+        # inputsFrom keeps that environment (cc, linker, native deps) verbatim
+        # and only adds the missing tools, at the same nixpkgs revision as the
+        # compiler so clippy-driver and rustc never disagree on metadata.
+        devShells.default = pkgs.mkShell {
+          inputsFrom = [workspace];
+          packages = [pkgs.clippy pkgs.rustfmt];
+        };
         checks = {
           nixos-module =
             assert moduleSystem.config.systemd.services.plant.serviceConfig.User == "vaultr-test";
