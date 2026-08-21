@@ -20,16 +20,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-/// Directory holding `ca.pem` + `ca.key`. Shares the state dir with the job
-/// ledger and crash log so there is one place to wipe.
-pub fn state_dir() -> PathBuf {
-    if let Some(dir) = std::env::var_os("XDG_STATE_HOME").filter(|v| !v.is_empty()) {
-        return PathBuf::from(dir).join("plant");
-    }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
-    home.join(".local/state/plant")
+/// `ca.pem` + `ca.key` live in the shared state dir, so there is one place to
+/// wipe. Resolution belongs to `state::dir` and nowhere else.
+fn state_dir() -> PathBuf {
+    crate::state::dir()
 }
 
 pub struct Ca {
