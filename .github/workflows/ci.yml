@@ -53,6 +53,51 @@ jobs:
       - run: nix flake check --print-build-logs
       - run: nix build .#default --print-build-logs
 
+  # The broker image is built here rather than in athens: athens builds only
+  # from its gitlab-group webhook, and this source lives on GitHub.
+  #
+  # It publishes to GHCR and stops there. athens pulls it through the ECR
+  # pull-through cache that already fronts ghcr.io, so no AWS credential,
+  # role, or OIDC trust exists anywhere in this pipeline. The registry the
+  # cluster reads from is a mirror it already controls, not a door this
+  # workflow was handed a key to.
+  broker-image:
+    name: Broker image
+    needs: checks
+    # main only: a fork's pull_request must never publish a broker image.
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/${{ github.repository }}/plant-broker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        run: |
+          docker build -t "$IMAGE:$GITHUB_SHA" .
+          docker push "$IMAGE:$GITHUB_SHA"
+
+      - name: Report the image
+        run: |
+          {
+            echo "### Broker image"
+            echo '```'
+            echo "$IMAGE:$GITHUB_SHA"
+            echo '```'
+            echo "Pulled in athens through the ghcr pull-through cache as:"
+            echo '```'
+            echo "485494358268.dkr.ecr.us-east-2.amazonaws.com/ghcr/${{ github.repository }}/plant-broker:$GITHUB_SHA"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
   secrets:
     name: Secret scan
     runs-on: ubuntu-latest
