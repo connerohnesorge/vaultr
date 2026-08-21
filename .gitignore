@@ -6,3 +6,7 @@ result
 .rocks/changes/**/*.jsonc
 .DS_Store
 .claude/
+
+# Spec workspace. .rocks/ holds internal design records and incident
+# write-ups; it lives in the private mirror, not in this public repository.
+.rocks/
