@@ -92,10 +92,7 @@ jobs:
             echo '```'
             echo "$IMAGE:$GITHUB_SHA"
             echo '```'
-            echo "Pulled in athens through the ghcr pull-through cache as:"
-            echo '```'
-            echo "485494358268.dkr.ecr.us-east-2.amazonaws.com/ghcr/${{ github.repository }}/plant-broker:$GITHUB_SHA"
-            echo '```'
+            echo "Consumers pull this through their own registry mirror."
           } >> "$GITHUB_STEP_SUMMARY"
 
   secrets:
