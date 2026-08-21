@@ -29,6 +29,16 @@
 
 ## 4. Not in this change
 
-- [ ] 4.1 Full backlog upload run (acropolis `#1220`)
-- [ ] 4.2 athens deployment, IRSA role, Grafana staleness alert, and activating
-      the job into `shared/` (acropolis `#1221`)
+These are not tasks of this change and never were. They are checkboxes only by
+accident, which held the change at 13/15 and blocked its archive. Both shipped
+under their own tickets:
+
+- Full backlog upload run — acropolis `#1220`, closed.
+- athens deployment, IRSA role, Grafana staleness alert, and activating the job
+  into `shared/` — acropolis `#1221`, closed. The deployment runs in the
+  `plant-broker` namespace, the ServiceAccount carries
+  `arn:aws:iam::485494358268:role/plant-broker-athens`, and `seal-push.30m.sh`
+  has moved from `staged/` into `shared/`. No PrometheusRule matches the
+  staleness alert; the ServiceMonitor scrapes the broker's per-tenant upload-age
+  metrics, so whether an alert was ever built on them is worth confirming
+  against `#1221` rather than assumed from this list.
