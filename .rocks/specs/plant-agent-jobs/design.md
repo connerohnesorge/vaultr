@@ -63,27 +63,3 @@ The listener-owning daemon retains every `InProcessCompression` action.
 
 This replay relies on `capture-stewardship/design.md` ADR-0001 for crash-recoverable Sealing.
 Script and legacy actionless fences remain fail-closed because their side effects are not proven replay-safe.
-
-### ADR-0005: Reconcile keyed Agent Runs by durable execution identity
-
-A pending receipt stores the Herdr workspace, pane, terminal, captured session, and last observed lifecycle stage.
-Plant uses that identity to inspect the exact execution after a supervisor restart.
-It never treats receipt age as proof that the effect is dead.
-
-A matching live pane resumes observation.
-A matching terminal capture produces a conclusive receipt.
-A conclusively absent execution without a terminal capture produces a conclusive failure.
-Unavailable or conflicting evidence retains the receipt and the attempt fence.
-Legacy receipts lack the identity and keep the existing operator recovery path.
-
-### ADR-0006: Seal upload capacity is isolated from agent work
-
-`seal-push` gets its own single cross-process scheduler lease and is selected
-alongside, rather than within, the configured ordinary capacity. Its offsite
-copy is a durability boundary, while ordinary slots commonly hold multi-minute
-Herdr agent runs; sharing the pool can silently defer seal uploads past their
-90-minute broker-contact alert threshold.
-
-The dedicated lease remains one-at-a-time and does not share `health`'s
-supervisory lease. Health observes a failure; `seal-push` prevents the failure,
-so either must remain runnable while the ordinary queue is saturated.

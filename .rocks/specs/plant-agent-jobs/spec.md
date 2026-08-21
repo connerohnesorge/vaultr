@@ -4,7 +4,7 @@
 
 ### Requirement: Deep Herdr agent lifecycle
 
-Plant MUST run each agent-backed Cultivation Job through one high-level Herdr lifecycle interface that owns workspace creation and reclamation, verified agent readiness, prompt delivery, completion waiting, and best-effort cleanup with focus restoration. Plant MUST reconcile readiness snapshots until the selected supported native-agent pane remains prompt-ready after the composer settles. Plant MUST snapshot that pane's terminal and available agent-session identity before checked `pane run` prompt typing. Plant MUST receive a subscription acknowledgment before prompt typing. If the pane has not entered `working`, Plant MUST send exactly one checked Enter. Plant MUST reconcile buffered lifecycle events with same-pane snapshots. Plant MUST observe post-submit `working` before accepting a later terminal state. Plant MUST recheck terminal/session identity before returning success. Failed typing, failed submission, a missing transition, pre-existing terminal state, or a pane identity change MUST NOT return `Succeeded`. The scheduler MUST retain job selection, launch construction, prompts, cadence, and outcome recording.
+Plant MUST run each agent-backed Cultivation Job through one high-level Herdr lifecycle interface that owns workspace creation and reclamation, verified agent readiness, prompt delivery, completion waiting, and best-effort cleanup with focus restoration. Plant MUST reconcile readiness snapshots until the selected native Claude/Codex pane remains prompt-ready after the composer settles. Plant MUST snapshot that pane's terminal and available agent-session identity before checked `pane run` prompt typing. Plant MUST receive a subscription acknowledgment before prompt typing. If the pane has not entered `working`, Plant MUST send exactly one checked Enter. Plant MUST reconcile buffered lifecycle events with same-pane snapshots. Plant MUST observe post-submit `working` before accepting a later terminal state. Plant MUST recheck terminal/session identity before returning success. Failed typing, failed submission, a missing transition, pre-existing terminal state, or a pane identity change MUST NOT return `Succeeded`. The scheduler MUST retain job selection, launch construction, prompts, cadence, and outcome recording.
 
 #### Scenario: Herdr is unavailable before an attempt
 
@@ -20,7 +20,7 @@ Plant MUST run each agent-backed Cultivation Job through one high-level Herdr li
 
 #### Scenario: Agent run succeeds
 
-- WHEN a verified supported native-agent pane is idle or done
+- WHEN a verified native Claude or Codex pane is idle or done
 - AND the lifecycle acknowledges its pane-scoped status subscription before checked `pane run` prompt typing
 - AND the lifecycle sends one checked Enter only if the pane is not already `working`
 - AND Plant observes `working` followed by a terminal state through its buffered stream or same-pane snapshots
@@ -36,7 +36,7 @@ Plant MUST run each agent-backed Cultivation Job through one high-level Herdr li
 
 #### Scenario: Readiness changes while the composer settles
 
-- WHEN a selected supported native-agent pane becomes non-ready after initial readiness
+- WHEN a selected native Claude or Codex pane becomes non-ready after initial readiness
 - THEN Plant continues waiting for the same pane identity
 - AND Plant does not type the prompt before readiness returns
 
@@ -55,7 +55,7 @@ Plant MUST run each agent-backed Cultivation Job through one high-level Herdr li
 
 #### Scenario: Agentless or unknown pane is observed
 
-- WHEN the selected pane is agentless, unknown, or not a supported native-agent pane in idle or done state
+- WHEN the selected pane is agentless, unknown, or not a native Claude/Codex pane in idle or done state
 - THEN Plant MUST NOT deliver the prompt
 - AND the lifecycle fails with diagnostic detail while applying its cleanup policy
 
@@ -94,28 +94,6 @@ Plant MUST NOT hardwire or map interpreters per extension.
 - WHEN a job cannot be spawned (e.g. missing execute permission)
 - THEN Plant records a failed attempt with the spawn error in the job ledger
 - AND the scheduler continues unaffected
-
-### Requirement: Reserved seal durability capacity
-
-Plant MUST reserve one bounded scheduler-capacity lease for `seal-push`, separate
-from both the configured ordinary worker pool and the `health` supervisory
-lease. Plant MUST select a due `seal-push` job for dispatch even when the
-ordinary worker pool is saturated. A second concurrent `seal-push` MUST remain
-bounded by that dedicated lease.
-
-#### Scenario: Ordinary jobs saturate the configured worker pool
-
-- GIVEN every ordinary scheduler-capacity slot is held by another job
-- WHEN `seal-push` becomes due
-- THEN Plant dispatches it against its dedicated durability lease
-- AND no ordinary job exceeds the configured worker-pool capacity
-
-#### Scenario: An existing seal upload is still running
-
-- GIVEN the dedicated durability lease is held by `seal-push`
-- WHEN another scheduler observes `seal-push` as due
-- THEN the second worker does not dispatch another seal upload
-- AND ordinary and `health` work remain independently admissible
 
 ### Requirement: Durable scheduled-job attempt fencing
 
@@ -339,128 +317,3 @@ lifecycle during reconciliation.
 - WHEN the Agent Run receipt for the fence attempt ID is corrupt
 - THEN Plant retains the fence
 - AND Plant reports the unreadable receipt as the block reason
-
-### Requirement: Recoverable keyed Agent Run identity
-
-Plant MUST persist a tagged phase-specific checkpoint in each keyed Agent Run
-receipt. The checkpoint MUST preserve the immutable Herdr workspace and pane
-identity. The checkpoint MUST represent terminal-only and session-bound pane
-identity as distinct states. A captured checkpoint MUST include the captured
-session. Plant MUST reconcile a pending receipt against the exact checkpoint
-identity. Plant MUST NOT use receipt age as execution evidence. Plant MUST NOT
-create another workspace while the recorded execution can still finish. Plant
-MUST retain the fence when Herdr or identity evidence is unavailable. Legacy
-pending receipts MUST require verified operator recovery. The Codex Learn
-wrapper and 15-minute cadence MUST remain unchanged.
-
-#### Scenario: The recorded pane remains working
-
-- GIVEN Plant restarts with a pending keyed Agent Run receipt
-- AND the exact recorded pane remains working
-- WHEN Plant reconciles the receipt
-- THEN Plant resumes observation of that pane
-- AND Plant does not create another Herdr workspace
-
-#### Scenario: The recorded session completed
-
-- GIVEN Plant restarts with a pending keyed Agent Run receipt
-- AND a captured checkpoint proves submitted work
-- AND the matching captured session contains a terminal response
-- WHEN Plant reconciles the receipt
-- THEN Plant persists one conclusive successful receipt
-- AND Plant appends one successful job ledger record
-- AND Plant clears the attempt fence
-
-#### Scenario: The recorded execution cannot finish
-
-- GIVEN Plant restarts with a pending keyed Agent Run receipt
-- AND Herdr proves the recorded execution is absent
-- AND the matching captured session has no terminal response
-- WHEN Plant reconciles the receipt
-- THEN Plant persists one conclusive failed receipt
-- AND Plant appends one failed job ledger record
-- AND Plant clears the attempt fence
-
-#### Scenario: Recovery evidence is unavailable
-
-- GIVEN Plant restarts with a pending keyed Agent Run receipt
-- WHEN Herdr is unavailable or the recorded identity conflicts
-- THEN Plant retains the pending receipt
-- AND Plant retains the attempt fence
-- AND Plant does not create another Herdr workspace
-
-#### Scenario: A legacy pending receipt lacks identity
-
-- GIVEN a pending keyed Agent Run receipt stores only its attempt key
-- WHEN Plant reconciles the receipt
-- THEN Plant retains the attempt fence
-- AND Plant names `plant jobs unblock <name>` as the operator recovery
-
-#### Scenario: A terminal-only checkpoint awaits session discovery
-
-- GIVEN a pending keyed Agent Run receipt stores a terminal-only checkpoint
-- WHEN the captured session identifier is not available
-- THEN Plant retains the pending receipt
-- AND Plant does not infer a capture session
-
-#### Scenario: Checkpoint identity is stable
-
-- GIVEN a pending keyed Agent Run receipt stores a checkpoint
-- WHEN a later progress update supplies a different workspace, pane, terminal, or session identity
-- THEN Plant rejects the update
-- AND Plant retains the existing checkpoint
-
-#### Scenario: The current Codex Learn attempt is recovered
-
-- GIVEN session `019fb277-d08d-7f62-a1dd-2115d251056e` contains a terminal response
-- AND no live execution owns attempt `ddd1fb63-2eb6-4c17-8bb3-a882f1c497ef`
-- WHEN the operator runs `plant jobs unblock learn-codex`
-- THEN Plant records the abandoned attempt as failed
-- AND a later Codex Learn run can write a durable final record
-
-#### Scenario: Codex Learn scheduling remains unchanged
-
-- GIVEN interrupted Agent Run recovery is deployed
-- WHEN Plant scans `vault/jobs/learn-codex.15m.sh`
-- THEN Plant schedules Codex Learn every 15 minutes
-
-### Requirement: Pi agent job launches
-
-`plant agent run` MUST accept `--cli pi`. Usage and invalid-value errors MUST list `pi` as a supported launch identity. Plant MUST map this identity to Herdr's `pi` agent. Pi panes MUST participate in all supported native-agent pane gates and recovery checks. Plant MUST render Pi launches with `PLANT_AGENT=1`, project trust approval, the `openai-codex` provider, Pi's `--model` option, and Pi's `--thinking` option. Plant MUST give every Pi run a unique `--session-dir` under Plant state. Plant MUST read the first JSONL record ID from that directory and register it as the job self-capture before workspace cleanup.
-
-#### Scenario: Pi is selected
-
-- WHEN an operator supplies `plant agent run --cli pi`
-- THEN Plant accepts the command
-- AND usage and invalid-value errors list `pi`
-- AND Plant expects Herdr to report the pane agent as `pi`
-
-#### Scenario: Pi launch options are rendered
-
-- WHEN Plant launches Pi with a model and effort
-- THEN the launch starts with `PLANT_AGENT=1 command pi --approve --provider openai-codex`
-- AND Plant renders the model with `--model`
-- AND Plant renders the effort with `--thinking`
-
-#### Scenario: Pi run session is isolated
-
-- WHEN Plant prepares a Pi run
-- THEN Plant appends a unique `--session-dir` under Plant state
-- AND no other prepared Pi run receives the same directory
-
-#### Scenario: Pi self-capture is registered
-
-- WHEN the sole Pi JSONL session file starts with `{"type":"session","id":"<uuid>"}`
-- AND the Pi run reaches a terminal state
-- THEN Plant registers that record ID as the job self-capture before cleanup
-
-#### Scenario: Native effort flags are smuggled through extra arguments
-
-- WHEN Pi extra arguments contain `--thinking`
-- THEN Plant rejects the command
-- AND the operator must use `--effort`
-
-#### Scenario: Existing launch identities remain supported
-
-- WHEN Plant launches Claude, Codex, or Prime
-- THEN Plant preserves the existing launch and self-capture behavior
