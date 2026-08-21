@@ -1,0 +1,28 @@
+[package]
+name = "plant-broker"
+version = "0.1.0"
+edition = "2021"
+
+# Deliberately NOT a dependency of plant, and plant is deliberately not a
+# dependency of this. The broker is the only holder of credentials reaching the
+# seal store; plant runs inside every vended computer, i.e. inside every agent
+# sandbox. Keeping them separate binaries is what keeps that grant off the boxes
+# where untrusted agents run.
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "time", "io-util", "fs", "sync", "process"] }
+hyper = { version = "1", features = ["server", "client", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+uuid = { version = "1", features = ["v4"] }
+# The TokenReview leg (#1419) talks HTTPS to the API server and must trust the
+# cluster CA and nothing else. rustls rather than native-tls so the binary keeps
+# no OpenSSL linkage, and both crates are already in this workspace's lock file
+# via plant — this adds compile time, not new vendored dependencies.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"

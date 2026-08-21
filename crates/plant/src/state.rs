@@ -2,10 +2,17 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+/// The one state root: CA material, job ledgers, attempt fences, agent-run
+/// receipts, capture staging, and the crash log. One resolver on purpose — a
+/// second one that answered differently sent `XDG_STATE_HOME` callers to a
+/// directory the job ledger never used, so "one place to wipe" was not true.
 pub(crate) fn dir() -> PathBuf {
     #[cfg(test)]
     if let Some(path) = TEST_DIR.with(|slot| slot.borrow().clone()) {
         return path;
+    }
+    if let Some(dir) = std::env::var_os("XDG_STATE_HOME").filter(|dir| !dir.is_empty()) {
+        return PathBuf::from(dir).join("plant");
     }
     PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".local/state/plant")
 }

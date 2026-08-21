@@ -22,7 +22,11 @@
           version = "0.1.0";
           src = self;
           cargoLock.lockFile = ./Cargo.lock;
-          # both workspace binaries (vaultr + plant) install into $out/bin
+          # vaultr + plant install into $out/bin. plant-broker is a workspace
+          # member but deliberately NOT built here: it is a cluster artifact
+          # that holds the seal-store IRSA grant, and this flake is what Home
+          # Manager puts on a laptop. Same separation the Dockerfile argues for.
+          cargoBuildFlags = [ "-p" "vaultr" "-p" "plant" ];
           doCheck = false;
         };
         linuxPkgs = nixpkgs.legacyPackages.x86_64-linux;
