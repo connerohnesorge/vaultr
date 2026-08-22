@@ -92,6 +92,12 @@
           packages = [pkgs.clippy pkgs.rustfmt];
         };
         checks = {
+          vaultr-session-index-contract = pkgs.runCommand "vaultr-session-index-contract" {} ''
+            help="$(${workspace}/bin/vaultr session index --help)"
+            grep -F -- "--update" <<< "$help"
+            grep -F -- "--workers" <<< "$help"
+            touch "$out"
+          '';
           nixos-module =
             assert moduleSystem.config.systemd.services.plant.serviceConfig.User == "vaultr-test";
             assert moduleSystem.config.systemd.services.plant.serviceConfig.TimeoutStopSec == "40s";

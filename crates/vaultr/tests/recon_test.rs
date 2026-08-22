@@ -130,6 +130,32 @@ fn compaction_replaces_history() {
 }
 
 #[test]
+fn search_fixtures_retain_compacted_messages_for_both_harnesses() {
+    for (name, before, after) in [
+        (
+            "search_claude_compaction.jsonl",
+            "before compaction",
+            "after compaction",
+        ),
+        (
+            "search_codex_compaction.jsonl",
+            "before compaction",
+            "after compaction",
+        ),
+    ] {
+        let reconstruction = recon::reconstruct(&fixture(name)).unwrap();
+        assert_eq!(reconstruction.messages.len(), 1, "{name}");
+        assert_eq!(reconstruction.observed_messages.len(), 2, "{name}");
+        assert!(reconstruction.observed_messages.iter().any(|message| {
+            message.message.to_string().contains(before) && !message.in_final_replay
+        }));
+        assert!(reconstruction.observed_messages.iter().any(|message| {
+            message.message.to_string().contains(after) && message.in_final_replay
+        }));
+    }
+}
+
+#[test]
 fn harness_falls_back_to_input_key_when_envelopes_lack_field() {
     // No `harness` field anywhere: key == "input" resolves Codex.
     let codex = json!({

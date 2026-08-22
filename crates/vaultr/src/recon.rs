@@ -4,7 +4,10 @@
 //! can't drift. Memory is bounded by the largest single envelope plus the
 //! final history — the archive is never loaded whole.
 
+mod observed;
+
 use anyhow::{Context, Result};
+use observed::ReconState;
 use serde::de::DeserializeOwned;
 use serde_json::{json, Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -63,6 +66,14 @@ impl Harness {
 }
 
 /// Result of reconstructing a capture.
+#[derive(Debug, Clone)]
+pub struct ObservedMessage {
+    pub message: Value,
+    pub in_final_replay: bool,
+    pub observed_at: Option<String>,
+}
+
+/// Result of reconstructing a capture.
 #[derive(Debug)]
 pub struct Recon {
     /// History key seen on the wire: "messages" (Anthropic) or "input" (Codex).
@@ -75,6 +86,10 @@ pub struct Recon {
     pub history_len: usize,
     /// Final history, with the trailing completed response (if any) appended.
     pub messages: Vec<Value>,
+    /// Every message occurrence observed in request histories or completed output.
+    pub observed_messages: Vec<ObservedMessage>,
+    /// True when one or more history deltas could not be replayed.
+    pub partial: bool,
     /// Number of trailing assistant items appended from the final response.
     pub trailing_appended: usize,
     /// Envelopes parsed.
@@ -495,112 +510,6 @@ impl Segment {
     }
 }
 
-/// Accumulated reconstruction state, shared across a capture's segments.
-#[derive(Clone, Copy)]
-enum HarnessState {
-    Unknown,
-    ProvisionalCodex,
-    Explicit(Harness),
-}
-
-impl HarnessState {
-    fn value(self) -> Option<Harness> {
-        match self {
-            HarnessState::Unknown => None,
-            HarnessState::ProvisionalCodex => Some(Harness::Codex),
-            HarnessState::Explicit(harness) => Some(harness),
-        }
-    }
-}
-
-struct ReconState {
-    msgs: Vec<Value>,
-    hash_dict: HashMap<String, Value>,
-    key: String,
-    harness: HarnessState,
-    trailing: Vec<Value>,
-    envelopes: usize,
-}
-
-impl ReconState {
-    fn new() -> Self {
-        ReconState {
-            msgs: Vec::new(),
-            hash_dict: HashMap::new(),
-            key: String::from("messages"),
-            harness: HarnessState::Unknown,
-            trailing: Vec::new(),
-            envelopes: 0,
-        }
-    }
-
-    /// Apply one parsed Envelope value: derive harness, track its (possibly
-    /// final) completed response as the trailing output, and replay its delta.
-    fn apply(&mut self, env: &Value) -> Result<()> {
-        let explicit_harness = env
-            .get("harness")
-            .and_then(Value::as_str)
-            .and_then(Harness::from_label);
-        let history = env.pointer("/request/body_delta/history");
-        let provisional_codex =
-            history.and_then(|h| h.get("key")).and_then(Value::as_str) == Some("input");
-        let next_harness = match (self.harness, explicit_harness, provisional_codex) {
-            (HarnessState::Explicit(first), Some(next), _) if first != next => {
-                anyhow::bail!("conflicting explicit harness labels");
-            }
-            (_, Some(harness), _) => HarnessState::Explicit(harness),
-            (HarnessState::Unknown, None, true) => HarnessState::ProvisionalCodex,
-            (state, None, _) => state,
-        };
-        let harness = next_harness.value();
-
-        if let Some(h) = history {
-            apply_delta(h, &mut self.msgs, &mut self.hash_dict)?;
-            if let Some(k) = h.get("key").and_then(Value::as_str) {
-                self.key = k.to_string();
-            }
-        }
-
-        self.harness = next_harness;
-        self.envelopes += 1;
-        // The response of every envelope *before* the last is reflected in the
-        // next request's history delta; only the final envelope's completed
-        // response needs appending. Track it per-envelope, keeping only the last.
-        self.trailing = extract_response_output(env, harness);
-        // Codex stamps each replayed item with the turn it belongs to; the
-        // request-side items of this turn carry it already (baked into the
-        // wire), but the response-side items we append here don't — add it so
-        // a fork's resume replays them byte-identically to a native resume.
-        if harness == Some(Harness::Codex) {
-            if let Some(turn_id) = env.get("turn_id").and_then(Value::as_str) {
-                for item in &mut self.trailing {
-                    if let Some(o) = item.as_object_mut() {
-                        o.insert(
-                            "internal_chat_message_metadata_passthrough".into(),
-                            serde_json::json!({ "turn_id": turn_id }),
-                        );
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn finish(mut self) -> Recon {
-        let history_len = self.msgs.len();
-        let trailing_appended = self.trailing.len();
-        self.msgs.extend(self.trailing);
-        Recon {
-            key: self.key,
-            harness: self.harness.value(),
-            history_len,
-            messages: self.msgs,
-            trailing_appended,
-            envelopes: self.envelopes,
-        }
-    }
-}
-
 /// Process one segment record-by-record. A physical record is the bytes up to a
 /// newline (the final record may be unterminated). Each record may hold one or
 /// more concatenated complete Envelope JSON values (a historical concurrent-write
@@ -722,69 +631,140 @@ pub fn encode_delta(prior: &Value, body: &Value, history_key: &str, big_fields: 
     })
 }
 
+#[derive(Debug)]
+struct HistoryTransition {
+    retained_prefix: usize,
+}
+
+#[derive(Debug)]
+struct DeltaError {
+    message: &'static str,
+    recoverable: bool,
+}
+
+impl DeltaError {
+    fn invalid(message: &'static str) -> Self {
+        Self {
+            message,
+            recoverable: false,
+        }
+    }
+
+    fn broken_lineage(message: &'static str) -> Self {
+        Self {
+            message,
+            recoverable: true,
+        }
+    }
+
+    fn recoverable(&self) -> bool {
+        self.recoverable
+    }
+}
+
+impl std::fmt::Display for DeltaError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.message)
+    }
+}
+
+impl std::error::Error for DeltaError {}
+
 /// Apply one history delta (append or content-addressed form), mirroring recon.mjs.
 pub fn apply_delta(
     h: &Value,
     msgs: &mut Vec<Value>,
     hash_dict: &mut HashMap<String, Value>,
 ) -> Result<()> {
-    let h = h.as_object().context("history delta must be an object")?;
+    apply_delta_transition(h, msgs, hash_dict)
+        .map(|_| ())
+        .map_err(Into::into)
+}
+
+fn apply_delta_transition(
+    h: &Value,
+    msgs: &mut Vec<Value>,
+    hash_dict: &mut HashMap<String, Value>,
+) -> std::result::Result<HistoryTransition, DeltaError> {
+    let h = h
+        .as_object()
+        .ok_or_else(|| DeltaError::invalid("history delta must be an object"))?;
     let append = h
         .get("append")
-        .map(|v| v.as_array().context("history append must be an array"))
+        .map(|value| {
+            value
+                .as_array()
+                .ok_or_else(|| DeltaError::invalid("history append must be an array"))
+        })
         .transpose()?;
     let prefix = h
         .get("prefix_length")
-        .map(|v| {
-            v.as_u64()
-                .and_then(|n| usize::try_from(n).ok())
-                .context("history prefix must be an unsigned index")
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|number| usize::try_from(number).ok())
+                .ok_or_else(|| DeltaError::invalid("history prefix must be an unsigned index"))
         })
         .transpose()?;
     let order = h
         .get("order")
-        .map(|v| v.as_array().context("history order must be an array"))
+        .map(|value| {
+            value
+                .as_array()
+                .ok_or_else(|| DeltaError::invalid("history order must be an array"))
+        })
         .transpose()?;
     let new = h
         .get("new")
-        .map(|v| v.as_object().context("history new must be an object"))
+        .map(|value| {
+            value
+                .as_object()
+                .ok_or_else(|| DeltaError::invalid("history new must be an object"))
+        })
         .transpose()?;
 
-    match (append, prefix, order) {
+    let retained_prefix = match (append, prefix, order) {
         (Some(append), Some(prefix), None) => {
             if new.is_some() || prefix > msgs.len() {
-                anyhow::bail!("invalid append history lineage");
+                return Err(DeltaError::broken_lineage("invalid append history lineage"));
             }
             msgs.truncate(prefix);
             msgs.extend(append.iter().cloned());
+            prefix
         }
         (Some(append), None, None) => {
             if new.is_some() {
-                anyhow::bail!("invalid legacy append history");
+                return Err(DeltaError::invalid("invalid legacy append history"));
             }
+            let retained = msgs.len();
             msgs.extend(append.iter().cloned());
+            retained
         }
         (None, None, Some(order)) => {
             let mut resolved = Vec::with_capacity(order.len());
             for entry in order {
                 let key = entry
                     .as_str()
-                    .context("history order entry must be a string")?;
+                    .ok_or_else(|| DeltaError::invalid("history order entry must be a string"))?;
                 resolved.push(
                     new.and_then(|values| values.get(key))
                         .or_else(|| hash_dict.get(key))
                         .cloned()
-                        .context("history order entry does not resolve")?,
+                        .ok_or_else(|| {
+                            DeltaError::broken_lineage("history order entry does not resolve")
+                        })?,
                 );
             }
+            let retained = common_prefix(msgs, &resolved);
             if let Some(new) = new {
-                hash_dict.extend(new.iter().map(|(k, v)| (k.clone(), v.clone())));
+                hash_dict.extend(new.iter().map(|(key, value)| (key.clone(), value.clone())));
             }
             *msgs = resolved;
+            retained
         }
-        _ => anyhow::bail!("unrecognized history delta shape"),
-    }
-    Ok(())
+        _ => return Err(DeltaError::invalid("unrecognized history delta shape")),
+    };
+    Ok(HistoryTransition { retained_prefix })
 }
 
 /// Extract the assistant output carried by an envelope's completed response.

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use vaultr::{fork, normalize, recon, render, scan, seals, validate, vault};
+use vaultr::{fork, normalize, recon, render, scan, seals, session_index, validate, vault};
 
 #[derive(Parser)]
 #[command(
@@ -63,6 +63,39 @@ enum SessionCmd {
     },
     /// Stream the session's Herdr topology snapshots as JSONL
     Herdr { id: String },
+    /// Build or update local session-search indexes
+    Index {
+        /// Update the local indexes incrementally
+        #[arg(long, conflicts_with = "rebuild")]
+        update: bool,
+        /// Delete existing local indexes before building
+        #[arg(long, conflicts_with = "update")]
+        rebuild: bool,
+        /// Decode worker count
+        #[arg(long)]
+        workers: Option<usize>,
+    },
+    /// Search the local session index
+    Search {
+        /// Search terms or a quoted phrase
+        #[arg(required = true)]
+        query: Vec<String>,
+        /// Maximum result count
+        #[arg(long, default_value_t = 10)]
+        limit: usize,
+        /// Emit result records as JSON
+        #[arg(long)]
+        json: bool,
+        /// Return duplicate turn bodies
+        #[arg(long)]
+        no_collapse: bool,
+        /// Exclude turns absent from the final replay
+        #[arg(long)]
+        final_only: bool,
+        /// Include up to three curated vault records
+        #[arg(long)]
+        curated: bool,
+    },
     /// Fork a captured session into a fresh native Claude/Codex/Pi session
     Fork {
         id: String,
@@ -113,6 +146,29 @@ fn run() -> Result<()> {
                     show(&root, &id, stats, !cli.no_fetch)
                 }
                 Cmd::Session(SessionCmd::Herdr { id }) => herdr(&root, &id, !cli.no_fetch),
+                Cmd::Session(SessionCmd::Index {
+                    update,
+                    rebuild,
+                    workers,
+                }) => index(&root, update, rebuild, workers),
+                Cmd::Session(SessionCmd::Search {
+                    query,
+                    limit,
+                    json,
+                    no_collapse,
+                    final_only,
+                    curated,
+                }) => search(
+                    &root,
+                    &query.join(" "),
+                    session_index::SearchOptions {
+                        limit,
+                        collapse: !no_collapse,
+                        final_only,
+                        curated,
+                    },
+                    json,
+                ),
                 Cmd::Session(SessionCmd::Fork {
                     id,
                     into,
@@ -145,6 +201,189 @@ fn run() -> Result<()> {
                 Cmd::Scan(_) => unreachable!("scan is handled before the session root is resolved"),
             }
         }
+    }
+}
+
+fn index(
+    root: &std::path::Path,
+    update: bool,
+    rebuild: bool,
+    workers: Option<usize>,
+) -> Result<()> {
+    if !update && !rebuild {
+        anyhow::bail!("choose `--update` or `--rebuild`");
+    }
+    let stats = session_index::update_indexes(root, workers.unwrap_or(1), rebuild)?;
+    println!(
+        "indexed {} sessions and {} turns ({} changed); {} curated records ({} changed) with {} worker(s)",
+        stats.sessions,
+        stats.turns,
+        stats.changed_sessions,
+        stats.curated_documents,
+        stats.changed_curated_documents,
+        stats.workers,
+    );
+    // Loud on stderr, but not an error exit: these sessions are unreadable
+    // because their sealed bytes are already broken, so failing the run would
+    // only mean no index at all until someone hand-repairs an append-only file.
+    if !stats.unreadable.is_empty() {
+        eprintln!(
+            "warning: skipped {} unreadable session(s):",
+            stats.unreadable.len()
+        );
+        for session in &stats.unreadable {
+            eprintln!("  {}: {}", session.id, session.reason);
+        }
+    }
+    Ok(())
+}
+
+fn search(
+    root: &std::path::Path,
+    query: &str,
+    options: session_index::SearchOptions,
+    json: bool,
+) -> Result<()> {
+    let results = session_index::search(query, &options)?;
+    let freshness = index_freshness(results.built_at.as_deref());
+    let newer_sessions = if let Some(freshness) = freshness.as_deref() {
+        vault::list_sessions(root)?
+            .into_iter()
+            .filter(|session| timestamp_after(session.meta.last_activity(), freshness))
+            .count()
+    } else {
+        0
+    };
+    let warnings = if freshness.is_none() || newer_sessions > 0 {
+        vec!["index may be stale; run `vaultr session index --update`"]
+    } else {
+        Vec::new()
+    };
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "query": query,
+                "total": results.total,
+                "shown": results.hits.len(),
+                "curated_total": results.curated_total,
+                "curated_shown": results.curated_hits.len(),
+                "freshness": freshness,
+                "warnings": warnings,
+                "sessions_since_build": newer_sessions,
+                "coverage": results.coverage,
+                "curated_hits": results.curated_hits,
+                "hits": results.hits,
+            })
+        );
+        return Ok(());
+    }
+    for warning in warnings {
+        eprintln!("warning: {warning}");
+    }
+    if options.curated {
+        println!(
+            "{} of {} curated hit(s) shown",
+            results.curated_hits.len(),
+            results.curated_total,
+        );
+        for hit in results.curated_hits {
+            println!("{} | score={:.3}", hit.path, hit.score);
+            println!("{}", hit.snippet);
+        }
+    }
+    println!(
+        "{} of {} session hit(s) shown; built {}; {} sessions captured since build",
+        results.hits.len(),
+        results.total,
+        freshness.as_deref().unwrap_or("-"),
+        newer_sessions,
+    );
+    println!(
+        "metadata coverage: harness={}/{}, cwd={}/{}, branch={}/{}, model={}/{}, timestamp={}/{}",
+        results.coverage.harness,
+        results.coverage.sessions,
+        results.coverage.cwd,
+        results.coverage.sessions,
+        results.coverage.branch,
+        results.coverage.sessions,
+        results.coverage.model,
+        results.coverage.sessions,
+        results.coverage.timestamp,
+        results.coverage.sessions,
+    );
+    for hit in results.hits {
+        let markers = [
+            hit.compacted.then(|| "compacted".to_string()),
+            hit.partial.then(|| "partial".to_string()),
+            (hit.duplicates > 1).then(|| format!("{} duplicates", hit.duplicates)),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(", ");
+        println!(
+            "{} | {} | {} | cwd={} | branch={} | turn={}{}",
+            &hit.session_id[..hit.session_id.len().min(8)],
+            if hit.timestamp.is_empty() {
+                "-"
+            } else {
+                &hit.timestamp
+            },
+            if hit.harness.is_empty() {
+                "-"
+            } else {
+                &hit.harness
+            },
+            if hit.cwd.is_empty() { "-" } else { &hit.cwd },
+            if hit.branch.is_empty() {
+                "-"
+            } else {
+                &hit.branch
+            },
+            hit.turn_index,
+            if markers.is_empty() {
+                String::new()
+            } else {
+                format!(" | {markers}")
+            },
+        );
+        println!("{}", hit.snippet);
+    }
+    Ok(())
+}
+
+fn timestamp_after(activity: &str, built_at: &str) -> bool {
+    match (
+        chrono::DateTime::parse_from_rfc3339(activity),
+        chrono::DateTime::parse_from_rfc3339(built_at),
+    ) {
+        (Ok(activity), Ok(built_at)) => activity > built_at,
+        _ => !activity.is_empty() && activity > built_at,
+    }
+}
+
+fn index_freshness(built_at: Option<&str>) -> Option<String> {
+    let ledger = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".local/state/plant/jobs/session-index.jsonl"));
+    let ledger_timestamp = ledger
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| {
+            text.lines()
+                .rev()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .find(|record| {
+                    record.get("outcome").and_then(serde_json::Value::as_str) == Some("success")
+                })
+                .and_then(|record| record.get("ts").and_then(serde_json::Value::as_i64))
+        })
+        .and_then(|timestamp| chrono::DateTime::<chrono::Utc>::from_timestamp(timestamp, 0))
+        .map(|timestamp| timestamp.to_rfc3339());
+    match (built_at, ledger_timestamp) {
+        (Some(built_at), Some(ledger)) if timestamp_after(&ledger, built_at) => Some(ledger),
+        (Some(built_at), _) => Some(built_at.to_string()),
+        (None, ledger) => ledger,
     }
 }
 
