@@ -1,6 +1,23 @@
 use super::*;
 use std::os::unix::fs::PermissionsExt;
 
+async fn acquire_after_fork_window<F>(mut acquire: F, failure: &str) -> WorkerCapacityLease
+where
+    F: FnMut() -> io::Result<Option<WorkerCapacityLease>>,
+{
+    // A parallel test can fork while this process owns a flock. The child keeps
+    // unrelated CLOEXEC descriptors until exec, so allow that bounded handoff
+    // window while still failing a lease that is actually stranded.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Some(lease) = acquire().unwrap() {
+            return lease;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "{failure}");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 #[test]
 fn one_slot_admission_gives_door_mail_the_next_turn() {
     let due = [
@@ -275,9 +292,12 @@ async fn watch_rejected_turn_stays_due_then_completes_durably() {
     let ledger = std::fs::read_to_string(state.join("jobs/watch.jsonl")).unwrap();
     assert!(ledger.contains("\"outcome\":\"success\""));
     assert!(!state.join("job-attempts/watch.json").exists());
-    assert!(
-        try_acquire_worker_capacity(1).unwrap().is_some(),
-        "watch must release capacity after its durable ledger transition"
+    drop(
+        acquire_after_fork_window(
+            || try_acquire_worker_capacity(1),
+            "watch must release capacity after its durable ledger transition",
+        )
+        .await,
     );
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -393,10 +413,13 @@ async fn cross_process_capacity_lease_is_bounded() {
         "a second process cannot acquire the occupied capacity slot"
     );
     drop(first);
-    let second = try_acquire_worker_capacity(1)
-        .unwrap()
-        .expect("the slot is reusable after the worker releases it");
-    drop(second);
+    drop(
+        acquire_after_fork_window(
+            || try_acquire_worker_capacity(1),
+            "the slot is reusable after the worker releases it",
+        )
+        .await,
+    );
 
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -429,8 +452,20 @@ async fn reserved_capacity_is_bounded_and_separate_from_normal_capacity() {
     drop(ordinary);
     drop(durability);
     drop(supervisory);
-    assert!(try_acquire_supervisory_capacity().unwrap().is_some());
-    assert!(try_acquire_durability_capacity().unwrap().is_some());
+    drop(
+        acquire_after_fork_window(
+            try_acquire_supervisory_capacity,
+            "the supervisory lease is reusable after release",
+        )
+        .await,
+    );
+    drop(
+        acquire_after_fork_window(
+            try_acquire_durability_capacity,
+            "the durability lease is reusable after release",
+        )
+        .await,
+    );
     std::fs::remove_dir_all(root).unwrap();
 }
 
@@ -587,9 +622,12 @@ async fn failed_health_escalation_releases_supervisory_capacity() {
     let ledger = std::fs::read_to_string(state.join("jobs/health.jsonl")).unwrap();
     assert!(ledger.contains("\"outcome\":\"failed\""));
     assert!(!state.join("job-attempts/health.json").exists());
-    assert!(
-        try_acquire_supervisory_capacity().unwrap().is_some(),
-        "health failure must release supervisory capacity"
+    drop(
+        acquire_after_fork_window(
+            try_acquire_supervisory_capacity,
+            "health failure must release supervisory capacity",
+        )
+        .await,
     );
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -617,9 +655,12 @@ async fn failed_compression_releases_normal_capacity() {
     );
     let ledger = std::fs::read_to_string(state.join("jobs/compress.jsonl")).unwrap();
     assert!(ledger.contains("\"outcome\":\"failed\""));
-    assert!(
-        try_acquire_worker_capacity(1).unwrap().is_some(),
-        "compression failure must release normal capacity"
+    drop(
+        acquire_after_fork_window(
+            || try_acquire_worker_capacity(1),
+            "compression failure must release normal capacity",
+        )
+        .await,
     );
     std::fs::remove_dir_all(root).unwrap();
 }
