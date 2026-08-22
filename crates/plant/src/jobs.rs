@@ -22,8 +22,8 @@ use std::collections::HashMap;
 use std::collections::{HashSet, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
-use std::os::fd::AsRawFd;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use std::sync::Arc;
@@ -462,12 +462,56 @@ fn worker_class(name: &str) -> WorkerClass {
 }
 
 struct WorkerCapacityLease {
-    _slot: File,
+    slot: File,
+}
+
+impl WorkerCapacityLease {
+    fn prepare_for_worker_spawn(&self, command: &mut tokio::process::Command) {
+        let fd = self.slot.as_raw_fd();
+        unsafe {
+            command.pre_exec(move || {
+                let flags = libc::fcntl(fd, libc::F_GETFD);
+                if flags == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                if libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+
+    fn worker_fd(&self) -> RawFd {
+        self.slot.as_raw_fd()
+    }
+
+    unsafe fn from_worker_fd(fd: RawFd, job: &Job, normal_capacity: usize) -> io::Result<Self> {
+        if fd < 0 || unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        let slot = unsafe { File::from_raw_fd(fd) };
+        let actual = slot.metadata()?;
+        let valid_identity = worker_capacity_paths(job, normal_capacity)
+            .into_iter()
+            .filter_map(|path| std::fs::metadata(path).ok())
+            .any(|expected| expected.dev() == actual.dev() && expected.ino() == actual.ino());
+        if !valid_identity {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "capacity fd does not identify this job's scheduler lease",
+            ));
+        }
+        if unsafe { libc::flock(slot.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { slot })
+    }
 }
 
 fn try_acquire_capacity_file(file: File) -> io::Result<Option<WorkerCapacityLease>> {
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-        return Ok(Some(WorkerCapacityLease { _slot: file }));
+        return Ok(Some(WorkerCapacityLease { slot: file }));
     }
     let error = io::Error::last_os_error();
     if error.kind() == io::ErrorKind::WouldBlock {
@@ -535,6 +579,17 @@ fn try_acquire_durability_capacity() -> io::Result<Option<WorkerCapacityLease>> 
         .custom_flags(libc::O_NOFOLLOW)
         .open(dir.join("durability.lock"))?;
     try_acquire_capacity_file(file)
+}
+
+fn worker_capacity_paths(job: &Job, normal_capacity: usize) -> Vec<PathBuf> {
+    let dir = worker_lease_dir();
+    match worker_class(&job.name) {
+        WorkerClass::Ordinary => (0..normal_capacity)
+            .map(|slot| dir.join(format!("capacity-{slot}.lock")))
+            .collect(),
+        WorkerClass::Supervisory => vec![dir.join("supervisory.lock")],
+        WorkerClass::Durability => vec![dir.join("durability.lock")],
+    }
 }
 
 fn try_acquire_job_capacity(
@@ -1285,6 +1340,7 @@ async fn dispatch_scheduled(
     dispatch_admitted(job, vault, script_timeout).await
 }
 
+#[cfg(test)]
 async fn dispatch_scheduled_worker(
     job: &Job,
     vault: &Path,
@@ -1326,15 +1382,38 @@ pub async fn run_scheduled_worker(args: crate::cli::ScheduledWorkerArgs) -> i32 
         );
         return 0;
     };
+    let lease =
+        match unsafe { WorkerCapacityLease::from_worker_fd(args.capacity_fd, &job, args.capacity) }
+        {
+            Ok(lease) => lease,
+            Err(error) => {
+                eprintln!(
+                    "[job:{}] inherited capacity lease failed: {error}",
+                    job.name
+                );
+                return 75;
+            }
+        };
+    eprintln!(
+        "[job:{}] scheduled worker capacity admitted by scheduler (cap {})",
+        job.name, args.capacity
+    );
+    let _lease = lease;
     let vault = PathBuf::new();
-    match dispatch_scheduled_worker(&job, &vault, args.capacity, args.timeout).await {
+    match dispatch_admitted(&job, &vault, args.timeout).await {
         ScheduledDispatch::Finished(code) => code,
         ScheduledDispatch::NotDue => 0,
         ScheduledDispatch::Blocked => 75,
     }
 }
 
-fn spawn_scheduled_worker(job: &Job, capacity: usize, timeout: Duration) -> io::Result<()> {
+fn spawn_scheduled_worker(
+    job: &Job,
+    capacity: usize,
+    timeout: Duration,
+    lease: WorkerCapacityLease,
+) -> io::Result<()> {
+    let capacity_fd = lease.worker_fd().to_string();
     let executable = std::env::current_exe()?;
     let lease_dir = worker_lease_dir();
     ensure_dir_durable(&lease_dir)?;
@@ -1353,6 +1432,7 @@ fn spawn_scheduled_worker(job: &Job, capacity: usize, timeout: Duration) -> io::
     let capacity = capacity.to_string();
     let timeout = timeout.as_secs().to_string();
     let mut command = tokio::process::Command::new(executable);
+    lease.prepare_for_worker_spawn(&mut command);
     command
         .args([
             "jobs",
@@ -1362,6 +1442,7 @@ fn spawn_scheduled_worker(job: &Job, capacity: usize, timeout: Duration) -> io::
             every.as_str(),
             capacity.as_str(),
             timeout.as_str(),
+            capacity_fd.as_str(),
         ])
         .env("PATH", crate::process::augmented_path())
         .stdin(std::process::Stdio::null())
@@ -1443,12 +1524,38 @@ pub async fn scheduler(cfg: Cfg, vault: PathBuf) {
                     continue;
                 }
             }
+            let lease = match try_acquire_job_capacity(&job, cap) {
+                Ok(Some(lease)) => {
+                    eprintln!(
+                        "[job:{}] scheduler capacity admitted for worker handoff",
+                        job.name
+                    );
+                    lease
+                }
+                Ok(None) => {
+                    eprintln!(
+                        "[job:{}] scheduler capacity rejected: no available capacity",
+                        job.name
+                    );
+                    admission.requeue(name);
+                    continue;
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[job:{}] scheduler capacity lease failed: {error}",
+                        job.name
+                    );
+                    admission.requeue(name);
+                    continue;
+                }
+            };
             if job.action == JobAction::InProcessCompression {
                 let vault = vault.clone();
                 tokio::spawn(async move {
-                    let _ = dispatch_scheduled_worker(&job, &vault, cap, SCRIPT_BACKSTOP).await;
+                    let _lease = lease;
+                    let _ = dispatch_admitted(&job, &vault, SCRIPT_BACKSTOP).await;
                 });
-            } else if let Err(error) = spawn_scheduled_worker(&job, cap, SCRIPT_BACKSTOP) {
+            } else if let Err(error) = spawn_scheduled_worker(&job, cap, SCRIPT_BACKSTOP, lease) {
                 eprintln!("[job:{}] worker spawn failed: {error}", job.name);
                 admission.requeue(name);
             }
