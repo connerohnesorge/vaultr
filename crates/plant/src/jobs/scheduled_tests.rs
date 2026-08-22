@@ -229,6 +229,59 @@ async fn unresolved_fence_for_another_job_does_not_starve_door_mail() {
     std::fs::remove_dir_all(root).unwrap();
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn watch_rejected_turn_stays_due_then_completes_durably() {
+    let root = std::env::temp_dir().join(format!("plant-watch-admission-{}", uuid::Uuid::new_v4()));
+    let state = root.join("state");
+    let sessions = root.join("vault/sessions");
+    let called = root.join("watch-called");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let _state = crate::state::use_test_dir(state.clone());
+    let _cwd = use_test_script_cwd(root.clone());
+    let script = root.join("watch.15m.sh");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\ntouch '{}'\n", called.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let watch = Job {
+        name: "watch".to_string(),
+        path: script,
+        every: Duration::from_secs(900),
+        action: JobAction::Script,
+    };
+    let mut admission = DueJobAdmission::default();
+    admission.refresh(&["long-worker".to_string(), "watch".to_string()]);
+    assert_eq!(admission.take(1), vec!["long-worker"]);
+    admission.requeue("long-worker".to_string());
+    assert_eq!(admission.take(1), vec!["watch"]);
+
+    let occupied = try_acquire_worker_capacity(1).unwrap().unwrap();
+    assert_eq!(
+        dispatch_scheduled_worker(&watch, &sessions, 1, SCRIPT_BACKSTOP).await,
+        ScheduledDispatch::Blocked
+    );
+    assert!(!called.exists());
+    assert!(!state.join("job-attempts/watch.json").exists());
+    assert!(!state.join("jobs/watch.jsonl").exists());
+    drop(occupied);
+
+    assert_eq!(
+        dispatch_scheduled_worker(&watch, &sessions, 1, SCRIPT_BACKSTOP).await,
+        ScheduledDispatch::Finished(0)
+    );
+    assert!(called.exists());
+    let ledger = std::fs::read_to_string(state.join("jobs/watch.jsonl")).unwrap();
+    assert!(ledger.contains("\"outcome\":\"success\""));
+    assert!(!state.join("job-attempts/watch.json").exists());
+    assert!(
+        try_acquire_worker_capacity(1).unwrap().is_some(),
+        "watch must release capacity after its durable ledger transition"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 #[test]
 fn one_slot_admission_gives_door_teams_the_next_turn() {
     let due = [
