@@ -255,10 +255,23 @@ fn fetch_seal(root: &Path, session: &Session, seal: SealClass) -> Result<PathBuf
     )
 }
 
+/// Whether the CLI's stderr describes a refused read rather than a missing key.
+///
+/// `head-object` reports the HTTP status in parentheses (`An error occurred
+/// (403) when calling the HeadObject operation: Forbidden`); `AccessDenied` is
+/// matched too because the code, not the status, is what some CLI versions and
+/// `s3 cp` print.
+fn is_access_denied(stderr: &str) -> bool {
+    stderr.contains("(403)") || stderr.contains("AccessDenied") || stderr.contains("Forbidden")
+}
+
 /// The object's size, or `None` when it is not there.
 ///
 /// A 404 is an answer; anything else — expired SSO, a denied bucket, no `aws` on
-/// PATH — is a failure to report rather than a key to skip past.
+/// PATH — is a failure to report rather than a key to skip past. A 403 gets its
+/// own message: in a sandbox that denial is the settled policy of acropolis#1278
+/// and #1066, and the whole point of this ticket is that the error says so
+/// rather than reading as something to fix.
 fn head_object(store: &SealStore, key: &str) -> Result<Option<u64>> {
     let output = Command::new("aws")
         .args([
@@ -280,6 +293,26 @@ fn head_object(store: &SealStore, key: &str) -> Result<Option<u64>> {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if stderr.contains("(404)") || stderr.contains("Not Found") {
             return Ok(None);
+        }
+        if is_access_denied(&stderr) {
+            bail!(
+                "reading s3://{bucket}/{key} was DENIED (403).\n\
+                 \n\
+                 Inside a computer sandbox this denial is policy, not a misconfiguration. \
+                 A computer may write a seal through the plant broker but may never read a \
+                 seal it did not write — decided permanently in acropolis#1278 — and the \
+                 agent-sandbox IRSA role denies this bucket by fail-closed allow-list \
+                 (acropolis#1066). Do not widen the role or add a read route to make this \
+                 go away; the write-only shape is the decision, and the loud 403 is the \
+                 intended failure.\n\
+                 \n\
+                 On a host that is meant to read the store (the Mac, CI), a 403 means the \
+                 credentials are expired or wrong instead — refresh SSO and retry.\n\
+                 \n\
+                 aws: {}",
+                stderr.trim(),
+                bucket = store.bucket,
+            );
         }
         bail!("head s3://{}/{key} failed: {}", store.bucket, stderr.trim());
     }
@@ -418,6 +451,19 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    #[test]
+    fn a_refusal_is_told_apart_from_a_missing_key() {
+        assert!(is_access_denied(
+            "An error occurred (403) when calling the HeadObject operation: Forbidden"
+        ));
+        assert!(is_access_denied(
+            "An error occurred (AccessDenied) when calling the HeadObject operation"
+        ));
+        assert!(!is_access_denied(
+            "An error occurred (404) when calling the HeadObject operation: Not Found"
+        ));
     }
 
     #[test]
