@@ -54,6 +54,21 @@ CLI packages that its routed `claude` and `codex` wrappers execute:
 The module runs Plant as a system service on `127.0.0.1:18923` and
 `127.0.0.1:18924`.
 
+## Global flags
+
+| Flag | Purpose |
+| --- | --- |
+| `--vault <path>` | Sessions root override (default: `$VAULT_SESSIONS` or `~/.dotfiles/vault/sessions`) |
+| `--no-fetch` | Fail on a local miss instead of fetching the seal from the S3 store |
+
+### Sealed captures
+
+Old sessions can be *sealed*: the transcript bytes move to an S3 store of
+record while `sessions/.meta/<id>.json` stays in git, so every session stays
+listed and discoverable by clone. The read verbs (`session show`, `path`,
+`fork`, `herdr`) fetch sealed bytes on demand; nothing on the capture or sweep
+path ever fetches. Pass `--no-fetch` to work strictly offline.
+
 ## CLI reference
 
 | Command | Purpose |
@@ -96,6 +111,28 @@ Plant runs on loopback `127.0.0.1:18923` (Claude) and `127.0.0.1:18924`
 - Captures any session opened through it into `<vault>/sessions/`
 - Scheduled jobs scan `<vault>/jobs/` every minute; a `.hostname` file limits
   flat jobs to that host, `jobs/shared/` runs on every host.
+
+Plant also ships operational subcommands beyond the daemon:
+
+- `plant agent-run` — run a one-shot agent (CLI, model, effort, timeout,
+  idempotency key) under capture
+- `plant jobs run|unblock|worker` — drive the scheduled job set manually or as
+  a worker
+- `plant credentials reconcile` — reconcile broker/seal-store state
+- `plant sessions eligible|stuck` — eligibility and stuck-capture scans
+
+### vaultr-door
+
+`ts/vaultr-door` is a Plant job (TypeScript) that watches the ingestion root
+and turns new files into durable agent runs, with state locking, claim keys,
+and receipts.
+
+## Herdr plugin
+
+`herdr-plugin.toml` registers a Herdr plugin (`plugin/`) with three pane
+actions over captured sessions: **copy-path**, **show** (transcript), and
+**fork** — which opens a focused split, asks claude/codex/pi, and forks the
+pane's session into it in place.
 
 Maintenance and restart-supervision detail: `crates/plant/README.md`.
 
