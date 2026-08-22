@@ -1,6 +1,8 @@
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::net::TcpListener;
-use std::os::unix::fs::PermissionsExt;
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,20 +25,67 @@ fn run_args(home: &Path, sessions: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
-fn worker(home: &Path, sessions: &Path, name: &str, path: &Path, capacity: &str) -> Child {
+fn scheduler_capacity_lease(home: &Path, capacity: usize) -> Option<File> {
+    let dir = home.join(".local/state/plant/job-workers");
+    fs::create_dir_all(&dir).unwrap();
+    for slot in 0..capacity {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(dir.join(format!("capacity-{slot}.lock")))
+            .unwrap();
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Some(file);
+        }
+    }
+    None
+}
+
+fn worker(home: &Path, sessions: &Path, name: &str, path: &Path, capacity: &str) -> Option<Child> {
     let jobs = sessions.parent().unwrap().join("jobs/shared");
     fs::create_dir_all(&jobs).unwrap();
     let active_path = jobs.join(format!("{name}.1m.sh"));
     fs::copy(path, &active_path).unwrap();
+    let capacity_value = capacity.parse::<usize>().unwrap();
+    let lease = scheduler_capacity_lease(home, capacity_value)?;
+    let capacity_fd = lease.as_raw_fd();
+    let capacity_fd_arg = capacity_fd.to_string();
     let path = path.to_str().unwrap();
-    Command::new(env!("CARGO_BIN_EXE_plant"))
-        .args(["jobs", "worker", name, path, "60", capacity, "30"])
+    let mut command = Command::new(env!("CARGO_BIN_EXE_plant"));
+    unsafe {
+        command.pre_exec(move || {
+            let flags = libc::fcntl(capacity_fd, libc::F_GETFD);
+            if flags == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fcntl(capacity_fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let child = command
+        .args([
+            "jobs",
+            "worker",
+            name,
+            path,
+            "60",
+            capacity,
+            "30",
+            &capacity_fd_arg,
+        ])
         .env("HOME", home)
         .env("VAULT_SESSIONS", sessions)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
-        .unwrap()
+        .unwrap();
+    drop(lease);
+    Some(child)
 }
 
 fn wait_for(path: &Path) {
@@ -266,7 +315,7 @@ fn terminated_worker_retains_an_unresolved_fence() {
         "#!/bin/sh\n touch \"$HOME/worker-started\"\n while [ ! -e \"$HOME/release-worker\" ]; do sleep 0.01; done\n",
     );
 
-    let mut child = worker(&home, &sessions, "stranded", &script, "1");
+    let mut child = worker(&home, &sessions, "stranded", &script, "1").unwrap();
     let fence = home.join(".local/state/plant/job-attempts/stranded.json");
     wait_for(&home.join("worker-started"));
     wait_for(&fence);
@@ -302,10 +351,12 @@ fn worker_capacity_is_shared_across_processes() {
     );
     write_job(&second_script, "#!/bin/sh\n touch \"$HOME/second-ran\"\n");
 
-    let mut first = worker(&home, &sessions, "first", &first_script, "1");
+    let mut first = worker(&home, &sessions, "first", &first_script, "1").unwrap();
     wait_for(&home.join("first-started"));
-    let mut second = worker(&home, &sessions, "second", &second_script, "1");
-    assert_eq!(second.wait().unwrap().code(), Some(75));
+    assert!(
+        worker(&home, &sessions, "second", &second_script, "1").is_none(),
+        "the scheduler must not launch a worker without admitted capacity"
+    );
     assert!(!home
         .join(".local/state/plant/job-attempts/second.json")
         .exists());
@@ -337,9 +388,9 @@ fn same_job_workers_record_one_execution() {
         "#!/bin/sh\n echo called >> \"$HOME/calls\"\n sleep 1\n",
     );
 
-    let mut first = worker(&home, &sessions, "same-job", &script, "2");
+    let mut first = worker(&home, &sessions, "same-job", &script, "2").unwrap();
     wait_for(&home.join(".local/state/plant/job-attempts/same-job.json"));
-    let mut second = worker(&home, &sessions, "same-job", &script, "2");
+    let mut second = worker(&home, &sessions, "same-job", &script, "2").unwrap();
     assert_eq!(second.wait().unwrap().code(), Some(75));
     assert_eq!(first.wait().unwrap().code(), Some(0));
     assert_eq!(

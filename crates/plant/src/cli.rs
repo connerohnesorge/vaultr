@@ -55,6 +55,7 @@ pub struct ScheduledWorkerArgs {
     pub every: Duration,
     pub capacity: usize,
     pub timeout: Duration,
+    pub capacity_fd: i32,
 }
 
 pub fn parse_command(argv: &[String]) -> Result<Command, String> {
@@ -263,9 +264,9 @@ fn parse_agent(args: &[String]) -> Result<AgentRunArgs, String> {
 }
 
 fn parse_worker(args: &[String]) -> Result<ScheduledWorkerArgs, String> {
-    let [name, path, every, capacity, timeout] = args else {
+    let [name, path, every, capacity, timeout, capacity_fd] = args else {
         return Err(
-            "jobs worker: expected <name> <path> <every-seconds> <capacity> <timeout-seconds>"
+            "jobs worker: expected <name> <path> <every-seconds> <capacity> <timeout-seconds> <capacity-fd>"
                 .to_string(),
         );
     };
@@ -289,12 +290,19 @@ fn parse_worker(args: &[String]) -> Result<ScheduledWorkerArgs, String> {
         .parse::<u64>()
         .map(Duration::from_secs)
         .map_err(|_| "jobs worker: invalid timeout-seconds".to_string())?;
+    let capacity_fd = capacity_fd
+        .parse::<i32>()
+        .map_err(|_| "jobs worker: invalid capacity-fd".to_string())?;
+    if capacity_fd < 0 {
+        return Err("jobs worker: capacity-fd must be nonnegative".to_string());
+    }
     Ok(ScheduledWorkerArgs {
         name: name.clone(),
         path: PathBuf::from(path),
         every,
         capacity,
         timeout,
+        capacity_fd,
     })
 }
 
@@ -595,6 +603,7 @@ mod tests {
                 "3600",
                 "2",
                 "10800",
+                "9",
             ])),
             Ok(Command::JobsWorker(ScheduledWorkerArgs {
                 name: "reconcile".to_string(),
@@ -602,6 +611,7 @@ mod tests {
                 every: Duration::from_secs(3600),
                 capacity: 2,
                 timeout: Duration::from_secs(10800),
+                capacity_fd: 9,
             }))
         );
     }

@@ -2,6 +2,234 @@ use super::*;
 use std::os::unix::fs::PermissionsExt;
 
 #[test]
+fn one_slot_admission_gives_door_mail_the_next_turn() {
+    let due = [
+        "compress".to_string(),
+        "door-mail".to_string(),
+        "outbox-alert".to_string(),
+    ];
+    let mut admission = DueJobAdmission::default();
+    admission.refresh(&due);
+
+    assert_eq!(admission.take(1), vec!["compress"]);
+    admission.requeue("compress".to_string());
+    assert_eq!(admission.take(1), vec!["door-mail"]);
+}
+
+#[test]
+fn rejected_turn_rotates_to_door_mail_without_a_fence_or_ledger() {
+    let root = std::env::temp_dir().join(format!(
+        "plant-door-mail-rejected-turn-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let state = root.join("state");
+    let _state = crate::state::use_test_dir(state.clone());
+    let due = ["compress".to_string(), "door-mail".to_string()];
+    let mut admission = DueJobAdmission::default();
+    admission.refresh(&due);
+
+    assert_eq!(admission.take(1), vec!["compress"]);
+    admission.requeue("compress".to_string());
+    assert_eq!(admission.take(1), vec!["door-mail"]);
+    assert!(!state.join("job-attempts/door-mail.json").exists());
+    assert!(!state.join("jobs/door-mail.jsonl").exists());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn unresolved_fence_and_restart_preserve_door_mail_admission() {
+    let root = std::env::temp_dir().join(format!(
+        "plant-door-mail-restart-admission-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let state = root.join("state");
+    let _state = crate::state::use_test_dir(state.clone());
+    let due = ["capture-audit".to_string(), "door-mail".to_string()];
+    let mut before_restart = DueJobAdmission::default();
+    before_restart.refresh(&due);
+    assert_eq!(before_restart.take(1), vec!["capture-audit"]);
+    before_restart.requeue("capture-audit".to_string());
+    assert_eq!(before_restart.take(1), vec!["door-mail"]);
+
+    let mut restarted = DueJobAdmission::default();
+    restarted.refresh(&due);
+    assert_eq!(restarted.take(1), vec!["capture-audit"]);
+    restarted.requeue("capture-audit".to_string());
+    assert_eq!(restarted.take(1), vec!["door-mail"]);
+    assert!(!state.join("job-attempts/door-mail.json").exists());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[test]
+fn one_slot_long_worker_handoff_gives_door_mail_the_next_turn() {
+    let root = std::env::temp_dir().join(format!(
+        "plant-scheduler-capacity-handoff-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let state = root.join("state");
+    let _state = crate::state::use_test_dir(state);
+    let mut admission = DueJobAdmission::default();
+    admission.refresh(&["long-worker".to_string(), "door-mail".to_string()]);
+    assert_eq!(admission.take(1), vec!["long-worker"]);
+    let scheduler_lease = try_acquire_worker_capacity(1).unwrap().unwrap();
+    let mut command = tokio::process::Command::new("/bin/sh");
+    scheduler_lease.prepare_for_worker_spawn(&mut command);
+    let parent_flags = unsafe { libc::fcntl(scheduler_lease.worker_fd(), libc::F_GETFD) };
+    assert_ne!(parent_flags & libc::FD_CLOEXEC, 0);
+
+    let job = Job {
+        name: "long-worker".to_string(),
+        path: root.join("long-worker.30m.sh"),
+        every: Duration::from_secs(1800),
+        action: JobAction::Script,
+    };
+    let inherited_fd = unsafe { libc::dup(scheduler_lease.worker_fd()) };
+    assert!(inherited_fd >= 0);
+    let worker_lease =
+        unsafe { WorkerCapacityLease::from_worker_fd(inherited_fd, &job, 1) }.unwrap();
+    drop(scheduler_lease);
+
+    assert_eq!(admission.take(1), vec!["door-mail"]);
+    assert!(
+        try_acquire_worker_capacity(1).unwrap().is_none(),
+        "the worker must retain the scheduler-owned capacity lease"
+    );
+    admission.requeue("door-mail".to_string());
+    drop(worker_lease);
+    assert_eq!(admission.take(1), vec!["door-mail"]);
+    assert!(try_acquire_worker_capacity(1).unwrap().is_some());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn worker_rejects_a_forged_capacity_descriptor() {
+    use std::os::fd::IntoRawFd;
+
+    let root = std::env::temp_dir().join(format!(
+        "plant-forged-capacity-handoff-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let state = root.join("state");
+    let _state = crate::state::use_test_dir(state);
+    let job = Job {
+        name: "door-mail".to_string(),
+        path: root.join("door-mail.30m.ts"),
+        every: Duration::from_secs(1800),
+        action: JobAction::Script,
+    };
+    let forged = File::open("/dev/null").unwrap().into_raw_fd();
+
+    assert!(unsafe { WorkerCapacityLease::from_worker_fd(forged, &job, 1) }.is_err());
+    let _ = std::fs::remove_dir_all(root);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn door_mail_capacity_rejection_writes_no_fence_or_ledger_then_recovers() {
+    let root = std::env::temp_dir().join(format!(
+        "plant-door-mail-capacity-rejection-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let state = root.join("state");
+    let sessions = root.join("vault/sessions");
+    let called = root.join("door-mail-called");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let _state = crate::state::use_test_dir(state.clone());
+    let _cwd = use_test_script_cwd(root.clone());
+    let script = root.join("door-mail.30m.ts");
+    std::fs::write(
+        &script,
+        format!("#!/bin/sh\ntouch '{}'\n", called.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let door_mail = Job {
+        name: "door-mail".to_string(),
+        path: script,
+        every: Duration::from_secs(1800),
+        action: JobAction::Script,
+    };
+    let occupied = try_acquire_worker_capacity(1).unwrap().unwrap();
+
+    assert_eq!(
+        dispatch_scheduled_worker(&door_mail, &sessions, 1, SCRIPT_BACKSTOP).await,
+        ScheduledDispatch::Blocked
+    );
+    assert!(!state.join("job-attempts/door-mail.json").exists());
+    assert!(!state.join("jobs/door-mail.jsonl").exists());
+    drop(occupied);
+
+    assert_eq!(
+        dispatch_scheduled_worker(&door_mail, &sessions, 1, SCRIPT_BACKSTOP).await,
+        ScheduledDispatch::Finished(0)
+    );
+    assert!(called.exists());
+    assert!(std::fs::read_to_string(state.join("jobs/door-mail.jsonl"))
+        .unwrap()
+        .contains("\"outcome\":\"success\""));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn unresolved_fence_for_another_job_does_not_starve_door_mail() {
+    let root = std::env::temp_dir().join(format!(
+        "plant-door-mail-unresolved-fence-{}",
+        uuid::Uuid::new_v4()
+    ));
+    let state = root.join("state");
+    let sessions = root.join("vault/sessions");
+    let called = root.join("door-mail-called");
+    std::fs::create_dir_all(state.join("job-attempts")).unwrap();
+    std::fs::create_dir_all(&sessions).unwrap();
+    let _state = crate::state::use_test_dir(state.clone());
+    let _cwd = use_test_script_cwd(root.clone());
+    let blocked_script = root.join("capture-audit.15m.sh");
+    std::fs::write(&blocked_script, "#!/bin/sh\nexit 0\n").unwrap();
+    std::fs::set_permissions(&blocked_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let blocked = Job {
+        name: "capture-audit".to_string(),
+        path: blocked_script,
+        every: Duration::from_secs(900),
+        action: JobAction::Script,
+    };
+    write_fence(
+        &state.join("job-attempts/capture-audit.json"),
+        &AttemptFence {
+            id: "unresolved-capture-audit".to_string(),
+            started_ts: 1,
+            retryable: false,
+            action: Some(JobAction::Script),
+        },
+    )
+    .unwrap();
+    let door_script = root.join("door-mail.30m.ts");
+    std::fs::write(
+        &door_script,
+        format!("#!/bin/sh\ntouch '{}'\n", called.display()),
+    )
+    .unwrap();
+    std::fs::set_permissions(&door_script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let door_mail = Job {
+        name: "door-mail".to_string(),
+        path: door_script,
+        every: Duration::from_secs(1800),
+        action: JobAction::Script,
+    };
+
+    assert_eq!(
+        dispatch_scheduled_worker(&blocked, &sessions, 1, SCRIPT_BACKSTOP).await,
+        ScheduledDispatch::Blocked
+    );
+    assert!(state.join("job-attempts/capture-audit.json").exists());
+    assert_eq!(
+        dispatch_scheduled_worker(&door_mail, &sessions, 1, SCRIPT_BACKSTOP).await,
+        ScheduledDispatch::Finished(0)
+    );
+    assert!(called.exists());
+    assert!(state.join("job-attempts/capture-audit.json").exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn one_slot_admission_gives_door_teams_the_next_turn() {
     let due = [
         "compress".to_string(),
