@@ -103,6 +103,67 @@ fn signal(child: &Child, signal: i32) {
 }
 
 #[test]
+fn jobs_active_reports_held_free_and_orphan_locks_without_mutating_state() {
+    let tmp = std::env::temp_dir().join(format!(
+        "plant-jobs-active-{}-{}",
+        std::process::id(),
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let home = tmp.join("home");
+    let sessions = tmp.join("vault/sessions");
+    let attempts = home.join(".local/state/plant/job-attempts");
+    let ledgers = home.join(".local/state/plant/jobs");
+    fs::create_dir_all(&attempts).unwrap();
+    fs::create_dir_all(&ledgers).unwrap();
+    fs::create_dir_all(&sessions).unwrap();
+
+    let free = run_args(&home, &sessions, &["jobs", "active", "verify"]);
+    assert_eq!(free.status.code(), Some(0));
+    assert_eq!(String::from_utf8(free.stdout).unwrap(), "inactive\n");
+    let lock_path = attempts.join("verify.lock");
+    assert!(
+        !lock_path.exists(),
+        "status query must not create a lock file"
+    );
+
+    let fence_path = attempts.join("verify.json");
+    let ledger_path = ledgers.join("verify.jsonl");
+    let fence = "{\"id\":\"orphan\",\"started_ts\":1,\"retryable\":false}\n";
+    let ledger = "{\"attempt_id\":\"old\",\"outcome\":\"success\"}\n";
+    fs::write(&fence_path, fence).unwrap();
+    fs::write(&ledger_path, ledger).unwrap();
+
+    let orphan = run_args(&home, &sessions, &["jobs", "active", "verify"]);
+    assert_eq!(orphan.status.code(), Some(0));
+    assert_eq!(String::from_utf8(orphan.stdout).unwrap(), "inactive\n");
+    assert_eq!(fs::read_to_string(&fence_path).unwrap(), fence);
+    assert_eq!(fs::read_to_string(&ledger_path).unwrap(), ledger);
+
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let held = run_args(&home, &sessions, &["jobs", "active", "verify"]);
+    assert_eq!(held.status.code(), Some(0));
+    assert_eq!(String::from_utf8(held.stdout).unwrap(), "active\n");
+    assert_eq!(fs::read_to_string(&fence_path).unwrap(), fence);
+    assert_eq!(fs::read_to_string(&ledger_path).unwrap(), ledger);
+
+    drop(lock);
+    fs::remove_dir_all(tmp).unwrap();
+}
+
+#[test]
 fn manual_jobs_propagate_normalized_statuses() {
     let tmp = std::env::temp_dir().join(format!(
         "plant-jobs-{}-{}",

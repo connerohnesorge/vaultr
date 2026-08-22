@@ -1451,6 +1451,32 @@ fn spawn_scheduled_worker(
     crate::process::spawn_detached(&mut command)
 }
 
+/// Report whether another process currently owns a job's attempt flock.
+///
+/// This status probe opens only an existing lock file. It does not create job
+/// state, reconcile an attempt fence, or touch the durable ledger.
+pub fn active_attempt(name: &str) -> io::Result<bool> {
+    let lock = match OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(attempt_dir().join(format!("{name}.lock")))
+    {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(false);
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() == io::ErrorKind::WouldBlock {
+        Ok(true)
+    } else {
+        Err(error)
+    }
+}
+
 fn attempt_lock_held(name: &str) -> io::Result<bool> {
     match acquire_attempt_lock(name)? {
         AttemptLockStart::Ready(lock) => {

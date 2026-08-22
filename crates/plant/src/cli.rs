@@ -16,6 +16,7 @@ pub enum Command {
     SessionsStuck(Duration),
     CompressOnce(Duration),
     JobsRun(String),
+    JobsActive(String),
     JobsUnblock(String),
     JobsWorker(ScheduledWorkerArgs),
     AgentRun(AgentRunArgs),
@@ -89,6 +90,9 @@ pub fn parse_command(argv: &[String]) -> Result<Command, String> {
         }
         [group, action, name] if group == "jobs" && action == "run" && !name.is_empty() => {
             Ok(Command::JobsRun(name.clone()))
+        }
+        [group, action, name] if group == "jobs" && action == "active" && !name.is_empty() => {
+            Ok(Command::JobsActive(name.clone()))
         }
         [group, action, name] if group == "jobs" && action == "unblock" && !name.is_empty() => {
             Ok(Command::JobsUnblock(name.clone()))
@@ -391,6 +395,16 @@ mod tests {
                 claim: Some(Duration::from_secs(50 * 60)),
             }))
         );
+    }
+
+    #[test]
+    fn parses_jobs_active_status_query() {
+        assert_eq!(
+            parse_command(&argv(&["jobs", "active", "verify"])),
+            Ok(Command::JobsActive("verify".to_string()))
+        );
+        assert!(parse_command(&argv(&["jobs", "active", ""])).is_err());
+        assert!(parse_command(&argv(&["jobs", "active"])).is_err());
     }
 
     #[test]

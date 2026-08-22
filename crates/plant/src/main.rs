@@ -253,6 +253,20 @@ async fn dispatch(command: Command) -> i32 {
                 }
             }
         }
+        Command::JobsActive(name) => match jobs::active_attempt(&name) {
+            Ok(true) => {
+                println!("active");
+                0
+            }
+            Ok(false) => {
+                println!("inactive");
+                0
+            }
+            Err(error) => {
+                eprintln!("jobs active {name}: {error}");
+                1
+            }
+        },
         Command::JobsUnblock(name) => match jobs::unblock_job(&name) {
             Ok(jobs::Unblocked::NoFence) => {
                 println!("[job:{name}] no attempt fence, nothing to unblock");
