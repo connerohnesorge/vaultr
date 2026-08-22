@@ -10,25 +10,43 @@
 //! consulted, or asserts that it did.
 
 use super::*;
+use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddrV4};
+use std::os::unix::fs::PermissionsExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// A broker bound to loopback with a dev tenant, pointed at a bucket that must
 /// never be reached: any test that gets as far as an AWS call is a test that has
 /// escaped its own scope, and the nonsense bucket name makes that loud.
 async fn broker_on(surface: Surface) -> (SocketAddr, tempfile::TempDir) {
-    let spool = tempfile::tempdir().unwrap();
-    let broker = Arc::new(Broker {
-        store: Store::with_max_aws_processes(
+    broker_with(
+        surface,
+        Store::with_max_aws_processes(
             "broker-tests-must-not-reach-s3",
             store::DEFAULT_MAX_AWS_PROCESSES,
         ),
-        resolver: Resolver::new(
+        Resolver::new(
             Some("/nonexistent/tailscaled.sock".into()),
             Tenant::from_node_name("testhost"),
         ),
+        HashSet::new(),
+    )
+    .await
+}
+
+async fn broker_with(
+    surface: Surface,
+    store: Store,
+    resolver: Resolver,
+    read_tenants: HashSet<Tenant>,
+) -> (SocketAddr, tempfile::TempDir) {
+    let spool = tempfile::tempdir().unwrap();
+    let broker = Arc::new(Broker {
+        store,
+        resolver,
         metrics: Metrics::new(),
         keys: KeyPolicy::default(),
+        read_tenants,
         spool: spool.path().to_path_buf(),
         max_object_bytes: 1024,
         listing: Mutex::new(None),
@@ -65,6 +83,7 @@ async fn shutdown_closes_an_idle_keepalive_connection_without_waiting_for_kubele
         ),
         metrics: Metrics::new(),
         keys: KeyPolicy::default(),
+        read_tenants: HashSet::new(),
         spool: spool.path().to_path_buf(),
         max_object_bytes: 1024,
         listing: Mutex::new(None),
@@ -114,6 +133,7 @@ async fn shutdown_aborts_a_stuck_body_after_the_bounded_drain_window() {
         ),
         metrics: Metrics::new(),
         keys: KeyPolicy::default(),
+        read_tenants: HashSet::new(),
         spool: spool.path().to_path_buf(),
         max_object_bytes: 1024,
         listing: Mutex::new(None),
@@ -148,12 +168,12 @@ async fn shutdown_aborts_a_stuck_body_after_the_bounded_drain_window() {
         .unwrap();
 }
 
-async fn request(
+async fn request_response(
     addr: SocketAddr,
     method: Method,
     path: &str,
     body: Vec<u8>,
-) -> (StatusCode, String) {
+) -> hyper::Response<Incoming> {
     let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     let (mut sender, connection) =
         hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream))
@@ -169,10 +189,155 @@ async fn request(
         .header("content-length", body.len().to_string())
         .body(Full::new(Bytes::from(body)))
         .unwrap();
-    let response = sender.send_request(request).await.unwrap();
+    sender.send_request(request).await.unwrap()
+}
+
+async fn request(
+    addr: SocketAddr,
+    method: Method,
+    path: &str,
+    body: Vec<u8>,
+) -> (StatusCode, String) {
+    let response = request_response(addr, method, path, body).await;
     let status = response.status();
     let body = response.into_body().collect().await.unwrap().to_bytes();
     (status, String::from_utf8_lossy(&body).to_string())
+}
+
+#[test]
+fn read_tenant_configuration_is_normalized_and_deduplicated() {
+    let tenants = configured_read_tenants(Some("CB14957,cb14957.hs.cnb.rocks".into())).unwrap();
+    assert_eq!(tenants.len(), 1);
+    assert!(tenants.contains(&Tenant::from_node_name("cb14957").unwrap()));
+    assert!(configured_read_tenants(Some("CB14957,,other".into())).is_err());
+}
+
+#[tokio::test]
+async fn an_authorized_read_returns_a_short_lived_presigned_redirect() {
+    let dir = tempfile::tempdir().unwrap();
+    let aws = dir.path().join("aws");
+    std::fs::write(
+        &aws,
+        "#!/bin/sh\n[ \"$1\" = s3 ] && [ \"$2\" = presign ] || exit 1\n[ \"$4\" = --expires-in ] && [ \"$5\" = 300 ] || exit 1\nprintf '%s\\n' 'https://signed.example.test/seal?X-Amz-Signature=fixture'\n",
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&aws).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&aws, permissions).unwrap();
+
+    let tenant = Tenant::from_node_name("CB14957").unwrap();
+    let mut read_tenants = HashSet::new();
+    read_tenants.insert(tenant.clone());
+    let (addr, _spool) = broker_with(
+        Surface::TenantApi,
+        Store::with_aws_binary("broker-tests", store::DEFAULT_MAX_AWS_PROCESSES, aws),
+        Resolver::new(None, Some(tenant)),
+        read_tenants,
+    )
+    .await;
+
+    let response = request_response(
+        addr,
+        Method::GET,
+        "/v1/seals/sessions/2026/08/03/abc/turns.jsonl.zst",
+        vec![],
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(
+        response
+            .headers()
+            .get(hyper::header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap(),
+        "https://signed.example.test/seal?X-Amz-Signature=fixture"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get(hyper::header::CACHE_CONTROL)
+            .unwrap(),
+        "no-store"
+    );
+}
+
+#[tokio::test]
+async fn an_unauthorized_tenant_cannot_read_a_seal() {
+    let mut read_tenants = HashSet::new();
+    read_tenants.insert(Tenant::from_node_name("CB14957").unwrap());
+    let (addr, _spool) = broker_with(
+        Surface::TenantApi,
+        Store::with_max_aws_processes(
+            "broker-tests-must-not-reach-s3",
+            store::DEFAULT_MAX_AWS_PROCESSES,
+        ),
+        Resolver::new(None, Some(Tenant::from_node_name("other-tenant").unwrap())),
+        read_tenants,
+    )
+    .await;
+
+    let (status, body) = request(
+        addr,
+        Method::GET,
+        "/v1/seals/sessions/2026/08/03/abc/turns.jsonl.zst",
+        vec![],
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(body.contains("not authorized"), "{body}");
+}
+
+#[tokio::test]
+async fn an_existing_tenant_can_still_upload_a_seal() {
+    let dir = tempfile::tempdir().unwrap();
+    let aws = dir.path().join("aws");
+    std::fs::write(
+        &aws,
+        "#!/bin/sh\ncase \"$1:$2\" in\ns3api:list-objects-v2) printf '%s\\n' None ;;\ns3api:put-object) printf '%s\\n' '{}' ;;\n*) exit 1 ;;\nesac\n",
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&aws).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&aws, permissions).unwrap();
+
+    let (addr, _spool) = broker_with(
+        Surface::TenantApi,
+        Store::with_aws_binary("broker-tests", store::DEFAULT_MAX_AWS_PROCESSES, aws),
+        Resolver::new(None, Some(Tenant::from_node_name("other-tenant").unwrap())),
+        HashSet::new(),
+    )
+    .await;
+    let (status, body) = request(
+        addr,
+        Method::PUT,
+        "/v1/seals/sessions/2026/08/03/abc/turns.jsonl.zst",
+        b"payload".to_vec(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains("uploaded"), "{body}");
+}
+
+#[tokio::test]
+async fn an_authorized_read_rejects_a_non_seal_key_before_the_store() {
+    let mut read_tenants = HashSet::new();
+    let tenant = Tenant::from_node_name("CB14957").unwrap();
+    read_tenants.insert(tenant.clone());
+    let (addr, _spool) = broker_with(
+        Surface::TenantApi,
+        Store::with_max_aws_processes(
+            "broker-tests-must-not-reach-s3",
+            store::DEFAULT_MAX_AWS_PROCESSES,
+        ),
+        Resolver::new(None, Some(tenant)),
+        read_tenants,
+    )
+    .await;
+
+    let (status, body) = request(addr, Method::GET, "/v1/seals/not-a-seal", vec![]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("seal key"), "{body}");
 }
 
 #[tokio::test]

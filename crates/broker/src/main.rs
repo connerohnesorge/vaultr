@@ -31,13 +31,11 @@
 //!
 //! ## Shape general, surface narrow
 //!
-//! This is the general plant broker with seal upload as its only implemented
+//! This is the general plant broker with seal upload and one restricted read
 //! route. The shape is justified by tenancy, not by speculation about future
-//! routes; widening IAM later is one line, and getting the service shape wrong
-//! is a rewrite. The grant stays write-only (`ListBucket` + `PutObject`, no
-//! `GetObject`) until a read route genuinely exists, so the worst a compromised
-//! broker can do to 7.46 GB of transcripts is write garbage over versioned
-//! objects.
+//! routes; widening the read allowlist is a reviewed deployment change. The
+//! broker signs reads but never buffers seal bytes, so the Plant process remains
+//! outside the seal-store credential boundary.
 //!
 //! ## Routes
 //!
@@ -46,6 +44,7 @@
 //! | `GET /healthz` | open | liveness |
 //! | `GET /metrics` | open | Prometheus scrape (counts and ages, no seal content) |
 //! | `GET /v1/seals` | tenant | the store's view — `<key>\t<size>` — for reconciling |
+//! | `GET /v1/seals/<key>` | CB14957 | redirect to a short-lived presigned read |
 //! | `PUT /v1/seals/<key>` | tenant | store one seal, idempotently |
 //!
 //! `/healthz` and `/metrics` are deliberately open: the scrape comes from
@@ -63,6 +62,7 @@ use hyper::body::{Bytes, Incoming};
 use hyper::{Method, Request, Response, StatusCode};
 use metrics::{Metrics, Outcome};
 use seal::KeyPolicy;
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -77,6 +77,7 @@ struct Broker {
     resolver: Resolver,
     metrics: Metrics,
     keys: KeyPolicy,
+    read_tenants: HashSet<Tenant>,
     spool: PathBuf,
     max_object_bytes: u64,
     listing: Mutex<Option<(Vec<Object>, Instant)>>,
@@ -99,6 +100,7 @@ async fn main() -> Result<()> {
         eprintln!("[broker] removed {removed} stale spool file(s) after restart");
     }
     let dev_tenant = env("SEAL_BROKER_DEV_TENANT").and_then(|name| Tenant::from_node_name(&name));
+    let read_tenants = configured_read_tenants(env("SEAL_BROKER_READ_TENANTS"))?;
     let oidc_identity = match (
         env("SEAL_BROKER_OIDC_SUBJECT"),
         env("SEAL_BROKER_OIDC_TENANT"),
@@ -165,6 +167,7 @@ async fn main() -> Result<()> {
             ),
         metrics: Metrics::new(),
         keys: KeyPolicy::new(seal_files),
+        read_tenants,
         spool,
         max_object_bytes: env("SEAL_BROKER_MAX_OBJECT_BYTES")
             .and_then(|v| v.parse().ok())
@@ -173,9 +176,19 @@ async fn main() -> Result<()> {
     });
 
     eprintln!(
-        "[broker] store s3://{} seals {} spool {} max AWS processes {}",
+        "[broker] store s3://{} seals {} read tenants {} spool {} max AWS processes {}",
         broker.store.bucket(),
         broker.keys.seal_files().join(","),
+        if broker.read_tenants.is_empty() {
+            "NONE".to_string()
+        } else {
+            broker
+                .read_tenants
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        },
         broker.spool.display(),
         max_aws_processes
     );
@@ -304,6 +317,25 @@ fn env(key: &str) -> Option<String> {
         .ok()
         .map(|v| v.trim().to_string())
         .filter(|v| !v.is_empty())
+}
+
+fn configured_read_tenants(value: Option<String>) -> Result<HashSet<Tenant>> {
+    let Some(value) = value else {
+        return Ok(HashSet::new());
+    };
+
+    value
+        .split(',')
+        .map(str::trim)
+        .map(|name| {
+            if name.is_empty() {
+                bail!("SEAL_BROKER_READ_TENANTS contains an empty tenant");
+            }
+            Tenant::from_node_name(name).with_context(|| {
+                format!("SEAL_BROKER_READ_TENANTS contains unusable tenant {name:?}")
+            })
+        })
+        .collect()
 }
 
 async fn shutdown() {
@@ -505,6 +537,10 @@ async fn route(
 
     match (&method, path.as_str()) {
         (&Method::GET, "/v1/seals") => listing(broker).await,
+        (&Method::GET, _) => match path.strip_prefix("/v1/seals/") {
+            Some(key) => read_seal(broker, &tenant, key).await,
+            None => error(StatusCode::NOT_FOUND, format!("no route for GET {path}")),
+        },
         (&Method::PUT, _) => match path.strip_prefix("/v1/seals/") {
             Some(key) => upload(request, broker, &tenant, key).await,
             None => error(StatusCode::NOT_FOUND, format!("no route for PUT {path}")),
@@ -551,6 +587,42 @@ async fn listing(broker: Arc<Broker>) -> Response<Body> {
         .header("content-type", "text/tab-separated-values; charset=utf-8")
         .body(Full::new(Bytes::from(body)))
         .expect("listing response")
+}
+
+const PRESIGNED_URL_EXPIRES_SECONDS: u64 = 300;
+
+/// Return a short-lived redirect to one seal object.
+///
+/// Read access is a separate allowlist from upload access. The caller must be
+/// authenticated before this function runs, and the key is validated before the
+/// broker asks the store to sign anything.
+async fn read_seal(broker: Arc<Broker>, tenant: &Tenant, key: &str) -> Response<Body> {
+    if !broker.read_tenants.contains(tenant) {
+        return error(
+            StatusCode::FORBIDDEN,
+            format!("tenant {tenant} is not authorized to read seals"),
+        );
+    }
+    if let Err(reason) = broker.keys.validate(key) {
+        return error(StatusCode::BAD_REQUEST, reason);
+    }
+
+    match broker
+        .store
+        .presign(key, PRESIGNED_URL_EXPIRES_SECONDS)
+        .await
+    {
+        Ok(url) => Response::builder()
+            .status(StatusCode::TEMPORARY_REDIRECT)
+            .header(hyper::header::LOCATION, url)
+            .header(hyper::header::CACHE_CONTROL, "no-store")
+            .body(Full::new(Bytes::new()))
+            .expect("presigned seal redirect"),
+        Err(reason) => {
+            eprintln!("[broker] {tenant} failed to sign {key}: {reason:#}");
+            error(StatusCode::BAD_GATEWAY, reason)
+        }
+    }
 }
 
 /// Store one seal.
