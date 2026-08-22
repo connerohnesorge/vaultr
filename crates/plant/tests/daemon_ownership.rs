@@ -368,10 +368,13 @@ fn daemon_scheduler_runs_compression_in_process_and_records_conflicts() {
     }
     let record = record.expect("scheduled compression recorded an outcome");
     let last: serde_json::Value = serde_json::from_str(record.lines().last().unwrap()).unwrap();
+    // The conflicting session is skipped rather than propagated, so the sweep
+    // can still seal every later session — but incomplete coverage is recorded
+    // as a failure, naming the session, so the skip cannot go unnoticed.
     assert_eq!(last["outcome"], "failed");
     assert!(last["detail"]
         .as_str()
-        .is_some_and(|detail| detail.contains("conflicts")));
+        .is_some_and(|detail| detail.contains("skipped") && detail.contains("detached")));
     assert!(!marker.exists(), "compress cadence script was not spawned");
     assert_eq!(fs::read(&detached).unwrap(), detached_body);
     assert_eq!(fs::read(&sealed).unwrap(), sealed_before);

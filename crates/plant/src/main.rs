@@ -226,7 +226,17 @@ async fn dispatch(command: Command) -> i32 {
                 }
             };
             match sweep::compress_sweep(&vault, idle).await {
-                Ok(()) => 0,
+                // A skipped session is a non-zero exit: `compress once` is run
+                // by hand and by scripts that read its status, and reporting
+                // success while sessions went unsealed is the silent-cap shape.
+                Ok(outcome) if outcome.skipped.is_empty() => 0,
+                Ok(outcome) => {
+                    eprintln!(
+                        "compress once: {} session(s) skipped",
+                        outcome.skipped.len()
+                    );
+                    1
+                }
                 Err(error) => {
                     eprintln!("compress once: {error}");
                     if matches!(error, sweep::CompressError::Inventory(_)) {

@@ -635,13 +635,23 @@ pub(super) fn sealing_readiness(
         ));
     }
     if let Some(order) = &journal.order {
-        if order.root != root {
+        let outstanding = order.next_to_drain < order.next_sequence || staged;
+        // A foreign root only endangers a journal with work still outstanding.
+        // The stage directory is derived from `root`, so a mismatch means the
+        // undrained envelopes would be looked for in the wrong vault. Once the
+        // journal is fully drained and nothing is staged there is nothing left
+        // to find, and the recorded root is inert history — a capture adopted
+        // from another host (a vended computer's, pulled here) is complete and
+        // sealable, and refusing it strands the session unsealed forever.
+        // The write path keeps its unconditional refusal; this gate is sealing
+        // only.
+        if order.root != root && outstanding {
             return Err(format!(
                 "capture journal: vault identity mismatch at {}",
                 journal.dir.join("state.json").display()
             ));
         }
-        if order.next_to_drain < order.next_sequence || staged {
+        if outstanding {
             return Ok(None);
         }
     }

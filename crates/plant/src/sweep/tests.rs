@@ -578,10 +578,17 @@ async fn detached_sealing_conflict_is_an_operational_failure() {
     let conflict = zstd::encode_all("different generation\n".as_bytes(), 3).unwrap();
     std::fs::write(&sealed, &conflict).unwrap();
 
-    let error = compress_sweep(&vault, Duration::ZERO).await.unwrap_err();
+    // A detached-generation conflict belongs to this one session: the sweep
+    // steps over it and reports it, rather than halting before every later
+    // session. The evidence is still untouched either way.
+    let outcome = compress_sweep(&vault, Duration::ZERO)
+        .await
+        .expect("a per-session conflict does not fail the sweep");
+    assert_eq!(outcome.sealed, 0);
+    assert_eq!(outcome.skipped.len(), 1, "{outcome:?}");
     assert!(
-        matches!(&error, CompressError::Operational(message) if message.contains("seal detached generation")),
-        "{error}"
+        outcome.skipped[0].1.contains("seal detached generation"),
+        "{outcome:?}"
     );
     assert!(detached.exists(), "detached evidence is preserved");
     assert_eq!(std::fs::read(&sealed).unwrap(), conflict);
