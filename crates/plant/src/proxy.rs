@@ -633,7 +633,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
-    fn pi_codex_http_path_is_rewritten_once() {
+    fn codex_http_paths_are_rewritten_once() {
         let adapter = crate::adapter::adapters().remove(1);
         let base = "https://chatgpt.com/backend-api/codex";
         assert_eq!(
@@ -643,6 +643,15 @@ mod tests {
         assert_eq!(
             http_upstream_url(&adapter, base, "/responses", ""),
             "https://chatgpt.com/backend-api/codex/responses"
+        );
+        assert_eq!(
+            http_upstream_url(
+                &adapter,
+                base,
+                "/backend-api/codex/realtime/calls",
+                "?intent=quicksilver&architecture=avas"
+            ),
+            "https://chatgpt.com/backend-api/codex/realtime/calls?intent=quicksilver&architecture=avas"
         );
     }
 

@@ -100,12 +100,18 @@ impl Adapter {
         }
     }
 
-    /// Pi's Codex provider appends `/codex/responses` to a bare proxy base.
-    /// Plant's upstream already ends in `/codex`, so strip that exact duplicate
-    /// only for transport while preserving the observed path in the Envelope.
+    /// Normalize exact downstream paths that already contain Plant's Codex
+    /// upstream prefix. Pi appends `/codex/responses` to a bare proxy base.
+    /// Codex voice needs a local `/backend-api` base so it selects the ChatGPT
+    /// JSON protocol instead of the public multipart `/live` protocol.
+    /// Preserve the downstream path everywhere except upstream transport.
     pub fn upstream_path<'a>(&self, path: &'a str) -> &'a str {
-        if self.harness == Harness::Codex && path == "/codex/responses" {
-            "/responses"
+        if self.harness == Harness::Codex {
+            match path {
+                "/codex/responses" => "/responses",
+                "/backend-api/codex/realtime/calls" => "/realtime/calls",
+                _ => path,
+            }
         } else {
             path
         }
@@ -326,8 +332,16 @@ mod tests {
         assert_eq!(x.upstream_path("/codex/responses"), "/responses");
         assert_eq!(x.upstream_path("/responses"), "/responses");
         assert_eq!(
+            x.upstream_path("/backend-api/codex/realtime/calls"),
+            "/realtime/calls"
+        );
+        assert_eq!(
             x.upstream_path("/prefix/codex/responses"),
             "/prefix/codex/responses"
+        );
+        assert_eq!(
+            x.upstream_path("/prefix/backend-api/codex/realtime/calls"),
+            "/prefix/backend-api/codex/realtime/calls"
         );
     }
 
