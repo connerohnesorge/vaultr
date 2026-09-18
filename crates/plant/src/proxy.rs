@@ -304,7 +304,6 @@ async fn handle_origin(
 ) -> Response<BoxBody> {
     let started_at = SystemTime::now();
     let adapter = &ctx.adapter;
-    let upstream_base = adapter.upstream.trim_end_matches('/');
     let path = req.uri().path().to_string();
     let query = req
         .uri()
@@ -386,7 +385,7 @@ async fn handle_origin(
         None
     };
 
-    let url = http_upstream_url(adapter, upstream_base, &path, &query);
+    let url = http_upstream_url(adapter, &path, &query);
     let mut builder = ctx
         .client
         .request(method.parse().unwrap_or(reqwest::Method::POST), &url)
@@ -577,7 +576,8 @@ async fn prepare_http_capture(
     .map_err(|error| format!("capture preparation task failed: {error}"))?
 }
 
-fn http_upstream_url(adapter: &Adapter, base: &str, path: &str, query: &str) -> String {
+fn http_upstream_url(adapter: &Adapter, path: &str, query: &str) -> String {
+    let base = adapter.upstream_base(path).trim_end_matches('/');
     format!("{base}{}{query}", adapter.upstream_path(path))
 }
 
@@ -635,23 +635,25 @@ mod tests {
     #[test]
     fn codex_http_paths_are_rewritten_once() {
         let adapter = crate::adapter::adapters().remove(1);
-        let base = "https://chatgpt.com/backend-api/codex";
         assert_eq!(
-            http_upstream_url(&adapter, base, "/codex/responses", "?feature=1"),
+            http_upstream_url(&adapter, "/codex/responses", "?feature=1"),
             "https://chatgpt.com/backend-api/codex/responses?feature=1"
         );
         assert_eq!(
-            http_upstream_url(&adapter, base, "/responses", ""),
+            http_upstream_url(&adapter, "/responses", ""),
             "https://chatgpt.com/backend-api/codex/responses"
         );
         assert_eq!(
             http_upstream_url(
                 &adapter,
-                base,
                 "/backend-api/codex/realtime/calls",
                 "?intent=quicksilver&architecture=avas"
             ),
             "https://chatgpt.com/backend-api/codex/realtime/calls?intent=quicksilver&architecture=avas"
+        );
+        assert_eq!(
+            http_upstream_url(&adapter, "/live", ""),
+            "https://api.openai.com/v1/live"
         );
     }
 

@@ -23,6 +23,7 @@ pub struct Adapter {
     pub harness: Harness,
     pub port: u16,
     pub upstream: String,
+    pub live_upstream: Option<String>,
     pub history_key: &'static str,
     pub big_fields: &'static [&'static str],
     pub terminal_event: &'static str,
@@ -45,6 +46,7 @@ pub fn adapters() -> Vec<Adapter> {
             harness: Harness::ClaudeCode,
             port: env_port("VAULTR_ANTHROPIC_PORT", 18923),
             upstream: env_or("VAULTR_ANTHROPIC_UPSTREAM", "https://api.anthropic.com"),
+            live_upstream: None,
             history_key: "messages",
             big_fields: &["tools", "system"],
             terminal_event: "message_stop",
@@ -56,6 +58,10 @@ pub fn adapters() -> Vec<Adapter> {
                 "VAULTR_CODEX_UPSTREAM",
                 "https://chatgpt.com/backend-api/codex",
             ),
+            live_upstream: Some(env_or(
+                "VAULTR_CODEX_LIVE_UPSTREAM",
+                "https://api.openai.com/v1",
+            )),
             history_key: "input",
             big_fields: &["tools", "instructions"],
             terminal_event: "response.completed",
@@ -97,6 +103,16 @@ impl Adapter {
             // that real turns contend for. count_tokens is a side-query, not a turn.
             Harness::ClaudeCode => method == "POST" && path == "/v1/messages",
             Harness::Codex => method == "POST" && path.ends_with("/responses"),
+        }
+    }
+
+    /// Codex's public WebRTC call shape is served by the OpenAI realtime API,
+    /// not by the ChatGPT Codex backend used for ordinary Responses requests.
+    pub fn upstream_base(&self, path: &str) -> &str {
+        if self.harness == Harness::Codex && path == "/live" {
+            self.live_upstream.as_deref().unwrap_or(&self.upstream)
+        } else {
+            &self.upstream
         }
     }
 
