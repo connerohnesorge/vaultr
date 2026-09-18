@@ -1,7 +1,7 @@
 use serde::Deserialize;
 use serde_json::Value;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::ops::Range;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
@@ -176,12 +176,18 @@ pub(super) fn capture_tail(raw: &RawGeneration) -> Result<CaptureTail, String> {
 
     let mut invalid_identity = false;
     let mut final_value = None;
+    // serde_json pulls one byte per `read` call from an unbuffered reader, so
+    // an unwrapped FileRange costs one pread(2) per byte of the tail record:
+    // hundreds of thousands of syscalls per commit on a multi-hundred-KB turn.
     let decoded = vaultr::recon::decode_concatenated(
-        FileRange {
-            raw,
-            offset: start,
-            end: record_end,
-        },
+        BufReader::with_capacity(
+            IO_CHUNK,
+            FileRange {
+                raw,
+                offset: start,
+                end: record_end,
+            },
+        ),
         |identity: EnvelopeIdentity, range| {
             if uuid::Uuid::parse_str(&identity.request_id).is_err() {
                 invalid_identity = true;
