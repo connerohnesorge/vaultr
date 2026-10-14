@@ -1223,7 +1223,26 @@ async fn execute_compression(vault: &Path) -> JobExecution {
     })
     .await
     {
-        Ok(Ok(())) => JobExecution::Succeeded("in-process compression complete".to_string()),
+        Ok(Ok(outcome)) if outcome.skipped.is_empty() => {
+            JobExecution::Succeeded(format!("in-process compression complete: {outcome}"))
+        }
+        // The sweep ran to the end and sealed what it could, but coverage was
+        // incomplete, so the ledger must not read green. Skipping is what keeps
+        // one bad session from halting the corpus; recording it as a failure is
+        // what keeps the skip from becoming invisible.
+        Ok(Ok(outcome)) => {
+            let detail = outcome
+                .skipped
+                .iter()
+                .map(|(sid, error)| format!("{sid}: {error}"))
+                .collect::<Vec<_>>()
+                .join("; ");
+            JobExecution::Failed(format!(
+                "in-process compression sealed {}, skipped {}: {detail}",
+                outcome.sealed,
+                outcome.skipped.len()
+            ))
+        }
         Ok(Err(error)) => JobExecution::Failed(format!("in-process compression failed: {error}")),
         Err(error) => JobExecution::Failed(format!("compression task failed: {error}")),
     }

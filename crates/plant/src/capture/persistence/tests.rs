@@ -685,3 +685,71 @@ fn recovery_rejects_symlink_escapes_without_mutating_evidence() {
     assert_eq!(fs::read(outside.join("turns.jsonl")).unwrap(), before);
     fs::remove_dir_all(root).unwrap();
 }
+
+/// A capture adopted from another host — a vended computer's, pulled onto this
+/// Mac — records that host's absolute sessions root in its journal. Once the
+/// journal is drained there is nothing left to look for in the wrong vault, so
+/// the foreign root must not keep the session unsealed forever.
+#[test]
+fn a_drained_journal_seals_despite_a_foreign_recorded_root() {
+    let root = test_dir("foreign-root-drained");
+    let vault = root.join("sessions");
+    let sid = "00000000-0000-4000-8000-000000000060";
+    let dir = vault.join("2026/08/15").join(sid);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("turns.jsonl"), b"{\"schema_version\":1}\n").unwrap();
+    fs::write(
+        dir.join("state.json"),
+        serde_json::to_vec(&json!({
+            "schema_version": 1,
+            "harness": "claude-code",
+            "session_id": sid,
+            "request_body": {},
+            "capture_order": {
+                "next_sequence": 4,
+                "next_to_drain": 4,
+                "pending": {},
+                "root": "/home/dev/.local/state/computers/sessions"
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let root_identity = canonical_root(&vault);
+    let readiness = sealing_readiness(&root_identity, sid, &dir).expect("drained journal is safe");
+    assert!(
+        matches!(readiness, Some(SealReadiness::Raw)),
+        "a drained capture with a foreign root should still be sealable"
+    );
+    fs::remove_dir_all(root).unwrap();
+}
+
+/// The same foreign root with work still outstanding stays a hard refusal: the
+/// stage directory is derived from the root, so the undrained envelopes would
+/// be sought in a vault this host cannot see.
+#[test]
+fn an_undrained_journal_still_refuses_a_foreign_recorded_root() {
+    let root = test_dir("foreign-root-undrained");
+    let vault = root.join("sessions");
+    let sid = "00000000-0000-4000-8000-000000000061";
+    let dir = vault.join("2026/08/15").join(sid);
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("turns.jsonl"), b"{\"schema_version\":1}\n").unwrap();
+    write_ordered_journal(
+        &dir,
+        sid,
+        "/home/dev/.local/state/computers/sessions",
+        &envelope(sid),
+    );
+
+    let root_identity = canonical_root(&vault);
+    match sealing_readiness(&root_identity, sid, &dir) {
+        Err(error) => assert!(
+            error.contains("vault identity mismatch"),
+            "unexpected error: {error}"
+        ),
+        Ok(_) => panic!("an undrained foreign-root journal must refuse"),
+    }
+    fs::remove_dir_all(root).unwrap();
+}
